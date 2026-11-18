@@ -1,0 +1,17 @@
+bin/
+obj/
+.env
+gmail_token.json
+gmail_credentials.json
+*.db
+*.db-shm
+*.db-wal
+sandbox/
+security-scan/
+.vvaharness/
+*.zip
+styles/
+*.style.md
+
+TODO.md
+tts_infer_*.yaml

@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "AiSecretary 表單助手",
+  "version": "1.1.0",
+  "description": "免手動點擊：由本機 AiSecretary 透過 SSE 主動觸發讀取／預填當前分頁非密碼表單欄位，絕不自動送出。",
+  "permissions": ["activeTab", "scripting", "tabs"],
+  "host_permissions": [
+    "http://127.0.0.1:19876/*",
+    "https://*/*",
+    "http://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

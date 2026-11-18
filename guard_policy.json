@@ -1,0 +1,23 @@
+{
+  "RestPermissions": {
+    "gmail.messages.list": { "Method": "GET", "Host": "gmail.googleapis.com", "PathPrefix": "/gmail/v1/users/me/messages" },
+    "gmail.messages.get": { "Method": "GET", "Host": "gmail.googleapis.com", "PathPrefix": "/gmail/v1/users/me/messages/" },
+    "gmail.oauth.token": { "Method": "POST", "Host": "oauth2.googleapis.com", "PathPrefix": "/token" }
+  },
+  "DestructiveCommandPatterns": [
+    "\\b(format|diskpart|bcdedit|shutdown|certutil|bitsadmin|mshta|wscript|cscript|rundll32|regsvr32)\\b",
+    "\\breg\\s+(delete|add|save|export)\\b",
+    "\\bcipher\\s+/w\\b",
+    "Remove-Item\\b.*(-Recurse|-Force).*([A-Za-z]:\\\\(Windows|Program Files|Users)|\\\\\\*)",
+    "\\b(Invoke-Expression|Set-ExecutionPolicy|iex)\\b",
+    "\\s-(EncodedCommand|enc)\\b",
+    "-Verb\\s+RunAs\\b",
+    "\\[(?:System\\.)?Reflection\\.Assembly\\]::Load"
+  ],
+  "SecretAccessPatterns": [
+    "(\\.env|gmail_token\\.json|gmail_credentials\\.json|aisecretary\\.db|guard_audit\\.db|Foundry__ApiKey|ClientSecret|RefreshToken|\\.ssh|id_rsa|\\\\AppData\\\\|\\$env:[A-Za-z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASS|CREDENTIAL|FOUNDRY|OPENAI|AZURE|AWS|GMAIL)[A-Za-z0-9_]*)"
+  ],
+  "NetworkExfilPatterns": [
+    "\\b(Invoke-WebRequest|Invoke-RestMethod|iwr|irm|curl|wget|Start-BitsTransfer|Net\\.WebClient|HttpClient)\\b"
+  ]
+}
