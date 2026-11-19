@@ -113,7 +113,7 @@ public sealed class MailSyncService
                     eventId, mail,
                     AppMessages.VipEwsTitle,
                     AppMessages.DefaultTriageSummary(mail.SenderName, mail.Subject, mail.Snippet),
-                    15, CreateVipActions());
+                    15, null);
             }
             else if (decision == MailRuleDecision.NeedsAiTriage)
             {
@@ -192,7 +192,7 @@ public sealed class MailSyncService
                     eventId, mail,
                     AppMessages.VipGmailTitle,
                     AppMessages.DefaultTriageSummary(mail.SenderName, mail.Subject, mail.Snippet),
-                    15, CreateVipActions());
+                    15, null);
             }
             else if (decision == MailRuleDecision.NeedsAiTriage)
             {
@@ -224,11 +224,4 @@ public sealed class MailSyncService
 
         return processed;
     }
-
-    private static List<NotificationButtonOption> CreateVipActions() =>
-    [
-        new("view_mail", AppMessages.ViewMailLabel, IsPrimary: false),
-        new("draft_reply", AppMessages.DraftReplyLabel, IsPrimary: true),
-        new("snooze", AppMessages.SnoozeLabel, IsPrimary: false)
-    ];
 }

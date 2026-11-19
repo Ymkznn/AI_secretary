@@ -1420,11 +1420,6 @@ public sealed class SecretaryController : IDisposable
 
                 if (!evCtx.Published)
                 {
-                    if (!finalActions.Any(a => a.Type == "fill_otp"))
-                    {
-                        finalActions = finalActions.Select(a => a with { IsPrimary = false }).ToList();
-                        finalActions.Insert(0, new NotificationButtonOption("fill_otp", AppMessages.OtpFillLabel(otp), Prompt: otp, IsPrimary: true));
-                    }
                     await PersistNotificationAsync(convId, eventId, mail, title, summary, reRemindMinutes, finalActions, ct);
                 }
                 return;

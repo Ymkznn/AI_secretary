@@ -62,17 +62,9 @@ public sealed class PushNotificationSkill : IBasicSkill
             ? new List<NotificationButtonOption>(ev.Actions)
             : new List<NotificationButtonOption>();
 
-        var otp = ev?.Otp;
         if (!includeFill)
         {
             actions.RemoveAll(a => a.Type == "fill_otp");
-        }
-        else if (!string.IsNullOrEmpty(otp) &&
-                 !actions.Any(a => a.Type == "fill_otp") &&
-                 _activity.HasMatchingVerificationWindow(title, mail?.SenderName))
-        {
-            actions = actions.Select(a => a with { IsPrimary = false }).ToList();
-            actions.Insert(0, new NotificationButtonOption("fill_otp", AppMessages.OtpFillLabel(otp), Prompt: otp, IsPrimary: true));
         }
 
         await _skills.PublishNotificationHandler(convId, eventId, mail, title, summary, reRemind, actions, ctx.Ct);

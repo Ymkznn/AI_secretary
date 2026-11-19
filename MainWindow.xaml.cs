@@ -587,12 +587,7 @@ public partial class MainWindow : Window
                         break;
                 }
             }
-            return;
         }
-
-        addAction("查看郵件", true, () => ShowMailDialogAsync(n.MailId));
-        if (pinnedId is null && n.Status == "Unread")
-            addAction("稍後", false, () => _controller.SnoozeNotificationAsync(n.NotificationId));
     }
 
     private void RefreshPinnedReminders()
