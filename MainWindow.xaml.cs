@@ -479,9 +479,9 @@ public partial class MainWindow : Window
         textBlock.Text = count > 1 ? $"{GetPinnedIcon(kind)} {count}" : GetPinnedIcon(kind);
     }
 
-    private static void TrySetClipboardText(string text)
+    private static bool TrySetClipboardText(string text)
     {
-        try { Clipboard.SetText(text); } catch { }
+        try { Clipboard.SetText(text); return true; } catch { return false; }
     }
 
     private async Task DismissPinnedForNotificationAsync(NotificationActionPayload n)
@@ -513,12 +513,14 @@ public partial class MainWindow : Window
                             var code = btn.Prompt;
                             addAction(btn.Label, btn.IsPrimary, async () =>
                             {
-                                TrySetClipboardText(code);
-                                if (pinnedId is not null)
-                                    await _controller.DismissPinnedReminderAsync(pinnedId);
-                                else
-                                    await DismissPinnedForNotificationAsync(n);
-                                OutputStatusText.Text = AiSecretary.Desktop.Resources.AppMessages.OtpCopiedStatus(code);
+                                if (TrySetClipboardText(code))
+                                {
+                                    if (pinnedId is not null)
+                                        await _controller.DismissPinnedReminderAsync(pinnedId);
+                                    else
+                                        await DismissPinnedForNotificationAsync(n);
+                                    OutputStatusText.Text = AiSecretary.Desktop.Resources.AppMessages.OtpCopiedStatus(code);
+                                }
                             });
                         }
                         break;
@@ -530,14 +532,16 @@ public partial class MainWindow : Window
                             addAction(btn.Label, btn.IsPrimary, async () =>
                             {
                                 TrySetClipboardText(code);
-                                if (pinnedId is not null)
-                                    await _controller.DismissPinnedReminderAsync(pinnedId);
-                                else
-                                    await DismissPinnedForNotificationAsync(n);
-
                                 try
                                 {
-                                    var (_, msg) = await _controller.FillOtpInExternalWindowAsync(code, titleHint);
+                                    var (ok, msg) = await _controller.FillOtpInExternalWindowAsync(code, titleHint);
+                                    if (ok)
+                                    {
+                                        if (pinnedId is not null)
+                                            await _controller.DismissPinnedReminderAsync(pinnedId);
+                                        else
+                                            await DismissPinnedForNotificationAsync(n);
+                                    }
                                     OutputStatusText.Text = msg;
                                 }
                                 catch (Exception ex)
