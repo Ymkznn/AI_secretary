@@ -9,15 +9,14 @@
 ### 1. 桌寵氣泡互動、對話視窗與置頂提醒
 - **雙介面操作**：支援桌面浮動氣泡框快速問答，以及獨立的完整對話紀錄視窗（支援貼上截圖、拖放附件、Markdown 排版與一鍵複製）。
 - **三類置頂藥丸（Pinned Pills）**：
-  - `📌` **通知提醒**：重要郵件與事件通知，可設定「僅置頂不重報（`0` 分鐘）」或「每 N 分鐘再提醒」。
+  - `📌` **通知提醒**：重要事件通知。
   - `📅` **排程提醒**：定時任務與待辦到期時自動彈出置頂。
-  - `❓` **待確認選項**：長任務需要你做決定或補充資訊時保留選項按鈕，不怕被新通知洗掉。
+  - `❓` **待確認選項**：長任務需要你做決定或補充資訊時保留選項按鈕。
 - **有分寸的主動關心**：空閒時會依目前時間、未處理的置頂事項與近期對話主動關心你；若打開一般瀏覽器分頁，可透過擴充功能僅讀取分頁標題來增加參與感（**無痕視窗自動屏蔽，且不讀取網址參數與頁面內文**）。
 
 ### 2. 郵件智慧秘書（Outlook EWS & Gmail）
-- **雙信箱整合與背景同步**：定時同步公司 Outlook（EWS）與個人 Gmail 收件匣，自動過濾已讀歷史信件，所有未讀新信由 AI 結合你的個人偏好記憶（`user_pref`）判斷重要程度與是否通知。
-- **驗證碼（OTP）極速代填**：偵測到登入／驗證頁面停留時自動加速收信，收到驗證碼後提供「複製」或「一鍵填入」目前網頁／視窗（**只填入、絕不自動送出**）。
-- **摘要與動態操作按鈕**：AI 會依郵件性質動態附上對應的操作按鈕（例如「查看原文」、針對真人來信的「草擬回覆」、「延後提醒」或「交給 AI 接續處理」），而非固定死板按鈕。
+- **雙信箱整合與背景同步**：定時同步公司 Outlook（EWS）與個人 Gmail 收件匣。
+- **摘要與草擬回覆**：可直接從通知卡點選「查看原文」、「草擬回覆」或指定 AI 接續處理該封郵件。
 
 ### 3. 行事曆、排程與勿擾模式
 - **行事曆管理**：新增、修改、查詢會議與請假行程，內建時間衝突檢查、週期行程（`FREQ=WEEKLY`）與單日跳過（`skip_date`）。
@@ -108,20 +107,14 @@ Foundry__Model=your_model_name
 
    - 其餘服務參數（Outlook EWS `Ews:Url`、Gmail OAuth `Gmail`、語音合成 `Tts`、安全護欄 `Guard` 與沙盒路徑 `Sandbox`）可在 [appsettings.json](appsettings.json) 或「設定」視窗中調整；使用者覆寫設定與 SQLite 資料庫預設存放於 `%LOCALAPPDATA%\AiSecretary.Desktop\`。
 
-### 3. 設定自己的 Gmail OAuth 憑證（選用）
-本專案開源不包含任何預置的 Google OAuth 金鑰（`.gitignore` 亦已排除 `gmail_credentials.json` 與 `gmail_token.json`）。若需使用 Gmail 同步功能，請使用你自己的 Google Cloud 專案憑證：
-1. 至 [Google Cloud Console](https://console.cloud.google.com/) 建立專案並啟用 **Gmail API**。
-2. 於「API 和服務 → 憑證」建立「**OAuth 用戶端 ID**」（應用程式類型選擇 **桌面應用程式**），取得 `Client ID` / `Client Secret` 或下載 `credentials.json`。
-3. 啟動程式後開啟「設定 → 連接 Gmail」填入 `Client ID` / `Client Secret` 或直接點「**匯入 JSON…**」，依照瀏覽器頁面完成 OAuth 授權即可（權杖僅儲存於本機 `%LOCALAPPDATA%\AiSecretary.Desktop\`）。
-
-### 4. 建置與啟動
+### 3. 建置與啟動
 
 ```powershell
 dotnet build -c Release
 dotnet run --project AiSecretary.Desktop.csproj
 ```
 
-### 5. 載入瀏覽器擴充功能（選用）
+### 4. 載入瀏覽器擴充功能（選用）
 1. 開啟 Chrome 或 Edge 的擴充功能管理頁面（`chrome://extensions` 或 `edge://extensions`）。
 2. 開啟「開發人員模式」。
 3. 點選「載入未封裝項目」，選擇專案內的 `BrowserExtension` 資料夾。
