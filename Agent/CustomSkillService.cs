@@ -47,11 +47,15 @@ public sealed class CustomSkillService
     public Task<List<CustomSkillRecord>> ListAsync(CancellationToken ct = default)
         => _store.GetCustomSkillsAsync(ct);
 
-    /// <summary>依技能名稱（不分大小寫）查詢單一自訂技能。</summary>
+    /// <summary>依技能名稱（不分大小寫，並相容 `custom:` 前綴）查詢單一自訂技能。</summary>
     public async Task<CustomSkillRecord?> FindAsync(string name, CancellationToken ct = default)
     {
+        var normalized = (name ?? "").Trim();
+        if (normalized.StartsWith("custom:", StringComparison.OrdinalIgnoreCase))
+            normalized = normalized["custom:".Length..].Trim();
+
         var all = await _store.GetCustomSkillsAsync(ct);
-        return all.FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        return all.FirstOrDefault(s => s.Name.Equals(normalized, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>
