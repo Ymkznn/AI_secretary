@@ -143,7 +143,7 @@ public sealed class OrganizeFolderSkill : IBasicSkill
         if (act != "execute")
             return $"Unsupported organize_folder action: {act} (expected scan or execute)";
 
-        if (!_sandbox.IsPathAllowed(rootFull))
+        if (!_sandbox.IsPathInsideSandbox(rootFull))
         {
             var orgPermTitle = await _localizer.TextAsync("OrganizePermTitle", "Folder Organize Permission", Array.Empty<object?>(), ct);
             var orgPermMsg = await _localizer.TextAsync("OrganizePermMessage", "Allow organizing files inside external folder '{0}'?", new object?[] { rootFull }, ct);
