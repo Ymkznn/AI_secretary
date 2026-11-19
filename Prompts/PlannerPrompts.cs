@@ -147,7 +147,9 @@ Output pure JSON only (write `title`, `summary`, and button `label`s strictly in
     /// <summary>組裝最終回覆彙整階段的 User Prompt。</summary>
     public static string BuildFinalReplyUserPrompt(string userPrompt, IReadOnlyList<string> observations)
     {
-        var obsText = observations.Count == 0 ? "(no external tool called)" : string.Join("\n\n", observations);
+        var obsText = observations.Count == 0
+            ? "(NO external tool was called and NO background task is running. Do NOT claim you are currently working on it or will report back after finishing; state honestly that no action was executed and explain why or ask how to proceed.)"
+            : string.Join("\n\n", observations);
         return $"user_prompt: {userPrompt}\n\nobservations:\n{obsText}";
     }
 
