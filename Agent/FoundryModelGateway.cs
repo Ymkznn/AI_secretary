@@ -128,9 +128,19 @@ public sealed class FoundryModelGateway : IModelGateway
         var savedKey = SecretProtector.Unprotect(await _store.GetSyncValueAsync(prefix + "key", ct));
         var savedModel = await _store.GetSyncValueAsync(prefix + "model", ct);
 
-        var defaultEp = _config.GetValue<string>("Foundry:Endpoint")?.Trim() ?? "";
-        var defaultKey = _config.GetValue<string>("Foundry:ApiKey")?.Trim() ?? "";
-        var defaultModel = _config.GetValue<string>("Foundry:Model")?.Trim() ?? "gpt-4o";
+        var tierSection = tier == ModelTier.Complex ? "Foundry:Complex" : "Foundry:Simple";
+        var defaultEp = FirstNonEmpty(
+            _config.GetValue<string>($"{tierSection}:Endpoint"),
+            _config.GetValue<string>("Foundry:Endpoint"),
+            _config.GetValue<string>("Foundry:Complex:Endpoint")) ?? "";
+        var defaultKey = FirstNonEmpty(
+            _config.GetValue<string>($"{tierSection}:ApiKey"),
+            _config.GetValue<string>("Foundry:ApiKey"),
+            _config.GetValue<string>("Foundry:Complex:ApiKey")) ?? "";
+        var defaultModel = FirstNonEmpty(
+            _config.GetValue<string>($"{tierSection}:Model"),
+            _config.GetValue<string>("Foundry:Model"),
+            _config.GetValue<string>("Foundry:Complex:Model")) ?? "gpt-4o";
 
         return (
             string.IsNullOrWhiteSpace(savedEp) ? defaultEp : savedEp.Trim(),
@@ -138,6 +148,9 @@ public sealed class FoundryModelGateway : IModelGateway
             string.IsNullOrWhiteSpace(savedModel) ? defaultModel : savedModel.Trim()
         );
     }
+
+    private static string? FirstNonEmpty(params string?[] values)
+        => values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v))?.Trim();
 
     private async Task WaitForPacingAsync(CancellationToken ct)
     {
