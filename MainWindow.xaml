@@ -371,6 +371,7 @@
                         <MenuItem x:Name="MenuTtsModeFull" Header="模式：全部唸出" Tag="full" IsCheckable="True" Click="MenuTtsMode_Click" />
                         <MenuItem x:Name="MenuTtsModeNotify" Header="模式：僅通知發聲" Tag="notify_only" IsCheckable="True" Click="MenuTtsMode_Click" />
                         <Separator />
+                        <MenuItem Header="匯入語音包 (.zip)..." Click="MenuImportVoiceZip_Click" />
                         <MenuItem Header="立即試聽一句" Click="MenuTtsTest_Click" />
                     </MenuItem>
                     <MenuItem x:Name="MenuStyleRoot" Header="語氣切換" />

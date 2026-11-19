@@ -473,6 +473,111 @@ public sealed class SecretaryController : IDisposable
     public void TestTtsVoice()
         => _tts.EnqueueJapaneseSpeech(_tts.GetTestPhrase());
 
+    public async Task<(bool Ok, string Message)> ImportVoicePackageAsync(string zipPath)
+    {
+        if (string.IsNullOrWhiteSpace(zipPath) || !File.Exists(zipPath))
+            return (false, "找不到選擇的壓縮檔。");
+
+        try
+        {
+            using var archive = System.IO.Compression.ZipFile.OpenRead(zipPath);
+            var validEntries = archive.Entries
+                .Where(e => !string.IsNullOrEmpty(e.Name) &&
+                            !e.FullName.StartsWith("__MACOSX/", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var ckpt = validEntries.FirstOrDefault(e => e.Name.EndsWith(".ckpt", StringComparison.OrdinalIgnoreCase));
+            var pth = validEntries.FirstOrDefault(e => e.Name.EndsWith(".pth", StringComparison.OrdinalIgnoreCase));
+            var wavs = validEntries.Where(e => e.Name.EndsWith(".wav", StringComparison.OrdinalIgnoreCase)).ToList();
+
+            if (ckpt is null || pth is null || wavs.Count == 0)
+            {
+                return (false, "壓縮檔須至少包含基礎所需的 3 個檔案：.ckpt（GPT 權重）、.pth（SoVITS 權重）與 .wav（參考音檔）。");
+            }
+
+            var rawName = Path.GetFileNameWithoutExtension(zipPath).Trim();
+            var profileKey = System.Text.RegularExpressions.Regex.Replace(rawName.ToLowerInvariant(), @"[^a-z0-9_]+", "_").Trim('_');
+            if (string.IsNullOrWhiteSpace(profileKey))
+                profileKey = "voice_" + Guid.NewGuid().ToString("N")[..6];
+
+            var destDir = Path.Combine(AppPaths.UserDataRoot, "tts", "voices", profileKey);
+            Directory.CreateDirectory(destDir);
+            var fullDestDir = Path.GetFullPath(destDir);
+
+            string? extractedCkpt = null;
+            string? extractedPth = null;
+            string? mainWav = null;
+            var auxWavs = new List<string>();
+            string? promptTxtPath = null;
+            string? styleMdPath = null;
+
+            foreach (var entry in validEntries)
+            {
+                var safeName = Path.GetFileName(entry.Name);
+                if (string.IsNullOrWhiteSpace(safeName)) continue;
+
+                var targetPath = Path.GetFullPath(Path.Combine(fullDestDir, safeName));
+                if (!targetPath.StartsWith(fullDestDir, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                using (var src = entry.Open())
+                using (var dst = File.Create(targetPath))
+                    await src.CopyToAsync(dst);
+
+                var ext = Path.GetExtension(safeName).ToLowerInvariant();
+                if (ext == ".ckpt" && extractedCkpt is null) extractedCkpt = targetPath;
+                else if (ext == ".pth" && extractedPth is null) extractedPth = targetPath;
+                else if (ext == ".wav")
+                {
+                    if (safeName.Contains("aux", StringComparison.OrdinalIgnoreCase))
+                        auxWavs.Add(targetPath);
+                    else if (mainWav is null)
+                        mainWav = targetPath;
+                    else
+                        auxWavs.Add(targetPath);
+                }
+                else if (ext == ".txt" && promptTxtPath is null) promptTxtPath = targetPath;
+                else if (ext == ".md" && styleMdPath is null) styleMdPath = targetPath;
+            }
+
+            if (mainWav is null && auxWavs.Count > 0)
+            {
+                mainWav = auxWavs[0];
+                auxWavs.RemoveAt(0);
+            }
+
+            if (extractedCkpt is null || extractedPth is null || mainWav is null)
+                return (false, "解壓後缺少必要檔案（.ckpt / .pth / .wav）。");
+
+            var promptText = promptTxtPath is not null && File.Exists(promptTxtPath)
+                ? (await File.ReadAllTextAsync(promptTxtPath)).Trim()
+                : "";
+            var detectedLang = (!string.IsNullOrWhiteSpace(styleMdPath) ? StyleService.ParseTtsLanguageFromMd(styleMdPath) : null) ?? "ja";
+
+            var profile = new TtsVoiceProfileSettings
+            {
+                DisplayName = rawName,
+                GptWeightsPath = extractedCkpt,
+                SovitsWeightsPath = extractedPth,
+                RefAudioPath = mainWav,
+                AuxRefAudioPaths = auxWavs.Count > 0 ? auxWavs.ToArray() : null,
+                PromptText = promptText,
+                StylePromptPath = styleMdPath,
+                PromptLang = detectedLang,
+                TextLang = detectedLang
+            };
+
+            await _settings.SaveOverridesAsync(s => s.Tts.Profiles[profileKey] = profile);
+            var (_, _, curMode) = GetTtsSettings();
+            await SaveTtsSettingsAsync(true, profileKey, curMode);
+            return (true, $"已成功匯入並切換語音「{rawName}」。");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"匯入語音包失敗：{ex.Message}");
+        }
+    }
+
     public async Task SetOutputFadeSecondsAsync(int seconds)
     {
         var clamped = Math.Clamp(seconds, 0, 120);

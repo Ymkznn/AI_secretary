@@ -648,9 +648,21 @@ public sealed class TtsService : IDisposable
                        ?? (string.IsNullOrWhiteSpace(tts.RefAudioPath) ? null : tts.RefAudioPath)
                        ?? FindVoiceAsset(group, "*.wav")
                        ?? "";
-        var promptText = prof?.PromptText ?? tts.PromptText ?? "";
+        var promptText = prof?.PromptText;
+        if (string.IsNullOrWhiteSpace(promptText))
+        {
+            promptText = tts.PromptText;
+            if (string.IsNullOrWhiteSpace(promptText))
+            {
+                var txtPath = FindVoiceAsset(group, "*.txt");
+                if (!string.IsNullOrWhiteSpace(txtPath) && File.Exists(txtPath))
+                {
+                    try { promptText = File.ReadAllText(txtPath, Encoding.UTF8).Trim(); } catch { }
+                }
+            }
+        }
 
-        return (refAudio, promptText);
+        return (refAudio, promptText ?? "");
     }
 
     private async Task<byte[]?> SynthesizeWavAsync(string baseUrl, string sentence, CancellationToken ct)
@@ -664,7 +676,7 @@ public sealed class TtsService : IDisposable
 
         var tts = _settings.Current.Tts;
         var prof = GetActiveProfileSettings();
-        var promptLang = GetProfileSetting("PromptLang", "zh");
+        var promptLang = prof?.PromptLang ?? (string.IsNullOrWhiteSpace(tts.PromptLang) ? TargetLang : TargetLang);
         var textLang = TargetLang;
         var auxRefs = (prof?.AuxRefAudioPaths ?? tts.AuxRefAudioPaths ?? Array.Empty<string>())
             .Where(File.Exists)

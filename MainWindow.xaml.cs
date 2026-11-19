@@ -1807,6 +1807,24 @@ public partial class MainWindow : Window
         _controller.TestTtsVoice();
     }
 
+    private async void MenuImportVoiceZip_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "匯入語音包 (.zip)",
+            Filter = "語音包壓縮檔 (*.zip)|*.zip"
+        };
+        if (dlg.ShowDialog() != true) return;
+
+        var (ok, msg) = await _controller.ImportVoicePackageAsync(dlg.FileName);
+        if (!ok)
+        {
+            MessageBox.Show(this, msg, "匯入語音包失敗", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        OutputStatusText.Text = msg;
+    }
+
     private void MenuDetails_Click(object sender, RoutedEventArgs e) => OpenMonitorWindow();
 
     private void MenuSettings_Click(object sender, RoutedEventArgs e) => OpenSettingsWindow();
