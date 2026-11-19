@@ -723,7 +723,7 @@ public sealed class SecretaryController : IDisposable
             ConversationId = ConversationId,
             Role = "assistant",
             Content = "",
-            StatusText = AppMessages.Localize("ProcessingStatus", "Processing..."),
+            StatusText = await AppMessages.LocalizeAsync("ProcessingStatus", "Processing..."),
             IsStreaming = true,
             TaskId = taskId,
             CreatedAt = DateTimeOffset.UtcNow.AddMilliseconds(5)
@@ -1111,7 +1111,7 @@ public sealed class SecretaryController : IDisposable
                             {
                                 ConversationId = ConversationId,
                                 Role = "assistant",
-                                Content = AppMessages.LocalizeFormat("BgTaskFailed", "Background task failed: {0}", ex.Message),
+                                Content = await AppMessages.LocalizeFormatAsync("BgTaskFailed", "Background task failed: {0}", ex.Message),
                                 IsStreaming = false,
                                 TaskId = taskId,
                                 CreatedAt = DateTimeOffset.UtcNow

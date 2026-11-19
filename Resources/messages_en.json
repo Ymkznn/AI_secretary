@@ -1,5 +1,8 @@
 {
   "MissingLlmConfig": "LLM Endpoint or API Key is not configured. Please set it in Settings -> LLM or .env.",
+  "ProcessingStatus": "Processing...",
+  "BgTaskFailed": "Background task failed: {0}",
+  "GuardSkillDisabled": "Skill '{0}' is disabled.",
   "ErrorPrefix": "Error while processing",
   "StatusSpeechTitle": "AI Secretary Status",
   "ExecuteSkillTitle": "Confirm Low-Risk Command",

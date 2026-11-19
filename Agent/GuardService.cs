@@ -140,7 +140,7 @@ public sealed class GuardService
         var norm = NormalizeSkillKey(skillName);
         if (_disabledSkills.Contains(skillName) || _disabledSkills.Contains(norm))
         {
-            return Block(skillName, skillName, $"Skill '{skillName}' is disabled.");
+            return Block(skillName, skillName, Resources.AppMessages.LocalizeFormat("GuardSkillDisabled", "Skill '{0}' is disabled.", skillName));
         }
 
         if (!_allowedSkills.Contains(skillName) && !_allowedSkills.Contains(norm))
