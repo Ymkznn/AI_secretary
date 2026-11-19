@@ -100,6 +100,11 @@ public sealed class SecretaryController : IDisposable
 
     public bool ResolveCommandApproval(string requestId, CommandApprovalDecision decision)
         => _interaction.ResolveCommandApproval(requestId, decision);
+    public event Action<PendingInteractionRequest>? InteractionAdded
+    {
+        add => _interaction.PendingRequestAdded += value;
+        remove => _interaction.PendingRequestAdded -= value;
+    }
     public event Action<string>? InteractionResolved
     {
         add => _interaction.PendingRequestResolved += value;

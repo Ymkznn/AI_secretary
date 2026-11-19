@@ -111,6 +111,7 @@ public partial class MainWindow : Window
             return tcs.Task;
         };
 
+        _controller.InteractionAdded += _req => Dispatcher.InvokeAsync(RefreshPinnedReminders);
         _controller.InteractionResolved += _id => Dispatcher.InvokeAsync(() =>
         {
             if (_cancelPendingPrompt is { } cancel)
@@ -121,6 +122,7 @@ public partial class MainWindow : Window
                 OutputActionsPanel.Visibility = Visibility.Collapsed;
                 _ = RefreshOutputAsync();
             }
+            RefreshPinnedReminders();
         });
         _controller.StateChanged += () => Dispatcher.InvokeAsync(RefreshOutputAsync);
         _controller.PinnedRemindersChanged += () => Dispatcher.InvokeAsync(RefreshPinnedReminders);
@@ -595,10 +597,11 @@ public partial class MainWindow : Window
     {
         PinnedRemindersPanel.Children.Clear();
         var items = _controller.GetPinnedReminders();
+        var pendingInteractions = _controller.GetPendingInteractions();
 
         var notifCount = items.Count(i => i.Kind == PinnedItemKind.Notification);
         var schedCount = items.Count(i => i.Kind == PinnedItemKind.Schedule);
-        var confirmCount = items.Count(i => i.Kind == PinnedItemKind.Confirmation);
+        var confirmCount = items.Count(i => i.Kind == PinnedItemKind.Confirmation) + pendingInteractions.Count;
 
         PinnedItemKind? newlyAddedKind = null;
         foreach (var (kind, cnt) in new[]
@@ -632,7 +635,9 @@ public partial class MainWindow : Window
             _suppressPinnedDuringAlertBubble = false;
         }
 
-        if (_expandedPinnedKind is PinnedItemKind active && items.All(i => i.Kind != active))
+        if (_expandedPinnedKind is PinnedItemKind active &&
+            items.All(i => i.Kind != active) &&
+            !(active == PinnedItemKind.Confirmation && pendingInteractions.Count > 0))
             _expandedPinnedKind = null;
 
         if (_expandedPinnedKind is PinnedItemKind openKind)
@@ -748,9 +753,113 @@ public partial class MainWindow : Window
                 card.Child = stack;
                 PinnedRemindersPanel.Children.Add(card);
             }
+
+            if (expandedKind == PinnedItemKind.Confirmation)
+            {
+                var (cBgL, cBdL, cBgD, cBdD) = GetPinnedColors(PinnedItemKind.Confirmation);
+                foreach (var req in pendingInteractions)
+                {
+                    var card = new Border
+                    {
+                        CornerRadius = new CornerRadius(12),
+                        BorderThickness = new Thickness(1),
+                        Padding = new Thickness(10, 8, 10, 8),
+                        Margin = new Thickness(0, 0, 0, 5),
+                        Background = BrushFrom(_isDark ? cBgD : cBgL),
+                        BorderBrush = BrushFrom(_isDark ? cBdD : cBdL),
+                        Effect = (System.Windows.Media.Effects.Effect)FindResource("GlassShadow")
+                    };
+
+                    var stack = new StackPanel();
+                    var topDock = new DockPanel { LastChildFill = true };
+
+                    var closeBtn = new Button
+                    {
+                        Content = "✕",
+                        FontSize = 11,
+                        FontWeight = FontWeights.Bold,
+                        Width = 20,
+                        Height = 20,
+                        Padding = new Thickness(0),
+                        Background = Brushes.Transparent,
+                        BorderThickness = new Thickness(0),
+                        Foreground = BrushFrom(_isDark ? "#CBD5E1" : "#64748B"),
+                        Cursor = System.Windows.Input.Cursors.Hand,
+                        VerticalAlignment = VerticalAlignment.Top
+                    };
+                    DockPanel.SetDock(closeBtn, Dock.Right);
+                    var reqId = req.RequestId;
+                    var reqKind = req.Kind;
+                    closeBtn.Click += (_, _) =>
+                    {
+                        if (reqKind == "path_permission") _controller.ResolvePathPermission(reqId, PathPermissionDecision.Deny);
+                        else if (reqKind == "command_approval") _controller.ResolveCommandApproval(reqId, CommandApprovalDecision.Deny);
+                        else _controller.ResolveConfirmation(reqId, false);
+                    };
+                    topDock.Children.Add(closeBtn);
+
+                    var titleTb = new TextBlock
+                    {
+                        FontSize = 12.5,
+                        FontWeight = FontWeights.SemiBold,
+                        Foreground = BrushFrom(_isDark ? "#F8FAFC" : "#0F172A"),
+                        TextWrapping = TextWrapping.Wrap,
+                        Margin = new Thickness(0, 0, 6, 0)
+                    };
+                    MarkdownRenderer.AppendInlines(titleTb.Inlines, $"❓ {req.Title}", _isDark);
+                    topDock.Children.Add(titleTb);
+                    stack.Children.Add(topDock);
+
+                    var bodyText = req.Message;
+                    if (req.Kind == "path_permission" && !string.IsNullOrWhiteSpace(req.TargetPath))
+                        bodyText = $"{req.Message}\n`{req.TargetPath}`";
+                    if (!string.IsNullOrWhiteSpace(bodyText))
+                    {
+                        var bodyTb = new TextBlock
+                        {
+                            FontSize = 12,
+                            Foreground = BrushFrom(_isDark ? "#CBD5E1" : "#334155"),
+                            TextWrapping = TextWrapping.Wrap,
+                            Margin = new Thickness(0, 3, 0, 0)
+                        };
+                        MarkdownRenderer.AppendInlines(bodyTb.Inlines, bodyText, _isDark);
+                        stack.Children.Add(bodyTb);
+                    }
+
+                    var actions = new WrapPanel { Margin = new Thickness(0, 6, 0, 0) };
+                    void AddChoice(string label, bool isPrimary, Action onClick)
+                    {
+                        var b = MakeActionButton(label, isPrimary);
+                        b.Click += (_, _) => onClick();
+                        actions.Children.Add(b);
+                    }
+
+                    if (req.Kind == "path_permission")
+                    {
+                        AddChoice("永久信任", true, () => _controller.ResolvePathPermission(reqId, PathPermissionDecision.TrustPermanently));
+                        AddChoice("信任一次", false, () => _controller.ResolvePathPermission(reqId, PathPermissionDecision.AllowOnce));
+                        AddChoice("拒絕", false, () => _controller.ResolvePathPermission(reqId, PathPermissionDecision.Deny));
+                    }
+                    else if (req.Kind == "command_approval")
+                    {
+                        AddChoice("同意本次", true, () => _controller.ResolveCommandApproval(reqId, CommandApprovalDecision.AllowOnce));
+                        AddChoice("本任務內允許", false, () => _controller.ResolveCommandApproval(reqId, CommandApprovalDecision.AllowForTask));
+                        AddChoice("拒絕", false, () => _controller.ResolveCommandApproval(reqId, CommandApprovalDecision.Deny));
+                    }
+                    else
+                    {
+                        AddChoice("同意", true, () => _controller.ResolveConfirmation(reqId, true));
+                        AddChoice("拒絕", false, () => _controller.ResolveConfirmation(reqId, false));
+                    }
+
+                    stack.Children.Add(actions);
+                    card.Child = stack;
+                    PinnedRemindersPanel.Children.Add(card);
+                }
+            }
         }
 
-        if (items.Count == 0 || _suppressPinnedDuringAlertBubble)
+        if ((items.Count == 0 && pendingInteractions.Count == 0) || _suppressPinnedDuringAlertBubble)
         {
             _pinnedCollapseTimer.Stop();
             _expandedPinnedKind = null;
@@ -897,7 +1006,7 @@ public partial class MainWindow : Window
     {
         if (OutputBorder.Visibility != Visibility.Visible || _isReplying) return;
 
-        bool shrinkToPill = _suppressPinnedDuringAlertBubble || _controller.GetPinnedReminders().Count > 0;
+        bool shrinkToPill = _suppressPinnedDuringAlertBubble || _controller.GetPinnedReminders().Count > 0 || _controller.GetPendingInteractions().Count > 0;
         var dur = TimeSpan.FromMilliseconds(shrinkToPill ? 240 : 350);
         var ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
         var anim = new DoubleAnimation(OutputBorder.Opacity, 0, dur);
@@ -1035,14 +1144,15 @@ public partial class MainWindow : Window
 
     private void CloseBubbleBtn_Click(object sender, RoutedEventArgs e)
     {
-        if (_cancelPendingPrompt is { } cancel)
+        // If there is a pending permission request, keep it alive in the ❓ pill instead of forcing Deny when closing the bubble.
+        if (_controller.GetPendingInteractions().Count == 0 && _cancelPendingPrompt is { } cancel)
         {
             _cancelPendingPrompt = null;
             cancel();
         }
 
         _fadeTimer.Stop();
-        if (_suppressPinnedDuringAlertBubble || _controller.GetPinnedReminders().Count > 0)
+        if (_suppressPinnedDuringAlertBubble || _controller.GetPinnedReminders().Count > 0 || _controller.GetPendingInteractions().Count > 0)
         {
             FadeOutBubble();
             return;
