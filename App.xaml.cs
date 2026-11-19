@@ -110,6 +110,9 @@ public partial class App : System.Windows.Application
             () => appSettings.Current.Llm.ReplyLanguage,
             _services.GetRequiredService<SqliteStore>(),
             _services.GetRequiredService<IModelGateway>());
+        await HolidayHelper.InitializeAsync(
+            _services.GetRequiredService<SqliteStore>(),
+            _services.GetRequiredService<IModelGateway>());
 
         _services.GetRequiredService<GuardService>()
             .RegisterSkillNames(_services.GetRequiredService<SkillRegistry>().All.Select(s => s.Name));

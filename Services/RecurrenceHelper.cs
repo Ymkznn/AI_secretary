@@ -190,7 +190,7 @@ public static class RecurrenceHelper
             if (exceptionDates is not null && exceptionDates.Contains(ymd)) continue;
 
             if (parsed.IsWorkdaysShortcut &&
-                (HolidayHelper.IsWeekend(d) || HolidayHelper.TryGetTaiwanHolidayName(d, out _)))
+                (HolidayHelper.IsWeekend(d) || HolidayHelper.IsHoliday(d)))
             {
                 continue;
             }

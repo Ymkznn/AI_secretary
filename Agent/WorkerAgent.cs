@@ -205,14 +205,13 @@ public sealed class WorkerAgent
     {
         foreach (var obs in observations)
         {
-            var idx = obs.IndexOf("[附件：", StringComparison.Ordinal);
-            if (idx < 0) continue;
-            var end = obs.IndexOf(']', idx);
-            if (end <= idx) continue;
-            var path = obs[(idx + 4)..end].Trim();
-            if (Path.GetFileName(path).StartsWith("screen_", StringComparison.OrdinalIgnoreCase) && File.Exists(path))
+            foreach (System.Text.RegularExpressions.Match m in AttachmentExtractor.AttachmentPattern.Matches(obs))
             {
-                try { File.Delete(path); } catch { }
+                var path = m.Groups[1].Value.Trim();
+                if (Path.GetFileName(path).StartsWith("screen_", StringComparison.OrdinalIgnoreCase) && File.Exists(path))
+                {
+                    try { File.Delete(path); } catch { }
+                }
             }
         }
     }

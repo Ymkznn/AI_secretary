@@ -74,7 +74,7 @@ public sealed class InspectScreenSkill : IBasicSkill
         }
         else if (ok && !string.IsNullOrWhiteSpace(filePath))
         {
-            ctx.Observations.Add($"{msg}\nopen_windows:\n{winListText}\n[附件：{filePath}]");
+            ctx.Observations.Add($"{msg}\nopen_windows:\n{winListText}\n[Attachment: {filePath}]");
             ctx.CompletedSteps.Add("inspect_screen:capture");
         }
         else

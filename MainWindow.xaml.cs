@@ -2024,7 +2024,7 @@ public partial class MainWindow : Window
 
         if (_attachedFiles.Count > 0)
         {
-            var filesNote = string.Join("\n", _attachedFiles.Select(f => $"[附件：{f}]"));
+            var filesNote = string.Join("\n", _attachedFiles.Select(f => $"[Attachment: {f}]"));
             text = string.IsNullOrWhiteSpace(text) ? filesNote : $"{text}\n{filesNote}";
             _attachedFiles.Clear();
             RefreshAttachmentChips();

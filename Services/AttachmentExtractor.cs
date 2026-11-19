@@ -7,11 +7,11 @@ using AiSecretary.Desktop.Agent;
 namespace AiSecretary.Desktop.Services;
 
 /// <summary>
-/// Extracts text/binary payloads from [附件：path] markers in user prompts (PDF via PdfPig, DOCX, text files, and images).
+/// Extracts text/binary payloads from [Attachment: path] markers in user prompts (PDF via PdfPig, DOCX, text files, and images).
 /// </summary>
 public static class AttachmentExtractor
 {
-    public static readonly Regex AttachmentPattern = new(@"\[附件：([^\]]+)\]", RegexOptions.Compiled);
+    public static readonly Regex AttachmentPattern = new(@"\[Attachment:\s*([^\]]+)\]", RegexOptions.Compiled);
 
     public static bool HasImageAttachment(string text)
     {
