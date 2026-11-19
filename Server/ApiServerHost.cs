@@ -68,6 +68,7 @@ public sealed class ApiServerHost : IAsyncDisposable
         _interaction.PendingRequestAdded += req => BroadcastEvent("interaction_requested", req);
         _interaction.PendingRequestResolved += id => BroadcastEvent("interaction_resolved", new { requestId = id });
         _browserBridge.ExtractRequested += requestId => BroadcastEvent("browser_extract_request", new { requestId });
+        _browserBridge.DomRequested += (requestId, selector, maxChars) => BroadcastEvent("browser_dom_request", new { requestId, selector, maxChars });
         _browserBridge.ApplyFillsRequested += fills => BroadcastEvent("browser_apply_fills", new { fills });
         _browserBridge.FillOtpRequested += (requestId, code) => BroadcastEvent("browser_fill_otp", new { requestId, code });
     }
@@ -214,6 +215,10 @@ public sealed class ApiServerHost : IAsyncDisposable
             _browserBridge.CompleteExtract(requestId, form)
                 ? Results.Ok(new { received = true })
                 : Results.NotFound(new { error = "Extract request not found or expired." }));
+        _app.MapPost("/api/browser/dom-result/{requestId}", (string requestId, BrowserDomSnapshot dom) =>
+            _browserBridge.CompleteDom(requestId, dom)
+                ? Results.Ok(new { received = true })
+                : Results.NotFound(new { error = "DOM request not found or expired." }));
         _app.MapPost("/api/browser/otp-result/{requestId}", (string requestId, BrowserOtpFillResult result) =>
             _browserBridge.CompleteFillOtp(requestId, result)
                 ? Results.Ok(new { received = true })

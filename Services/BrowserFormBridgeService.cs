@@ -10,21 +10,34 @@ public sealed record BrowserOtpFillResult(
     string? Mode = null,
     string? Error = null);
 
+public sealed record BrowserDomSnapshot(
+    string Url,
+    string Title,
+    string Html,
+    string Text,
+    bool Truncated,
+    string? Error = null);
+
 /// <summary>
-/// Bridges on-demand form read/fill and OTP DOM fill commands between C# Agent skills and the Chrome/Edge MV3 Extension over SSE + HTTP,
+/// Bridges on-demand form read/fill, full DOM read, and OTP DOM fill commands between C# Agent skills and the Chrome/Edge MV3 Extension over SSE + HTTP,
 /// so the user never has to manually click the browser extension icon.
 /// </summary>
 public sealed class BrowserFormBridgeService
 {
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserFormContext?>> _extractWaiters = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserDomSnapshot?>> _domWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserOtpFillResult?>> _otpWaiters = new();
 
     public event Action<string>? ExtractRequested;
+    public event Action<string, string?, int>? DomRequested;
     public event Action<IReadOnlyList<BrowserFillAction>>? ApplyFillsRequested;
     public event Action<string, string>? FillOtpRequested;
 
     public Task<BrowserFormContext?> RequestActiveTabFormAsync(TimeSpan timeout, CancellationToken ct = default)
         => WaitWithTimeoutAsync(_extractWaiters, id => ExtractRequested?.Invoke(id), timeout, ct);
+
+    public Task<BrowserDomSnapshot?> RequestActiveTabDomAsync(string? selector, int maxChars, TimeSpan timeout, CancellationToken ct = default)
+        => WaitWithTimeoutAsync(_domWaiters, id => DomRequested?.Invoke(id, selector, maxChars), timeout, ct);
 
     public Task<BrowserOtpFillResult?> RequestFillOtpAsync(string code, TimeSpan timeout, CancellationToken ct = default)
         => WaitWithTimeoutAsync(_otpWaiters, id => FillOtpRequested?.Invoke(id, code), timeout, ct);
@@ -64,6 +77,14 @@ public sealed class BrowserFormBridgeService
         if (!_extractWaiters.TryRemove(requestId, out var tcs))
             return false;
         tcs.TrySetResult(context);
+        return true;
+    }
+
+    public bool CompleteDom(string requestId, BrowserDomSnapshot snapshot)
+    {
+        if (!_domWaiters.TryRemove(requestId, out var tcs))
+            return false;
+        tcs.TrySetResult(snapshot);
         return true;
     }
 

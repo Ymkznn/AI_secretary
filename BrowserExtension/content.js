@@ -138,9 +138,39 @@
     return { filled: true, mode: 'single', title: document.title, url: location.href };
   }
 
+  function extractDom(selector, maxChars) {
+    const limit = Math.max(1000, Math.min(Number(maxChars) || 80000, 250000));
+    const root = selector ? document.querySelector(selector) : document.documentElement;
+    if (!root) {
+      return { url: location.href, title: document.title, html: '', text: '', truncated: false, error: `selector not found: ${selector}` };
+    }
+
+    const clone = root.cloneNode(true);
+    for (const pw of clone.querySelectorAll('input[type="password"]')) {
+      pw.removeAttribute('value');
+      pw.value = '';
+    }
+    for (const noise of clone.querySelectorAll('script, style, noscript')) {
+      noise.remove();
+    }
+
+    const rawHtml = clone.outerHTML || '';
+    const rawText = (root.innerText || document.body?.innerText || '').trim();
+    const truncated = rawHtml.length > limit || rawText.length > limit;
+    return {
+      url: location.href,
+      title: document.title,
+      html: rawHtml.length > limit ? rawHtml.slice(0, limit) : rawHtml,
+      text: rawText.length > limit ? rawText.slice(0, limit) : rawText,
+      truncated
+    };
+  }
+
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === 'EXTRACT_FORM') {
       sendResponse(extractFormFields());
+    } else if (msg?.type === 'EXTRACT_DOM') {
+      sendResponse(extractDom(msg.selector || '', msg.maxChars));
     } else if (msg?.type === 'APPLY_FILLS') {
       const count = applyFills(msg.fills);
       sendResponse({ applied: count });

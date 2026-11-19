@@ -63,6 +63,24 @@ async function handleExtract(requestId) {
   }
 }
 
+async function handleExtractDom(requestId, selector, maxChars) {
+  try {
+    const tab = await getTargetTab();
+    if (!tab) return;
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+    const domCtx = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_DOM', selector: selector || '', maxChars: maxChars || 80000 });
+    if (!domCtx) return;
+
+    await fetch(`${API_BASE}/api/browser/dom-result/${encodeURIComponent(requestId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(domCtx)
+    });
+  } catch (e) {
+    console.debug('AiSecretary extract DOM error:', e);
+  }
+}
+
 async function handleApplyFills(fills) {
   try {
     const tab = await getTargetTab();
@@ -104,6 +122,12 @@ function connectSse() {
     try {
       const data = JSON.parse(ev.data);
       if (data?.requestId) handleExtract(data.requestId);
+    } catch {}
+  });
+  sse.addEventListener('browser_dom_request', (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      if (data?.requestId) handleExtractDom(data.requestId, data.selector, data.maxChars);
     } catch {}
   });
   sse.addEventListener('browser_apply_fills', (ev) => {

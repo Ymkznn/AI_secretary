@@ -19,14 +19,14 @@ public sealed class BrowserFormSkill : IBasicSkill
     }
 
     public string Name => "browser_form";
-    public string DisplayDescription => "Read and prefill browser tab forms via Extension";
+    public string DisplayDescription => "Read form/DOM and prefill browser tab forms via Extension";
     public string MainAgentSpec => """
             browser_form
-               - Purpose: Read form fields from the active Chrome/Edge tab or prefill fields via Browser Extension (never auto-submits).
-               - Args: {"action": "read|fill", "fills": [{"field_id": "aisec_0", "value": "..."}]}
+               - Purpose: Read form fields, inspect up to the full page DOM (on-demand), or prefill fields in the active Chrome/Edge tab via Browser Extension (never auto-submits).
+               - Args: {"action": "read|read_dom|fill", "selector": "optional CSS selector for read_dom", "max_chars": 80000, "fills": [{"field_id": "aisec_0", "value": "..."}]}
             
         """;
-    public string PlannerSpec => """browser_form: Read or prefill active browser tab form via Extension (never submits). args: {"action":"read|fill","fills":[{"field_id":"...","value":"..."}]}""";
+    public string PlannerSpec => """browser_form: Read form fields, full page DOM (read_dom), or prefill active browser tab via Extension (never submits). args: {"action":"read|read_dom|fill","selector":"optional","max_chars":80000,"fills":[{"field_id":"...","value":"..."}]}""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
@@ -53,6 +53,28 @@ public sealed class BrowserFormSkill : IBasicSkill
                 (f.Options is { Count: > 0 } ? $" | options=[{string.Join(", ", f.Options.Take(10))}]" : ""));
             ctx.Observations.Add($"browser_form: \"{form.Title}\" ({form.Url})\nfields:\n" + string.Join("\n", lines));
             ctx.CompletedSteps.Add("browser_form:read");
+            return;
+        }
+
+        if (action == "read_dom")
+        {
+            var selector = ctx.GetArg("selector");
+            var maxChars = int.TryParse(ctx.GetArg("max_chars"), out var mc) ? Math.Clamp(mc, 1000, 250000) : 80000;
+            var dom = await _bridge.RequestActiveTabDomAsync(selector, maxChars, TimeSpan.FromSeconds(8), ctx.Ct);
+            if (dom is null)
+            {
+                ctx.Observations.Add("browser_form: extension did not respond within 8s for read_dom (ensure Chrome/Edge extension is loaded and tab refreshed).");
+                return;
+            }
+            if (!string.IsNullOrWhiteSpace(dom.Error))
+            {
+                ctx.Observations.Add($"browser_form: read_dom failed on \"{dom.Title}\" ({dom.Url}): {dom.Error}");
+                return;
+            }
+
+            var note = dom.Truncated ? " [truncated]" : "";
+            ctx.Observations.Add($"browser_form: DOM snapshot of \"{dom.Title}\" ({dom.Url}){note}\n--- TEXT ---\n{dom.Text}\n--- HTML ---\n{dom.Html}");
+            ctx.CompletedSteps.Add("browser_form:read_dom");
             return;
         }
 
