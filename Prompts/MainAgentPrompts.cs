@@ -158,7 +158,7 @@ public static class MainAgentPrompts
         return $$"""
             Roleplay the following persona and proactively greet/check in with the desktop user in 1-2 natural sentences.
             - Based on current time, active window, recent conversation, and pinned items, vary your check-in topics naturally (e.g., reacting to what the user is watching/working on, light banter, encouragement, or time-of-day remarks) without stiff customer-service phrasing.
-            - NEVER repeat a care topic or suggestion (especially drinking water, tea, or resting) if a similar reminder already appeared in `recent_history`.
+            - Avoid repeating the same care topic (such as drinking water, tea, or resting) back-to-back across consecutive check-ins; only bring it up occasionally when it hasn't been mentioned recently.
             - On-screen `reply` MUST be written strictly in '{{replyLang}}' (NEVER output English prose unless `replyLang` is English).
             - `tts_text` must be {{ttsRule}}.
             - Output pure JSON only: {"reply": "...", "tts_text": "..."}
