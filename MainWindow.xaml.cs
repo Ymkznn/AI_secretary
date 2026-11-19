@@ -479,6 +479,23 @@ public partial class MainWindow : Window
         textBlock.Text = count > 1 ? $"{GetPinnedIcon(kind)} {count}" : GetPinnedIcon(kind);
     }
 
+    private static void TrySetClipboardText(string text)
+    {
+        try { Clipboard.SetText(text); } catch { }
+    }
+
+    private async Task DismissPinnedForNotificationAsync(NotificationActionPayload n)
+    {
+        var matches = _controller.GetPinnedReminders()
+            .Where(p => p.MailNotification is not null &&
+                        (p.MailNotification.NotificationId == n.NotificationId ||
+                         (!string.IsNullOrEmpty(n.MailId) && p.MailNotification.MailId == n.MailId)))
+            .Select(p => p.Id)
+            .ToList();
+        foreach (var id in matches)
+            await _controller.DismissPinnedReminderAsync(id);
+    }
+
     private void RenderNotificationActions(
         NotificationActionPayload n,
         string? pinnedId,
@@ -494,11 +511,14 @@ public partial class MainWindow : Window
                         if (!string.IsNullOrWhiteSpace(btn.Prompt))
                         {
                             var code = btn.Prompt;
-                            addAction(btn.Label, btn.IsPrimary, () =>
+                            addAction(btn.Label, btn.IsPrimary, async () =>
                             {
-                                Clipboard.SetText(code);
+                                TrySetClipboardText(code);
+                                if (pinnedId is not null)
+                                    await _controller.DismissPinnedReminderAsync(pinnedId);
+                                else
+                                    await DismissPinnedForNotificationAsync(n);
                                 OutputStatusText.Text = AiSecretary.Desktop.Resources.AppMessages.OtpCopiedStatus(code);
-                                return Task.CompletedTask;
                             });
                         }
                         break;
@@ -509,11 +529,21 @@ public partial class MainWindow : Window
                             var titleHint = n.Title;
                             addAction(btn.Label, btn.IsPrimary, async () =>
                             {
-                                Clipboard.SetText(code);
-                                var (_, msg) = await _controller.FillOtpInExternalWindowAsync(code, titleHint);
+                                TrySetClipboardText(code);
                                 if (pinnedId is not null)
                                     await _controller.DismissPinnedReminderAsync(pinnedId);
-                                OutputStatusText.Text = msg;
+                                else
+                                    await DismissPinnedForNotificationAsync(n);
+
+                                try
+                                {
+                                    var (_, msg) = await _controller.FillOtpInExternalWindowAsync(code, titleHint);
+                                    OutputStatusText.Text = msg;
+                                }
+                                catch (Exception ex)
+                                {
+                                    OutputStatusText.Text = ex.Message;
+                                }
                             });
                         }
                         break;
