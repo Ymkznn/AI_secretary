@@ -137,13 +137,11 @@ public sealed class TtsService : IDisposable
 
     public string GetTestPhrase()
     {
-        var custom = GetActiveProfileSettings()?.TestPhrase;
+        var custom = GetActiveProfileSettings()?.TestPhrase ?? _styles.GetActiveTtsTestPhrase();
         if (!string.IsNullOrWhiteSpace(custom))
             return custom;
 
-        return TargetLang == "ja"
-            ? "準備ができましたよ。いつでも確認してくださいね。"
-            : AppMessages.Localize("TtsTestPhrase", "Voice test completed. Ready whenever you are.");
+        return AppMessages.Localize("TtsTestPhrase", "Voice test completed. Ready whenever you are.");
     }
 
     private TtsVoiceProfileSettings? GetActiveProfileSettings()
@@ -457,7 +455,7 @@ public sealed class TtsService : IDisposable
         return true;
     }
 
-    private static string FallbackPhrase(string title, string content, string lang)
+    private string FallbackPhrase(string title, string content, string lang)
     {
         var combined = $"{title} {content}";
         bool isMail = combined.Contains("mail", StringComparison.OrdinalIgnoreCase) ||
@@ -467,12 +465,11 @@ public sealed class TtsService : IDisposable
                           combined.Contains("meeting", StringComparison.OrdinalIgnoreCase) ||
                           combined.Contains(AppMessages.Localize("TtsKeywordSchedule", "reminder"), StringComparison.OrdinalIgnoreCase);
 
-        if (lang == "ja")
-        {
-            if (isMail) return "新しいメールのお知らせがありますよ。確認してくださいね。";
-            if (isSchedule) return "予定のお知らせがありますよ。確認してくださいね。";
-            return "確認が終わりましたよ。画面を見てみてくださいね。";
-        }
+        var kind = isMail ? "mail" : isSchedule ? "schedule" : "done";
+        var mdFallback = _styles.GetActiveTtsFallbackPhrase(kind);
+        if (!string.IsNullOrWhiteSpace(mdFallback))
+            return mdFallback;
+
         if (lang == "en")
         {
             if (isMail) return "You have a new email notification.";

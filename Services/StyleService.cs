@@ -115,13 +115,23 @@ public sealed class StyleService
         return _cachedTtsLang;
     }
 
+    public string? GetActiveTtsTestPhrase()
+        => string.IsNullOrWhiteSpace(_activeStylePath) ? null : ParseMdField(_activeStylePath, "tts_test_phrase");
+
+    public string? GetActiveTtsFallbackPhrase(string kind)
+        => string.IsNullOrWhiteSpace(_activeStylePath) ? null : ParseMdField(_activeStylePath, $"tts_fallback_{kind}");
+
     internal static string? ParseTtsLanguageFromMd(string path)
+        => ParseMdField(path, "tts_lang");
+
+    internal static string? ParseMdField(string path, string key)
     {
         try
         {
             if (!File.Exists(path)) return null;
             var md = File.ReadAllText(path, Encoding.UTF8);
-            var m = Regex.Match(md, @"(?im)^\s*(?:tts_lang|tts-lang|tts語言)\s*[:：]\s*([^\r\n]+)");
+            var escaped = Regex.Escape(key).Replace("_", "[-_]");
+            var m = Regex.Match(md, $@"(?im)^\s*{escaped}\s*:\s*([^\r\n]+)");
             if (!m.Success) return null;
             var val = m.Groups[1].Value.Trim().Trim('`', '"', '\'');
             return string.IsNullOrWhiteSpace(val) ? null : val;
