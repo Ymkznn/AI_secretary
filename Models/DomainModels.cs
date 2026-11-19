@@ -63,7 +63,6 @@ public sealed class ChatMessageRecord
 public enum MailRuleDecision
 {
     Ignore,
-    DirectNotify,
     NeedsAiTriage
 }
 

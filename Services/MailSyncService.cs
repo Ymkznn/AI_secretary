@@ -107,15 +107,7 @@ public sealed class MailSyncService
             if (!seenInBatch.Add($"{mail.SenderEmail}|{mail.Subject}")) continue;
 
             processed++;
-            if (decision == MailRuleDecision.DirectNotify)
-            {
-                await onNotifyAsync(
-                    eventId, mail,
-                    AppMessages.VipEwsTitle,
-                    AppMessages.DefaultTriageSummary(mail.SenderName, mail.Subject, mail.Snippet),
-                    15, null);
-            }
-            else if (decision == MailRuleDecision.NeedsAiTriage)
+            if (decision == MailRuleDecision.NeedsAiTriage)
             {
                 _ = Task.Run(async () =>
                 {
@@ -186,15 +178,7 @@ public sealed class MailSyncService
             if (!isNew) continue;
 
             processed++;
-            if (decision == MailRuleDecision.DirectNotify)
-            {
-                await onNotifyAsync(
-                    eventId, mail,
-                    AppMessages.VipGmailTitle,
-                    AppMessages.DefaultTriageSummary(mail.SenderName, mail.Subject, mail.Snippet),
-                    15, null);
-            }
-            else if (decision == MailRuleDecision.NeedsAiTriage)
+            if (decision == MailRuleDecision.NeedsAiTriage)
             {
                 _ = Task.Run(async () =>
                 {
