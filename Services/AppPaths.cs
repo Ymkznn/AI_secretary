@@ -10,9 +10,13 @@ public static class AppPaths
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "AiSecretary.Desktop");
 
+    public static string UserAgentHome { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".AiSecretary.Desktop");
+
     public static string DatabasePath => Path.Combine(UserDataRoot, "aisecretary.db");
     public static string GuardAuditDatabasePath => Path.Combine(UserDataRoot, "guard_audit.db");
-    public static string SandboxRoot => Path.Combine(UserDataRoot, "sandbox");
+    public static string SandboxRoot => Path.Combine(UserAgentHome, "sandbox");
     public static string UserStylesDir => Path.Combine(UserDataRoot, "styles");
     public static string GmailTokenPath => Path.Combine(UserDataRoot, "gmail_token.json");
     public static string UserSettingsPath => Path.Combine(UserDataRoot, "user_settings.json");
@@ -76,7 +80,10 @@ public static class AppPaths
 
         if (!Directory.EnumerateFileSystemEntries(SandboxRoot).Any())
         {
-            foreach (var root in legacyRoots)
+            var sandboxLegacyRoots = new[] { UserDataRoot }
+                .Concat(legacyRoots)
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+            foreach (var root in sandboxLegacyRoots)
             {
                 var srcSandbox = Path.Combine(root, "sandbox");
                 if (!Directory.Exists(srcSandbox) || !Directory.EnumerateFileSystemEntries(srcSandbox).Any())
