@@ -355,14 +355,6 @@ public sealed class SecretaryController : IDisposable
         _latestChoicesMsgId = null;
         _latestChoices = new List<string>();
         _latestChoicesLogicalTaskId = null;
-
-        bool removedAny;
-        lock (_pinnedLock)
-        {
-            removedAny = _pinnedReminders.RemoveAll(p => p.Kind == PinnedItemKind.Confirmation) > 0;
-        }
-        if (removedAny)
-            PinnedRemindersChanged?.Invoke();
     }
 
     public IReadOnlyList<string> GetTrustedPaths() => _sandbox.GetTrustedPaths();
@@ -737,6 +729,8 @@ public sealed class SecretaryController : IDisposable
             CreatedAt = DateTimeOffset.UtcNow.AddMilliseconds(5)
         };
         ClearChoices();
+        if (!string.IsNullOrWhiteSpace(replyToLogicalTaskId))
+            RemovePinnedConfirmation(replyToLogicalTaskId);
         await _store.UpsertChatMessageAsync(assistantMsg);
         StateChanged?.Invoke();
 
@@ -890,6 +884,7 @@ public sealed class SecretaryController : IDisposable
                             Interlocked.Increment(ref existing.RunningCount);
                             existing.LastUpdatedAt = DateTimeOffset.UtcNow;
                             activePlannerTaskIdThisTurn = existing.LogicalTaskId;
+                            RemovePinnedConfirmation(existing.LogicalTaskId);
                             return existing.LogicalTaskId;
                         }
 
