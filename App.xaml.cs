@@ -153,7 +153,10 @@ public partial class App : System.Windows.Application
         }
         catch { }
 
-        _services?.Dispose();
+        if (_services is not null)
+        {
+            try { _services.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2)); } catch { }
+        }
         base.OnExit(e);
     }
 
