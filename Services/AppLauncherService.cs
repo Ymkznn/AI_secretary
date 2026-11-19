@@ -13,22 +13,16 @@ public sealed class AppLauncherService
 {
     private static readonly Dictionary<string, string> BuiltInAliases = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["記事本"] = "notepad.exe",
         ["notepad"] = "notepad.exe",
-        ["小算盤"] = "calc.exe",
-        ["計算機"] = "calc.exe",
         ["calc"] = "calc.exe",
         ["calculator"] = "calc.exe",
-        ["小畫家"] = "mspaint.exe",
-        ["畫圖"] = "mspaint.exe",
         ["paint"] = "mspaint.exe",
         ["mspaint"] = "mspaint.exe",
-        ["檔案總管"] = "explorer.exe",
-        ["資料夾"] = "explorer.exe",
         ["explorer"] = "explorer.exe",
+        ["file explorer"] = "explorer.exe",
         ["chrome"] = "chrome.exe",
         ["google chrome"] = "chrome.exe",
-        ["瀏覽器"] = "msedge.exe",
+        ["browser"] = "msedge.exe",
         ["edge"] = "msedge.exe",
         ["microsoft edge"] = "msedge.exe",
         ["vscode"] = "code",
@@ -40,9 +34,8 @@ public sealed class AppLauncherService
         ["powerpoint"] = "powerpnt.exe",
         ["ppt"] = "powerpnt.exe",
         ["outlook"] = "outlook.exe",
-        ["工作管理員"] = "taskmgr.exe",
         ["taskmgr"] = "taskmgr.exe",
-        ["設定"] = "ms-settings:",
+        ["task manager"] = "taskmgr.exe",
         ["settings"] = "ms-settings:"
     };
 
@@ -134,8 +127,8 @@ public sealed class AppLauncherService
         // 2. Built-in aliases
         if (BuiltInAliases.TryGetValue(query, out var aliased))
         {
-            // Prefer chrome.exe if "瀏覽器" is requested and Chrome is registered
-            if (query == "瀏覽器" && FindInAppPaths("chrome.exe") is string chromePath)
+            // Prefer chrome.exe if "browser" is requested and Chrome is registered
+            if (query.Equals("browser", StringComparison.OrdinalIgnoreCase) && FindInAppPaths("chrome.exe") is string chromePath)
                 return chromePath;
             return aliased;
         }

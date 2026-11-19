@@ -768,7 +768,7 @@ public sealed class SecretaryController : IDisposable
                 _ = _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
                 StateChanged?.Invoke();
                 if (!string.IsNullOrWhiteSpace(assistantMsg.Content))
-                    ProactiveAlert?.Invoke("AI 秘書回覆", assistantMsg.Content);
+                    ProactiveAlert?.Invoke(AppMessages.Localize("AlertTitleReply", "AI Secretary Reply"), assistantMsg.Content);
             }
 
             bool turnGateAcquired = false;
@@ -946,7 +946,7 @@ public sealed class SecretaryController : IDisposable
                 }
                 else if (string.IsNullOrWhiteSpace(directTtsText))
                 {
-                    _tts.EnqueueSummarySpeech("AI 秘書回覆", pendingText, RevealReply);
+                    _tts.EnqueueSummarySpeech(AppMessages.Localize("AlertTitleReply", "AI Secretary Reply"), pendingText, RevealReply);
                 }
                 else if (!_tts.IsEnabled || _tts.ChatMode == "notify_only")
                 {
@@ -1060,7 +1060,7 @@ public sealed class SecretaryController : IDisposable
                                     if (Interlocked.Exchange(ref reportRevealed, 1) != 0) return;
                                     _ = _store.UpsertChatMessageAsync(reportMsg, CancellationToken.None);
                                     StateChanged?.Invoke();
-                                    ProactiveAlert?.Invoke("AI 秘書回報", bgReportText);
+                                    ProactiveAlert?.Invoke(AppMessages.Localize("AlertTitleReport", "AI Secretary Report"), bgReportText);
                                 }
 
                                 if (!string.IsNullOrWhiteSpace(bgDirectTtsText) && _tts.IsEnabled && _tts.ChatMode != "notify_only")
@@ -1076,7 +1076,7 @@ public sealed class SecretaryController : IDisposable
                                 {
                                     reportReady.TrySetResult(true);
                                     if (string.IsNullOrWhiteSpace(bgDirectTtsText))
-                                        _tts.EnqueueSummarySpeech("AI 秘書回報", bgReportText, RevealReport);
+                                        _tts.EnqueueSummarySpeech(AppMessages.Localize("AlertTitleReport", "AI Secretary Report"), bgReportText, RevealReport);
                                     else
                                         RevealReport();
                                 }
@@ -1471,7 +1471,7 @@ public sealed class SecretaryController : IDisposable
         };
         await _store.UpsertChatMessageAsync(msg, ct);
         StateChanged?.Invoke();
-        RaiseProactiveAlert("AI 秘書", content);
+        RaiseProactiveAlert(AppMessages.Localize("AlertTitleDefault", "AI Secretary"), content);
     }
 
     private void RaiseProactiveAlert(string title, string content)
@@ -1743,12 +1743,12 @@ public sealed class SecretaryController : IDisposable
         void RevealProactive()
         {
             StateChanged?.Invoke();
-            ProactiveAlert?.Invoke("AI 秘書", reply);
+            ProactiveAlert?.Invoke(AppMessages.Localize("AlertTitleDefault", "AI Secretary"), reply);
         }
         if (!string.IsNullOrWhiteSpace(ttsText))
             _tts.EnqueueJapaneseSpeech(ttsText, RevealProactive);
         else
-            _tts.EnqueueSummarySpeech("AI 秘書", reply, RevealProactive);
+            _tts.EnqueueSummarySpeech(AppMessages.Localize("AlertTitleDefault", "AI Secretary"), reply, RevealProactive);
     }
 
     private async Task RunScheduledSkillSilentlyAsync(ReminderRecord r, CancellationToken ct)

@@ -300,9 +300,9 @@ public sealed class TtsService : IDisposable
     {
         if (!IsEnabled || string.IsNullOrWhiteSpace(content) ||
             (ChatMode == "notify_only" &&
-             (string.Equals(title, "AI 秘書回覆", StringComparison.Ordinal) ||
-              string.Equals(title, "AI 秘書回報", StringComparison.Ordinal) ||
-              string.Equals(title, "AI 秘書狀態", StringComparison.Ordinal))))
+             (string.Equals(title, AppMessages.Localize("AlertTitleReply", "AI Secretary Reply"), StringComparison.Ordinal) ||
+              string.Equals(title, AppMessages.Localize("AlertTitleReport", "AI Secretary Report"), StringComparison.Ordinal) ||
+              string.Equals(title, AppMessages.Localize("AlertTitleStatus", "AI Secretary Status"), StringComparison.Ordinal))))
         {
             SafeInvoke(onBeforePlay);
             return;
@@ -401,7 +401,7 @@ public sealed class TtsService : IDisposable
     private async Task<string> ToSpeechTextAsync(string title, string content, CancellationToken ct)
     {
         var lang = TargetLang;
-        var isChatReply = string.Equals(title, "AI 秘書回覆", StringComparison.Ordinal);
+        var isChatReply = string.Equals(title, AppMessages.Localize("AlertTitleReply", "AI Secretary Reply"), StringComparison.Ordinal);
         var mode = ChatMode;
         bool fullTranslation = mode == "full" ||
             (mode == "smart" && isChatReply && IsShortPlainReply(content));
@@ -460,9 +460,12 @@ public sealed class TtsService : IDisposable
     private static string FallbackPhrase(string title, string content, string lang)
     {
         var combined = $"{title} {content}";
-        bool isMail = combined.Contains("郵件", StringComparison.Ordinal) || combined.Contains("mail", StringComparison.OrdinalIgnoreCase);
-        bool isSchedule = combined.Contains("提醒", StringComparison.Ordinal) || combined.Contains("排程", StringComparison.Ordinal) ||
-                          combined.Contains("活動", StringComparison.Ordinal) || combined.Contains("會議", StringComparison.Ordinal);
+        bool isMail = combined.Contains("mail", StringComparison.OrdinalIgnoreCase) ||
+                      combined.Contains(AppMessages.Localize("TtsKeywordMail", "email"), StringComparison.OrdinalIgnoreCase);
+        bool isSchedule = combined.Contains("schedule", StringComparison.OrdinalIgnoreCase) ||
+                          combined.Contains("reminder", StringComparison.OrdinalIgnoreCase) ||
+                          combined.Contains("meeting", StringComparison.OrdinalIgnoreCase) ||
+                          combined.Contains(AppMessages.Localize("TtsKeywordSchedule", "reminder"), StringComparison.OrdinalIgnoreCase);
 
         if (lang == "ja")
         {
@@ -476,9 +479,9 @@ public sealed class TtsService : IDisposable
             if (isSchedule) return "You have an upcoming schedule reminder.";
             return "Done. Please check the screen.";
         }
-        if (isMail) return "有新的郵件通知，請查看畫面。";
-        if (isSchedule) return "有排程提醒，請確認畫面。";
-        return "處理完成了，請查看畫面。";
+        if (isMail) return AppMessages.Localize("TtsFallbackMail", "You have a new email notification.");
+        if (isSchedule) return AppMessages.Localize("TtsFallbackSchedule", "You have an upcoming schedule reminder.");
+        return AppMessages.Localize("TtsFallbackDone", "Done. Please check the screen.");
     }
 
     private Dictionary<string, string> GetPronunciationMap()
