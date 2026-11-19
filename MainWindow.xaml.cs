@@ -1018,7 +1018,7 @@ public partial class MainWindow : Window
         if (current <= 0) current = 220;
         var next = Math.Clamp(current + delta, 100, 520);
         PinnedScroll.MaxHeight = next;
-        PinnedScroll.Height = next;
+        PinnedScroll.Height = double.NaN;
     }
 
     private void ResizePinnedWidth(double delta)

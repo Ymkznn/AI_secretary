@@ -355,6 +355,14 @@ public sealed class SecretaryController : IDisposable
         _latestChoicesMsgId = null;
         _latestChoices = new List<string>();
         _latestChoicesLogicalTaskId = null;
+
+        bool removedAny;
+        lock (_pinnedLock)
+        {
+            removedAny = _pinnedReminders.RemoveAll(p => p.Kind == PinnedItemKind.Confirmation) > 0;
+        }
+        if (removedAny)
+            PinnedRemindersChanged?.Invoke();
     }
 
     public IReadOnlyList<string> GetTrustedPaths() => _sandbox.GetTrustedPaths();

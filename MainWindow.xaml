@@ -97,6 +97,7 @@
                     <Grid x:Name="PinnedExpandedHost"
                           Grid.Row="0"
                           Width="280"
+                          VerticalAlignment="Bottom"
                           Margin="0,0,0,4"
                           Visibility="Collapsed"
                           RenderTransformOrigin="1,1">
@@ -105,9 +106,11 @@
                         </Grid.RenderTransform>
                         <ScrollViewer x:Name="PinnedScroll"
                                       MaxHeight="260"
+                                      VerticalAlignment="Bottom"
                                       VerticalScrollBarVisibility="Auto"
                                       HorizontalScrollBarVisibility="Disabled">
-                            <StackPanel x:Name="PinnedRemindersPanel" />
+                            <StackPanel x:Name="PinnedRemindersPanel"
+                                        VerticalAlignment="Bottom" />
                         </ScrollViewer>
                         <!-- Independent Resize Thumbs for Pinned Card Panel -->
                         <Thumb x:Name="PinnedTopResizeThumb"
