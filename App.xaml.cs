@@ -97,6 +97,7 @@ public partial class App : System.Windows.Application
         sc.AddSingleton<SkillRuntime>();
         sc.AddSingleton<WorkerAgent>();
         sc.AddSingleton<PlannerAgent>();
+        sc.AddSingleton<HolidaySyncAgent>();
         sc.AddSingleton<MainAgent>();
         sc.AddSingleton<MailSyncService>();
         sc.AddSingleton<SecretaryController>();
@@ -112,7 +113,7 @@ public partial class App : System.Windows.Application
             _services.GetRequiredService<IModelGateway>());
         await HolidayHelper.InitializeAsync(
             _services.GetRequiredService<SqliteStore>(),
-            _services.GetRequiredService<IModelGateway>());
+            _services.GetRequiredService<HolidaySyncAgent>());
 
         _services.GetRequiredService<GuardService>()
             .RegisterSkillNames(_services.GetRequiredService<SkillRegistry>().All.Select(s => s.Name));

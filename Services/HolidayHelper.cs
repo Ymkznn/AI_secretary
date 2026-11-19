@@ -1,17 +1,15 @@
 using System.Collections.Concurrent;
 using System.Globalization;
-using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Data;
-using AiSecretary.Desktop.Models;
 
 namespace AiSecretary.Desktop.Services;
 
 public static class HolidayHelper
 {
     private static SqliteStore? _store;
-    private static IModelGateway? _model;
+    private static HolidaySyncAgent? _syncAgent;
     private static readonly ConcurrentDictionary<(string CountryCode, int Year), HashSet<string>> HolidaysByYear = new();
     private static readonly ConcurrentDictionary<(string CountryCode, int Year), byte> InFlight = new();
 
@@ -29,10 +27,10 @@ public static class HolidayHelper
         return "US";
     }
 
-    public static async Task InitializeAsync(SqliteStore store, IModelGateway model, CancellationToken ct = default)
+    public static async Task InitializeAsync(SqliteStore store, HolidaySyncAgent syncAgent, CancellationToken ct = default)
     {
         _store = store;
-        _model = model;
+        _syncAgent = syncAgent;
 
         var country = GetCurrentCountryCode();
         await LoadCachedYearsAsync(store, country, ct);
@@ -68,29 +66,14 @@ public static class HolidayHelper
         if (HolidaysByYear.ContainsKey(key)) return;
 
         await LoadCachedYearsAsync(store, country, ct);
-        if (HolidaysByYear.ContainsKey(key) || _model is null) return;
+        if (HolidaysByYear.ContainsKey(key) || _syncAgent is null) return;
 
         if (!InFlight.TryAdd(key, 0)) return;
         try
         {
-            var prompt =
-                $"List all official national public holidays (including observed or substitute holidays if applicable) " +
-                $"for ISO 3166-1 alpha-2 country/region '{country}' in year {year}. " +
-                $"Return ONLY a JSON array of YYYY-MM-DD strings, e.g. [\"{year}-01-01\"]. No markdown or explanation.";
-
-            var resp = await _model.CompleteAsync(new[]
-            {
-                new ModelMessage("system", "You are a precise calendar data assistant. Reply only with a JSON array of YYYY-MM-DD date strings."),
-                new ModelMessage("user", prompt)
-            }, ModelTier.Simple, ct);
-
-            var dates = ParseDates(resp.Content);
+            var dates = await _syncAgent.SyncYearAsync(country, year, ct);
             if (dates.Count > 0)
-            {
                 HolidaysByYear[key] = dates;
-                var sortedJson = JsonSerializer.Serialize(dates.OrderBy(d => d, StringComparer.Ordinal).ToArray());
-                await store.UpsertUiLocaleCacheAsync($"holidays:{country}", year.ToString(CultureInfo.InvariantCulture), sortedJson, ct);
-            }
         }
         catch
         {
