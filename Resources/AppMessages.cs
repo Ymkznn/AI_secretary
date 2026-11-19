@@ -54,6 +54,23 @@ public static class AppMessages
             var dict = LocaleCache.GetOrAdd(lang, _ => new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase));
             foreach (var kv in saved)
                 dict[kv.Key] = kv.Value;
+
+            // Pre-warm missing EnglishBase templates in the background.
+            var missing = EnglishBase.Value.Where(kv => !dict.ContainsKey(kv.Key)).ToList();
+            if (missing.Count > 0)
+            {
+                _ = Task.Run(async () =>
+                {
+                    using var gate = new SemaphoreSlim(3);
+                    var tasks = missing.Select(async kv =>
+                    {
+                        await gate.WaitAsync();
+                        try { await TranslateAndCacheAsync(lang, kv.Key, kv.Value, CancellationToken.None); }
+                        finally { gate.Release(); }
+                    });
+                    await Task.WhenAll(tasks);
+                });
+            }
         }
     }
 
@@ -96,36 +113,61 @@ public static class AppMessages
     public static string LocalizeFormat(string cacheKey, string englishTemplate, params object?[] args)
         => string.Format(CultureInfo.InvariantCulture, Localize(cacheKey, englishTemplate), args);
 
+    /// <summary>非同步取得翻譯字串（首次未快取時等待翻譯完成再回傳，避免第一次顯示英文）。</summary>
+    public static async Task<string> LocalizeAsync(string cacheKey, string englishText, CancellationToken ct = default)
+    {
+        var targetLang = ResolveTargetLanguage();
+        if (IsEnglish(targetLang))
+            return englishText;
+
+        var dict = LocaleCache.GetOrAdd(targetLang, _ => new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+        if (dict.TryGetValue(cacheKey, out var cached))
+            return cached;
+
+        return await TranslateAndCacheAsync(targetLang, cacheKey, englishText, ct) ?? englishText;
+    }
+
+    public static async Task<string> LocalizeFormatAsync(string cacheKey, string englishTemplate, params object?[] args)
+        => string.Format(CultureInfo.InvariantCulture, await LocalizeAsync(cacheKey, englishTemplate), args);
+
     private static void TriggerBackgroundTranslation(string targetLang, string key, string enTemplate)
     {
         if (_model is null || _store is null) return;
         var inflightKey = $"{targetLang}|{key}";
         if (!InFlightTranslations.TryAdd(inflightKey, 0)) return;
 
-        _ = Task.Run(async () =>
+        _ = Task.Run(() => TranslateAndCacheAsync(targetLang, key, enTemplate, CancellationToken.None));
+    }
+
+    private static async Task<string?> TranslateAndCacheAsync(string targetLang, string key, string enTemplate, CancellationToken ct)
+    {
+        if (_model is null || _store is null) return null;
+        try
         {
-            try
-            {
-                var sys = SystemAutomationPrompts.BuildUiTranslateSystemPrompt(targetLang);
-                var resp = await _model.CompleteAsync(new[]
-                {
-                    new ModelMessage("system", sys),
-                    new ModelMessage("user", enTemplate)
-                }, ModelTier.Simple);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(8));
 
-                var translated = resp.Content.Trim().Trim('"');
-                if (string.IsNullOrWhiteSpace(translated) || !HasSamePlaceholders(enTemplate, translated))
-                    return;
-
-                var dict = LocaleCache.GetOrAdd(targetLang, _ => new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase));
-                dict[key] = translated;
-                await _store.UpsertUiLocaleCacheAsync(targetLang, key, translated);
-            }
-            catch
+            var sys = SystemAutomationPrompts.BuildUiTranslateSystemPrompt(targetLang);
+            var resp = await _model.CompleteAsync(new[]
             {
-                // Offline / unconfigured LLM: safely keep English base fallback.
-            }
-        });
+                new ModelMessage("system", sys),
+                new ModelMessage("user", enTemplate)
+            }, ModelTier.Simple, timeoutCts.Token);
+
+            var translated = resp.Content.Trim().Trim('"');
+            if (string.IsNullOrWhiteSpace(translated) || !HasSamePlaceholders(enTemplate, translated))
+                return null;
+
+            var dict = LocaleCache.GetOrAdd(targetLang, _ => new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+            dict[key] = translated;
+            await _store.UpsertUiLocaleCacheAsync(targetLang, key, translated, CancellationToken.None);
+            return translated;
+        }
+        catch
+        {
+            // Offline / unconfigured LLM: safely keep English base fallback.
+            return null;
+        }
     }
 
     private static bool HasSamePlaceholders(string source, string translated)

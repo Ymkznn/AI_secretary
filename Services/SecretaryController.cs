@@ -700,7 +700,7 @@ public sealed class SecretaryController : IDisposable
         var ok = await _gmail.AuthorizeInteractiveAsync(_appCts.Token);
         if (ok)
         {
-            await PushPetMessageAsync(AppMessages.Localize("GmailConnected", "Gmail connected. You can now query your emails."));
+            await PushPetMessageAsync(await AppMessages.LocalizeAsync("GmailConnected", "Gmail connected. You can now query your emails."));
         }
         return ok;
     }
@@ -1666,12 +1666,12 @@ public sealed class SecretaryController : IDisposable
         if (dueItems.Count == 1)
         {
             var item = dueItems[0];
-            await PushPetMessageAsync(AppMessages.LocalizeFormat("ReRemindSingle", "🔔 Unacknowledged reminder '{0}': {1}", item.Title, item.Summary), ct);
+            await PushPetMessageAsync(await AppMessages.LocalizeFormatAsync("ReRemindSingle", "🔔 Unacknowledged reminder '{0}': {1}", item.Title, item.Summary), ct);
         }
         else
         {
             var lines = dueItems.Select(i => $"- **{i.Title}**：{i.Summary}");
-            await PushPetMessageAsync(AppMessages.LocalizeFormat("ReRemindMulti", "🔔 Unacknowledged reminders ({0}):\n{1}", dueItems.Count, string.Join("\n", lines)), ct);
+            await PushPetMessageAsync(await AppMessages.LocalizeFormatAsync("ReRemindMulti", "🔔 Unacknowledged reminders ({0}):\n{1}", dueItems.Count, string.Join("\n", lines)), ct);
         }
     }
 
