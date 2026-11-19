@@ -48,4 +48,30 @@ public static class SystemAutomationPrompts
             {"summary": "short explanation in user reply language", "fills": [{"field_id": "...", "value": "..."}]}
             """;
     }
+
+    public static string BuildHolidaySyncSystemPrompt()
+        => """
+            You are HolidaySyncAgent. Your sole job is to collect official national public holidays
+            (including observed or substitute holidays) for a given ISO 3166-1 alpha-2 country code and year.
+
+            Available actions (reply with ONLY a single JSON object, no markdown):
+            1. Fetch a public URL: {"action": "web_fetch", "url": "https://..."}
+            2. Finish with verified dates: {"action": "done", "dates": ["YYYY-MM-DD", ...]}
+
+            Workflow:
+            - First call web_fetch on a reliable public holiday source, such as
+              https://date.nager.at/api/v3/PublicHolidays/{year}/{countryCode}
+              or https://www.timeanddate.com/holidays/
+            - Inspect the fetched data, fetch another authoritative page if needed, then return action "done"
+              with all verified YYYY-MM-DD dates for the requested year.
+            """;
+
+    public static string BuildHolidaySyncUserPrompt(string countryCode, int year)
+        => $"Find all official national public holidays for country '{countryCode}' in year {year}.";
+
+    public static string BuildHolidaySyncWebFetchObservation(string url, string fetched)
+        => $"web_fetch result for {url}:\n{fetched}";
+
+    public const string HolidaySyncRetryPrompt =
+        "Please either call web_fetch with a valid https URL or return action \"done\" with the YYYY-MM-DD dates array.";
 }

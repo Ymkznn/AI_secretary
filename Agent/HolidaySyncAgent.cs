@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
+using AiSecretary.Desktop.Prompts;
 using AiSecretary.Desktop.Skills;
 using Microsoft.Extensions.Logging;
 
@@ -35,22 +36,8 @@ public sealed class HolidaySyncAgent
     {
         var messages = new List<ModelMessage>
         {
-            new("system", """
-                You are HolidaySyncAgent. Your sole job is to collect official national public holidays
-                (including observed or substitute holidays) for a given ISO 3166-1 alpha-2 country code and year.
-
-                Available actions (reply with ONLY a single JSON object, no markdown):
-                1. Fetch a public URL: {"action": "web_fetch", "url": "https://..."}
-                2. Finish with verified dates: {"action": "done", "dates": ["YYYY-MM-DD", ...]}
-
-                Workflow:
-                - First call web_fetch on a reliable public holiday source, such as
-                  https://date.nager.at/api/v3/PublicHolidays/{year}/{countryCode}
-                  or https://www.timeanddate.com/holidays/
-                - Inspect the fetched data, fetch another authoritative page if needed, then return action "done"
-                  with all verified YYYY-MM-DD dates for the requested year.
-                """),
-            new("user", $"Find all official national public holidays for country '{countryCode}' in year {year}.")
+            new("system", SystemAutomationPrompts.BuildHolidaySyncSystemPrompt()),
+            new("user", SystemAutomationPrompts.BuildHolidaySyncUserPrompt(countryCode, year))
         };
 
         var collected = new HashSet<string>(StringComparer.Ordinal);
@@ -85,14 +72,14 @@ public sealed class HolidaySyncAgent
                 if (fetched.Length > 12000)
                     fetched = fetched[..12000] + "\n...[truncated]";
 
-                messages.Add(new ModelMessage("user", $"web_fetch result for {url}:\n{fetched}"));
+                messages.Add(new ModelMessage("user", SystemAutomationPrompts.BuildHolidaySyncWebFetchObservation(url, fetched)));
                 continue;
             }
 
             if (collected.Count > 0)
                 break;
 
-            messages.Add(new ModelMessage("user", "Please either call web_fetch with a valid https URL or return action \"done\" with the YYYY-MM-DD dates array."));
+            messages.Add(new ModelMessage("user", SystemAutomationPrompts.HolidaySyncRetryPrompt));
         }
 
         if (collected.Count > 0)
