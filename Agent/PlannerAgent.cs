@@ -208,6 +208,39 @@ public sealed class PlannerAgent
                         confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
                 }
 
+                // Automatic 1-round self-repair if a tool/script execution failed (and wasn't declined/denied by user or guard)
+                bool hasExecError = observations.Any(o =>
+                    (o.Contains("Execution failed", StringComparison.OrdinalIgnoreCase) ||
+                     o.Contains(" failed:", StringComparison.OrdinalIgnoreCase)) &&
+                    !o.Contains("declined", StringComparison.OrdinalIgnoreCase) &&
+                    !o.Contains("denied", StringComparison.OrdinalIgnoreCase));
+
+                if (hasExecError)
+                {
+                    planMessages.Add(new("assistant", planResp.Content));
+                    planMessages.Add(new("user", $"One or more steps failed with the following error(s):\n{string.Join("\n\n", observations)}\n\nOutput a corrected JSON plan (`{{\"status_note\":\"...\",\"steps\":[...]}}`) to fix the error and complete the goal (do NOT repeat steps that already succeeded unless rewriting a failed script)."));
+
+                    var retryPlanResp = await _model.CompleteAsync(planMessages, tier, ct);
+                    await _sessions.RecordTokensAsync(plannerSession, retryPlanResp.EstimatedTokens, ct: ct);
+                    var (retrySteps, retryNote) = ParsePlanWithStatus(retryPlanResp.Content);
+                    if (retrySteps.Count > 0)
+                    {
+                        if (!string.IsNullOrWhiteSpace(retryNote))
+                            await onStatusAsync(retryNote);
+                        var retryLimit = Math.Min(retrySteps.Count, _guard.MaxWorkerStepsPerTask);
+                        for (int i = 0; i < retryLimit; i++)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            var step = retrySteps[i];
+                            var skillName = step.Skill.Trim();
+                            onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerStep", "Worker running {0} ({1}/{2})...", skillName, i + 1, retryLimit));
+                            await _worker.RunStepAsync(
+                                conversationId, userPrompt, skillName, step.Args, targetMailId,
+                                confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
+                        }
+                    }
+                }
+
                 await _sessions.CompleteTaskSessionAsync(
                     workerSession,
                     new SessionHandoff(goal, completedSteps, new List<string>(), new List<string>(), sources.Select(s => s.MailId).ToList()),
