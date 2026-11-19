@@ -66,11 +66,20 @@
 - **作業系統**：Windows 10 / 11 (x64)
 - **開發工具**：[.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)（含 `Microsoft.WindowsDesktop.App`）
 - **選用元件**：
-  - Google Chrome / Microsoft Edge（用於載入 [BrowserExtension](file:///e:/Anime/程式碼/HW/C%23/AiSecretary.Desktop/BrowserExtension)）
+  - Google Chrome / Microsoft Edge（用於載入 [BrowserExtension](BrowserExtension)）
   - [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)（本地語音合成服務，預設連線 `http://127.0.0.1:9880`）
 
 ### 2. 設定 LLM 與服務參數
-在專案根目錄建立 `.env`（或透過啟動後的「設定」視窗設定，憑證將以 DPAPI 加密儲存於本機）：
+支援以下兩種設定方式（支援 Anthropic Messages API、Google Gemini API 與 OpenAI 相容端點；若兩者皆有設定，**設定視窗儲存的本機加密設定優先權高於 `.env` 與 `appsettings.json`**）：
+
+1. **方式 A：透過桌面「設定」視窗設定（推薦一般使用）**
+   - 對桌面寵物點擊右鍵 →「設定」，可直接分別填寫：
+     - **複雜任務模型（Complex）**：供 `PlannerAgent` 等多步驟規劃使用。
+     - **輕量模型（Simple）**：供 `MainAgent` 路由、單步執行與輔助摘要使用（未填時自動沿用主設定）。
+   - API Key 會經由 Windows **DPAPI** 加密後儲存在本機資料庫，修改後立即生效、無須重啟。
+
+2. **方式 B：透過專案根目錄 `.env` 與 `appsettings.json` 設定**
+   - 在專案根目錄建立 `.env` 填入預設模型與金鑰：
 
 ```env
 Foundry__Endpoint=https://your-endpoint.example.com/anthropic/v1/messages
@@ -78,7 +87,7 @@ Foundry__ApiKey=your_api_key
 Foundry__Model=your_model_name
 ```
 
-程式亦會讀取 [appsettings.json](file:///e:/Anime/程式碼/HW/C%23/AiSecretary.Desktop/appsettings.json) 中的預設設定（支援 Anthropic Messages API、Google Gemini API 與 OpenAI 相容端點），使用者覆寫設定與 SQLite 資料庫預設存放於 `%LOCALAPPDATA%\AiSecretary.Desktop\`。
+   - 其餘服務參數（Outlook EWS `Ews:Url`、Gmail OAuth `Gmail`、語音合成 `Tts`、安全護欄 `Guard` 與沙盒路徑 `Sandbox`）可在 [appsettings.json](appsettings.json) 或「設定」視窗中調整；使用者覆寫設定與 SQLite 資料庫預設存放於 `%LOCALAPPDATA%\AiSecretary.Desktop\`。
 
 ### 3. 建置與啟動
 
