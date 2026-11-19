@@ -398,7 +398,7 @@ public sealed class SqliteStore
 
         await using (var selectCmd = conn.CreateCommand())
         {
-            selectCmd.CommandText = "SELECT Id, Content FROM ChatMessages WHERE Content LIKE '%[Attachment:%' OR Content LIKE '%[附件：%';";
+            selectCmd.CommandText = "SELECT Id, Content FROM ChatMessages WHERE Content LIKE '%[Attachment:%';";
             await using var reader = await selectCmd.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
@@ -406,7 +406,7 @@ public sealed class SqliteStore
                 var content = reader.GetString(1);
                 var cleaned = System.Text.RegularExpressions.Regex.Replace(
                     content,
-                    @"\[(?:Attachment:\s*|附件：)([^\]]+)\]",
+                    @"\[Attachment:\s*([^\]]+)\]",
                     match =>
                     {
                         var path = match.Groups[1].Value.Trim();
