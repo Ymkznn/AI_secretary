@@ -56,6 +56,7 @@ public partial class MainWindow : Window
     private string? _lastAutoSizedMsgId;
     private bool _userResizedBubble;
     private bool _suppressPinnedDuringAlertBubble;
+    private bool _forceShowProcessingBubble;
     private Action? _cancelPendingPrompt;
     private bool HasPendingPrompt => _cancelPendingPrompt is not null;
     private string _currentOutputMarkdown = "";
@@ -1481,8 +1482,16 @@ public partial class MainWindow : Window
         if (latest.IsStreaming)
         {
             _fadeTimer.Stop();
-            if (OutputContainer.Visibility != Visibility.Visible)
+            if (_forceShowProcessingBubble)
+            {
+                _forceShowProcessingBubble = false;
+                if (OutputBorder.Visibility != Visibility.Visible || OutputBorder.Opacity < 0.85)
+                    ShowOutputBubbleWithPopIn();
+            }
+            else if (OutputContainer.Visibility != Visibility.Visible)
+            {
                 ShowOutputBubbleWithPopIn();
+            }
         }
         else if (_lastCompletedMsgId != latest.Id)
         {
@@ -2064,6 +2073,7 @@ public partial class MainWindow : Window
 
         InputBox.Clear();
         UpdateSendButtonState();
+        _forceShowProcessingBubble = true;
         await _controller.SendUserPromptAsync(text);
     }
 
