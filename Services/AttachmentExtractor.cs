@@ -46,7 +46,7 @@ public static class AttachmentExtractor
                     return match.Value;
 
                 var name = Path.GetFileName(path);
-                return $"[圖片附件：{name}（目前環境不允許直接傳送圖片內容給模型）]";
+                return $"[Image attachment: {name} (direct image input not supported by current model)]";
             });
 
             result.Add(new ModelMessage(msg.Role, rewritten));
@@ -97,7 +97,7 @@ public static class AttachmentExtractor
             if (!string.IsNullOrWhiteSpace(extracted))
             {
                 if (extracted.Length > 150000)
-                    extracted = extracted[..150000] + "\n…（文件過長已截斷）";
+                    extracted = extracted[..150000] + "\n...(truncated)";
                 sb.AppendLine();
                 sb.AppendLine($"<attached_document name=\"{Path.GetFileName(path)}\">");
                 sb.AppendLine(extracted);

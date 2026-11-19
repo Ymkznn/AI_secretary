@@ -3,6 +3,7 @@ using System.Net.Http;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Services;
 
@@ -53,7 +54,7 @@ public sealed class BrowserHostService : IDisposable
         {
             var exe = FindSystemBrowserExecutable();
             if (exe is null)
-                return (false, "找不到系統安裝的 Microsoft Edge 或 Google Chrome，無法啟動專用瀏覽器。");
+                return (false, AppMessages.Localize("BrowserExeMissing", "Microsoft Edge or Google Chrome was not found on this system."));
 
             Directory.CreateDirectory(AppPaths.BrowserProfileDir);
 
@@ -62,7 +63,7 @@ public sealed class BrowserHostService : IDisposable
             {
                 if (!string.IsNullOrWhiteSpace(startUrl))
                     await OpenTabViaCdpAsync(startUrl, ct);
-                return (true, "專用瀏覽器已在執行中，已為您開啟分頁。登入完成後可保留或關閉視窗，背景監控將自動沿用此登入態。");
+                return (true, AppMessages.Localize("BrowserAlreadyRunning", "Dedicated browser is already running and a new tab was opened. Background watchers will reuse this login session."));
             }
 
             if (_process is { HasExited: false })
@@ -81,9 +82,9 @@ public sealed class BrowserHostService : IDisposable
             });
 
             if (_process is null)
-                return (false, "啟動專用瀏覽器失敗。");
+                return (false, AppMessages.Localize("BrowserStartFailed", "Failed to launch dedicated browser."));
 
-            return (true, $"已開啟小秘書專用隔離瀏覽器（設定檔：{AppPaths.BrowserProfileDir}）。請在該視窗手動登入帳號，登入態會安全保存在隔離設定檔內。");
+            return (true, AppMessages.LocalizeFormat("BrowserStarted", "Opened isolated dedicated browser (profile: {0}). Please sign in manually inside that window; session cookies stay isolated.", AppPaths.BrowserProfileDir));
         }
         finally
         {
@@ -101,7 +102,7 @@ public sealed class BrowserHostService : IDisposable
         CancellationToken ct = default)
     {
         if (!await IsCdpReachableAsync(ct))
-            return ("unavailable", "專用瀏覽器尚未啟動或未開啟 CDP 偵錯埠（請先點「開啟專用瀏覽器登入」啟動一次）。");
+            return ("unavailable", "Dedicated browser is not running or CDP debug port is unreachable.");
 
         try
         {
@@ -131,7 +132,7 @@ public sealed class BrowserHostService : IDisposable
                 using var putReq = new HttpRequestMessage(HttpMethod.Put, $"http://127.0.0.1:{CdpDebugPort}/json/new?{Uri.EscapeDataString(url)}");
                 using var putResp = await client.SendAsync(putReq, ct);
                 if (!putResp.IsSuccessStatusCode)
-                    return ("error", $"無法透過 CDP 開啟分頁 ({(int)putResp.StatusCode})");
+                    return ("error", $"Failed to open tab via CDP ({(int)putResp.StatusCode})");
 
                 var tabJson = await putResp.Content.ReadAsStringAsync(ct);
                 using var tabDoc = JsonDocument.Parse(tabJson);
@@ -142,7 +143,7 @@ public sealed class BrowserHostService : IDisposable
             }
 
             if (string.IsNullOrWhiteSpace(wsUrl))
-                return ("error", "CDP 未回傳 webSocketDebuggerUrl。");
+                return ("error", "CDP did not return webSocketDebuggerUrl.");
 
             try
             {

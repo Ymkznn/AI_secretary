@@ -26,14 +26,14 @@ public sealed class OfficeContextService
         {
             dynamic? excel = TryGetActiveComObject("Excel.Application");
             if (excel is null)
-                return (false, (string?)null, "目前未偵測到開啟中的 Excel 視窗。");
+                return (false, (string?)null, "No open Excel window detected.");
 
             try
             {
                 dynamic? wb = excel.ActiveWorkbook;
                 dynamic? ws = excel.ActiveSheet;
                 if (wb is null || ws is null)
-                    return (false, (string?)null, "Excel 目前沒有作用中的活頁簿或工作表。");
+                    return (false, (string?)null, "No active Excel workbook or worksheet.");
 
                 string fullName = SafeString(() => (string)wb.FullName);
                 string sheetName = SafeString(() => (string)ws.Name);
@@ -76,7 +76,7 @@ public sealed class OfficeContextService
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "Excel inspect failed");
-                return (false, (string?)null, $"讀取 Excel 失敗：{ex.Message}");
+                return (false, (string?)null, $"Failed to read Excel: {ex.Message}");
             }
         }, ct);
 
@@ -94,21 +94,21 @@ public sealed class OfficeContextService
 
             dynamic? excel = TryGetActiveComObject("Excel.Application");
             if (excel is null)
-                return (false, (string?)null, "目前未偵測到開啟中的 Excel 視窗。");
+                return (false, (string?)null, "No open Excel window detected.");
 
             try
             {
                 dynamic? wb = excel.ActiveWorkbook;
                 dynamic? ws = excel.ActiveSheet;
                 if (wb is null || ws is null)
-                    return (false, (string?)null, "Excel 目前沒有作用中的活頁簿或工作表。");
+                    return (false, (string?)null, "No active Excel workbook or worksheet.");
 
                 string fullName = SafeString(() => (string)wb.FullName);
                 string backupPath = CreateBackupPath(SafeString(() => (string)wb.Name), ".xlsx");
                 try { wb.SaveCopyAs(backupPath); }
                 catch (Exception ex)
                 {
-                    return (false, fullName, $"寫入前自動備份失敗，已中止寫入以保護資料：{ex.Message}");
+                    return (false, fullName, $"Auto-backup before write failed; write aborted: {ex.Message}");
                 }
 
                 foreach (var (addr, val) in writes)
@@ -118,12 +118,12 @@ public sealed class OfficeContextService
                     range.Value = val;
                 }
 
-                return (true, fullName, $"已寫入 {writes.Count} 筆儲存格（已先備份至 {backupPath}）。");
+                return (true, fullName, $"Written {writes.Count} cell(s) (backup: {backupPath}).");
             }
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "Excel write failed");
-                return (false, (string?)null, $"寫入 Excel 失敗：{ex.Message}");
+                return (false, (string?)null, $"Failed to write Excel: {ex.Message}");
             }
         }, ct);
 
@@ -132,13 +132,13 @@ public sealed class OfficeContextService
         {
             dynamic? ppt = TryGetActiveComObject("PowerPoint.Application");
             if (ppt is null)
-                return (false, (string?)null, "目前未偵測到開啟中的 PowerPoint 視窗。");
+                return (false, (string?)null, "No open PowerPoint window detected.");
 
             try
             {
                 dynamic? pres = ppt.ActivePresentation;
                 if (pres is null)
-                    return (false, (string?)null, "PowerPoint 目前沒有開啟中的簡報。");
+                    return (false, (string?)null, "No active PowerPoint presentation.");
 
                 string fullName = SafeString(() => (string)pres.FullName);
                 int total = (int)pres.Slides.Count;
@@ -187,7 +187,7 @@ public sealed class OfficeContextService
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "PowerPoint inspect failed");
-                return (false, (string?)null, $"讀取 PowerPoint 失敗：{ex.Message}");
+                return (false, (string?)null, $"Failed to read PowerPoint: {ex.Message}");
             }
         }, ct);
 
@@ -201,24 +201,24 @@ public sealed class OfficeContextService
         {
             dynamic? ppt = TryGetActiveComObject("PowerPoint.Application");
             if (ppt is null)
-                return (false, (string?)null, "目前未偵測到開啟中的 PowerPoint 視窗。");
+                return (false, (string?)null, "No open PowerPoint window detected.");
 
             try
             {
                 dynamic? pres = ppt.ActivePresentation;
                 if (pres is null)
-                    return (false, (string?)null, "PowerPoint 目前沒有開啟中的簡報。");
+                    return (false, (string?)null, "No active PowerPoint presentation.");
 
                 int total = (int)pres.Slides.Count;
                 if (slideIndex < 1 || slideIndex > total)
-                    return (false, (string?)null, $"投影片頁碼超出範圍（1..{total}）：{slideIndex}");
+                    return (false, (string?)null, $"Slide index out of range (1..{total}): {slideIndex}");
 
                 string fullName = SafeString(() => (string)pres.FullName);
                 string backupPath = CreateBackupPath(SafeString(() => (string)pres.Name), ".pptx");
                 try { pres.SaveCopyAs(backupPath); }
                 catch (Exception ex)
                 {
-                    return (false, fullName, $"寫入前自動備份失敗，已中止寫入以保護簡報：{ex.Message}");
+                    return (false, fullName, $"Auto-backup before write failed; update aborted: {ex.Message}");
                 }
 
                 dynamic slide = pres.Slides[slideIndex];
@@ -233,12 +233,12 @@ public sealed class OfficeContextService
                     slide.NotesPage.Shapes.Placeholders[2].TextFrame.TextRange.Text = newNotes;
                 }
 
-                return (true, fullName, $"已更新第 {slideIndex} 頁投影片（已先備份至 {backupPath}）。");
+                return (true, fullName, $"Updated slide {slideIndex} (backup: {backupPath}).");
             }
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "PowerPoint update failed");
-                return (false, (string?)null, $"更新 PowerPoint 失敗：{ex.Message}");
+                return (false, (string?)null, $"Failed to update PowerPoint: {ex.Message}");
             }
         }, ct);
 

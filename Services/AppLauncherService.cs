@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using AiSecretary.Desktop.Resources;
 using Microsoft.Win32;
 
 namespace AiSecretary.Desktop.Services;
@@ -65,24 +66,24 @@ public sealed class AppLauncherService
         var query = appName?.Trim() ?? "";
         if (string.IsNullOrWhiteSpace(query))
         {
-            return new AppLaunchResult(false, "未指定要開啟的應用程式名稱。");
+            return new AppLaunchResult(false, AppMessages.Localize("LaunchEmpty", "Application name is required."));
         }
 
         if (BlockedTokens.Contains(query) ||
             BlockedTokens.Any(b => query.StartsWith(b + " ", StringComparison.OrdinalIgnoreCase)))
         {
-            return new AppLaunchResult(false, $"基於安全考量，不允許執行系統或命令列程式「{query}」。");
+            return new AppLaunchResult(false, AppMessages.LocalizeFormat("LaunchBlockedApp", "Security policy forbids launching system or shell command '{0}'.", query));
         }
 
         if (!string.IsNullOrWhiteSpace(arguments) && !IsSafeArgument(arguments))
         {
-            return new AppLaunchResult(false, "基於安全考量，啟動參數包含不允許的字元或格式（僅允許安全的網址或本機已存在路徑）。");
+            return new AppLaunchResult(false, AppMessages.Localize("LaunchInvalidArgs", "Security policy rejected launch arguments (only safe URLs or existing local paths are allowed)."));
         }
 
         var target = ResolveTarget(query);
         if (string.IsNullOrWhiteSpace(target))
         {
-            return new AppLaunchResult(false, $"找不到名為「{query}」的應用程式或捷徑。");
+            return new AppLaunchResult(false, AppMessages.LocalizeFormat("LaunchNotFound", "Application or shortcut '{0}' not found.", query));
         }
 
         try
@@ -100,12 +101,12 @@ public sealed class AppLauncherService
 
             Process.Start(psi);
             _logger.LogInformation("Launched app '{Query}' -> '{Target}'", query, target);
-            return new AppLaunchResult(true, $"已為您開啟「{query}」。", target);
+            return new AppLaunchResult(true, AppMessages.LocalizeFormat("LaunchSuccess", "Opened '{0}'.", query), target);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to launch '{Target}'", target);
-            return new AppLaunchResult(false, $"開啟「{query}」失敗：{ex.Message}", target);
+            return new AppLaunchResult(false, AppMessages.LocalizeFormat("LaunchFailed", "Failed to open '{0}': {1}", query, ex.Message), target);
         }
     }
 

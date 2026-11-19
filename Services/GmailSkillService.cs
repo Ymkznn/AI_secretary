@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
+using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Services;
@@ -94,7 +95,7 @@ public sealed class GmailSkillService
         if (!TryLoadClientCredentials(out var clientId, out var clientSecret))
         {
             throw new InvalidOperationException(
-                "尚未設定 Gmail OAuth 用戶端憑證。請在 .env 設定 Gmail__ClientId 與 Gmail__ClientSecret，或將 Google Cloud 下載的 gmail_credentials.json 放在程式目錄。");
+                AppMessages.Localize("GmailMissingCreds", "Gmail OAuth credentials are not configured. Set Gmail__ClientId / Gmail__ClientSecret in .env or place gmail_credentials.json in the app data folder."));
         }
 
         var port = GetAvailablePort();
@@ -128,8 +129,8 @@ public sealed class GmailSkillService
         var error = ctx.Request.QueryString["error"];
 
         var html = string.IsNullOrWhiteSpace(code) || !string.IsNullOrWhiteSpace(error)
-            ? "<html><body style='font-family:sans-serif;padding:24px'><h2>Gmail 授權失敗或已取消</h2><p>請關閉此分頁並重試。</p></body></html>"
-            : "<html><body style='font-family:sans-serif;padding:24px'><h2>Gmail 授權成功！</h2><p>您可以關閉此分頁，回到桌面寵物繼續使用。</p></body></html>";
+            ? AppMessages.Localize("GmailAuthFailedHtml", "<html><body style='font-family:sans-serif;padding:24px'><h2>Gmail authorization failed or canceled</h2><p>Please close this tab and try again.</p></body></html>")
+            : AppMessages.Localize("GmailAuthSuccessHtml", "<html><body style='font-family:sans-serif;padding:24px'><h2>Gmail authorized!</h2><p>You can close this tab and return to the desktop assistant.</p></body></html>");
 
         var buffer = Encoding.UTF8.GetBytes(html);
         ctx.Response.ContentType = "text/html; charset=utf-8";
@@ -157,7 +158,7 @@ public sealed class GmailSkillService
         var json = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode)
         {
-            throw new HttpRequestException($"Gmail OAuth 交換 Token 失敗 ({(int)resp.StatusCode}): {json}");
+            throw new HttpRequestException($"Gmail OAuth token exchange failed ({(int)resp.StatusCode}): {json}");
         }
 
         using var doc = JsonDocument.Parse(json);
@@ -196,7 +197,7 @@ public sealed class GmailSkillService
         var json = await resp.Content.ReadAsStringAsync(reqCts.Token);
         if (!resp.IsSuccessStatusCode)
         {
-            throw new HttpRequestException($"Gmail 列表讀取失敗 ({(int)resp.StatusCode}): {json}");
+            throw new HttpRequestException($"Gmail list fetch failed ({(int)resp.StatusCode}): {json}");
         }
 
         using var doc = JsonDocument.Parse(json);
@@ -251,7 +252,7 @@ public sealed class GmailSkillService
         var json = await resp.Content.ReadAsStringAsync(reqCts.Token);
         if (!resp.IsSuccessStatusCode)
         {
-            throw new HttpRequestException($"Gmail 郵件詳情讀取失敗 ({(int)resp.StatusCode}): {json}");
+            throw new HttpRequestException($"Gmail message fetch failed ({(int)resp.StatusCode}): {json}");
         }
 
         using var doc = JsonDocument.Parse(json);
@@ -272,7 +273,7 @@ public sealed class GmailSkillService
             }
         }
 
-        var subject = "(無主旨)";
+        var subject = "(no subject)";
         var fromRaw = "";
         var received = DateTimeOffset.UtcNow;
         var body = "";
@@ -347,13 +348,13 @@ public sealed class GmailSkillService
             if (string.IsNullOrWhiteSpace(refreshToken))
             {
                 throw new InvalidOperationException(
-                    "尚未完成 Gmail 授權。請對寵物右鍵選擇「連接 Gmail」完成登入授權，或在 .env 設定 Gmail__RefreshToken / Gmail__AccessToken。");
+                    AppMessages.Localize("GmailNotAuthorized", "Gmail is not authorized. Please connect in Settings -> Skills -> manage_mail, or set Gmail__RefreshToken / Gmail__AccessToken in .env."));
             }
 
             if (!TryLoadClientCredentials(out var clientId, out var clientSecret))
             {
                 throw new InvalidOperationException(
-                    "缺少 Gmail ClientId / ClientSecret，無法自動刷新 Access Token。");
+                    AppMessages.Localize("GmailMissingClientForRefresh", "Missing Gmail ClientId / ClientSecret; cannot refresh Access Token."));
             }
 
             var http = _httpFactory.CreateClient();
@@ -369,7 +370,7 @@ public sealed class GmailSkillService
             var json = await resp.Content.ReadAsStringAsync(ct);
             if (!resp.IsSuccessStatusCode)
             {
-                throw new HttpRequestException($"Gmail Token 刷新失敗 ({(int)resp.StatusCode}): {json}");
+                throw new HttpRequestException($"Gmail token refresh failed ({(int)resp.StatusCode}): {json}");
             }
 
             using var doc = JsonDocument.Parse(json);
@@ -478,7 +479,7 @@ public sealed class GmailSkillService
 
     private static (string Name, string Email) ParseFromHeader(string fromRaw)
     {
-        if (string.IsNullOrWhiteSpace(fromRaw)) return ("未知寄件者", "");
+        if (string.IsNullOrWhiteSpace(fromRaw)) return ("Unknown sender", "");
         var match = Regex.Match(fromRaw, @"^(?<name>.*?)<(?<email>[^>]+)>$");
         if (match.Success)
         {

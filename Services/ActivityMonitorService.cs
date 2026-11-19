@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Automation;
 using AiSecretary.Desktop.Models;
+using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Services;
 
@@ -108,7 +109,7 @@ public sealed class ActivityMonitorService : IDisposable
     public (bool Ok, string Message) TryFillOtpInExternalWindow(string code, string? serviceHint = null)
     {
         if (string.IsNullOrWhiteSpace(code))
-            return (false, "驗證碼為空。");
+            return (false, AppMessages.Localize("OtpEmpty", "Verification code is empty."));
 
         var targets = GetRecentExternalTargets();
         var target = targets.FirstOrDefault(t =>
@@ -117,13 +118,13 @@ public sealed class ActivityMonitorService : IDisposable
                      ?? targets.FirstOrDefault();
 
         if (target is null)
-            return (false, "找不到對應的外部瀏覽器或登入視窗。");
+            return (false, AppMessages.Localize("OtpTargetMissing", "No matching external browser or login window found."));
 
         try
         {
             var root = AutomationElement.FromHandle(target.Hwnd);
             if (root is null)
-                return (false, "無法存取目標視窗介面。");
+                return (false, AppMessages.Localize("OtpWindowInaccessible", "Cannot access target window UI."));
 
             var doc = root.FindFirst(
                 TreeScope.Descendants,
@@ -141,24 +142,24 @@ public sealed class ActivityMonitorService : IDisposable
             }
 
             if (chosen is null)
-                return (false, $"在「{Truncate(target.Title, 24)}」找不到可填入的輸入框，已改複製到剪貼簿。");
+                return (false, AppMessages.LocalizeFormat("OtpFieldNotFound", "No fillable input found in '{0}'; copied to clipboard instead.", Truncate(target.Title, 24)));
 
             SetForegroundWindow(target.Hwnd);
             if (chosen.TryGetCurrentPattern(ValuePattern.Pattern, out var vpObj) && vpObj is ValuePattern vp && !vp.Current.IsReadOnly)
             {
                 vp.SetValue(code);
-                return (true, $"已將驗證碼 {code} 填入「{Truncate(target.Title, 24)}」（未自動送出）。");
+                return (true, AppMessages.LocalizeFormat("OtpFilled", "Filled verification code {0} into '{1}' (not auto-submitted).", code, Truncate(target.Title, 24)));
             }
 
             chosen.SetFocus();
             System.Windows.Forms.SendKeys.SendWait("^a");
             System.Windows.Forms.SendKeys.SendWait(code);
-            return (true, $"已將驗證碼 {code} 輸入「{Truncate(target.Title, 24)}」（未自動送出）。");
+            return (true, AppMessages.LocalizeFormat("OtpTyped", "Entered verification code {0} into '{1}' (not auto-submitted).", code, Truncate(target.Title, 24)));
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "TryFillOtpInExternalWindow failed");
-            return (false, $"自動填入失敗：{ex.Message}");
+            return (false, AppMessages.LocalizeFormat("OtpAutoFillFailed", "Auto-fill failed: {0}", ex.Message));
         }
     }
 
@@ -341,7 +342,7 @@ public sealed class ActivityMonitorService : IDisposable
                                 ProactiveSuggestionRaised?.Invoke(new ProactiveSuggestionEvent(
                                     "switch_back",
                                     enriched,
-                                    $"剛才是在找「{Truncate(title, 30)}」要填的資料嗎？需要我幫您整理或預填嗎？"));
+                                    AppMessages.LocalizeFormat("ActivitySwitchBack", "Were you looking up info to fill into '{0}'? Want me to help organize or prefill it?", Truncate(title, 30))));
                             }
                         }, ct);
                     }
@@ -366,7 +367,7 @@ public sealed class ActivityMonitorService : IDisposable
                             ProactiveSuggestionRaised?.Invoke(new ProactiveSuggestionEvent(
                                 "form_stuck",
                                 target,
-                                $"看到您在「{Truncate(title, 30)}」停留了一會兒，需要我根據記憶幫您整理填寫建議嗎？"));
+                                AppMessages.LocalizeFormat("ActivityFormStuck", "Noticed you've been on '{0}' for a while. Need fill suggestions from memory?", Truncate(title, 30))));
                         }
                     }
                 }

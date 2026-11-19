@@ -6,6 +6,7 @@ using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
+using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Skills;
 
 namespace AiSecretary.Desktop.Services;
@@ -78,7 +79,7 @@ public sealed class StandingWatcherService
             if (status == "needs_auth")
             {
                 await _store.UpdateWatcherStateAsync(w.WatcherId, w.LastSnapshot, now, nextAt, w.FailureCount, "NeedsAuth", ct);
-                await onTriggeredAsync(w, $"「{w.Title}」的登入態已失效，請開啟專用瀏覽器重新登入後恢復監控。");
+                await onTriggeredAsync(w, AppMessages.LocalizeFormat("WatcherNeedsAuth", "Session expired for '{0}'. Please reopen the dedicated browser and sign in to resume.", w.Title));
                 return (false, "needs_auth");
             }
 
@@ -88,7 +89,7 @@ public sealed class StandingWatcherService
                 var newStatus = fails >= 5 ? "Paused" : w.Status;
                 await _store.UpdateWatcherStateAsync(w.WatcherId, w.LastSnapshot, now, nextAt, fails, newStatus, ct);
                 if (newStatus == "Paused")
-                    await onTriggeredAsync(w, $"監控任務「{w.Title}」連續失敗 {fails} 次已自動暫停：{currentValue}");
+                    await onTriggeredAsync(w, AppMessages.LocalizeFormat("WatcherPaused", "Watcher '{0}' paused automatically after {1} consecutive failures: {2}", w.Title, fails, currentValue));
                 return (false, currentValue);
             }
 
@@ -98,8 +99,8 @@ public sealed class StandingWatcherService
             if (triggered)
             {
                 var alertMsg = string.IsNullOrWhiteSpace(w.ThresholdValue)
-                    ? $"「{w.Title}」偵測到新變化：\n{currentValue}"
-                    : $"「{w.Title}」符合條件（目前：{currentValue}，門檻：{w.ThresholdValue}）\n{w.Url}";
+                    ? AppMessages.LocalizeFormat("WatcherChanged", "'{0}' detected a new change:\n{1}", w.Title, currentValue)
+                    : AppMessages.LocalizeFormat("WatcherMatched", "'{0}' matched condition (current: {1}, threshold: {2})\n{3}", w.Title, currentValue, w.ThresholdValue, w.Url);
                 await onTriggeredAsync(w, alertMsg);
             }
 

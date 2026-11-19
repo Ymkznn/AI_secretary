@@ -9,6 +9,7 @@ using System.Threading.Channels;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
 using AiSecretary.Desktop.Prompts;
+using AiSecretary.Desktop.Resources;
 using Microsoft.Extensions.Configuration;
 
 namespace AiSecretary.Desktop.Services;
@@ -129,7 +130,7 @@ public sealed class TtsService : IDisposable
         }
 
         if (result.Count == 0)
-            return new[] { ("default", "預設語音") };
+            return new[] { ("default", AppMessages.Localize("TtsDefaultVoice", "Default Voice")) };
 
         return result.Select(kv => (kv.Key, kv.Value)).ToList();
     }
@@ -142,7 +143,7 @@ public sealed class TtsService : IDisposable
 
         return TargetLang == "ja"
             ? "準備ができましたよ。いつでも確認してくださいね。"
-            : "語音測試已完成，隨時可以開始。";
+            : AppMessages.Localize("TtsTestPhrase", "Voice test completed. Ready whenever you are.");
     }
 
     private TtsVoiceProfileSettings? GetActiveProfileSettings()
@@ -416,7 +417,7 @@ public sealed class TtsService : IDisposable
 
         var userPrompt = string.IsNullOrWhiteSpace(title)
             ? trimmed
-            : $"件名/種別: {title}\n內容:\n{trimmed}";
+            : $"Title/Type: {title}\nContent:\n{trimmed}";
 
         try
         {

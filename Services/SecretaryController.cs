@@ -108,7 +108,7 @@ public sealed class SecretaryController : IDisposable
     public event Action<StandingWatcherRecord, string>? WatcherTriggered;
 
     public string ConversationId { get; private set; } = "conv-main";
-    public string MonitorStatus { get; private set; } = "待命中";
+    public string MonitorStatus { get; private set; } = AppMessages.Localize("MonitorStandby", "Standby");
     public bool IsGmailAuthorized => _gmail.IsAuthorized;
     public bool HasGmailClientCredentials => _gmail.HasClientCredentials;
     public string SandboxRootPath => _sandbox.RootPath;
@@ -289,7 +289,7 @@ public sealed class SecretaryController : IDisposable
             m.IsStreaming = false;
             m.StatusText = null;
             if (string.IsNullOrWhiteSpace(m.Content))
-                m.Content = "（上次任務已中斷）";
+                m.Content = AppMessages.Localize("TaskInterrupted", "(Previous task was interrupted)");
             await _store.UpsertChatMessageAsync(m, _appCts.Token);
         }
 
@@ -476,7 +476,7 @@ public sealed class SecretaryController : IDisposable
     public async Task<(bool Ok, string Message)> ImportVoicePackageAsync(string zipPath)
     {
         if (string.IsNullOrWhiteSpace(zipPath) || !File.Exists(zipPath))
-            return (false, "找不到選擇的壓縮檔。");
+            return (false, AppMessages.Localize("ZipNotFound", "Selected zip file was not found."));
 
         try
         {
@@ -492,7 +492,7 @@ public sealed class SecretaryController : IDisposable
 
             if (ckpt is null || pth is null || wavs.Count == 0)
             {
-                return (false, "壓縮檔須至少包含基礎所需的 3 個檔案：.ckpt（GPT 權重）、.pth（SoVITS 權重）與 .wav（參考音檔）。");
+                return (false, AppMessages.Localize("ZipMissingCoreFiles", "Zip must contain at least 3 required files: .ckpt (GPT weights), .pth (SoVITS weights), and .wav (reference audio)."));
             }
 
             var rawName = Path.GetFileNameWithoutExtension(zipPath).Trim();
@@ -547,7 +547,7 @@ public sealed class SecretaryController : IDisposable
             }
 
             if (extractedCkpt is null || extractedPth is null || mainWav is null)
-                return (false, "解壓後缺少必要檔案（.ckpt / .pth / .wav）。");
+                return (false, AppMessages.Localize("ZipExtractMissingFiles", "Required files (.ckpt / .pth / .wav) are missing after extraction."));
 
             var promptText = promptTxtPath is not null && File.Exists(promptTxtPath)
                 ? (await File.ReadAllTextAsync(promptTxtPath)).Trim()
@@ -570,11 +570,11 @@ public sealed class SecretaryController : IDisposable
             await _settings.SaveOverridesAsync(s => s.Tts.Profiles[profileKey] = profile);
             var (_, _, curMode) = GetTtsSettings();
             await SaveTtsSettingsAsync(true, profileKey, curMode);
-            return (true, $"已成功匯入並切換語音「{rawName}」。");
+            return (true, AppMessages.LocalizeFormat("ZipImportSuccess", "Imported and switched to voice '{0}'.", rawName));
         }
         catch (Exception ex)
         {
-            return (false, $"匯入語音包失敗：{ex.Message}");
+            return (false, AppMessages.LocalizeFormat("ZipImportFailed", "Failed to import voice package: {0}", ex.Message));
         }
     }
 
@@ -609,15 +609,15 @@ public sealed class SecretaryController : IDisposable
     {
         var simpleModel = await _store.GetSyncValueAsync("llm_simple_model", _appCts.Token);
         var complexModel = await _store.GetSyncValueAsync("llm_complex_model", _appCts.Token);
-        var defaultModel = _config.GetValue<string>("Foundry:Model")?.Trim() ?? "（未設定）";
+        var defaultModel = _config.GetValue<string>("Foundry:Model")?.Trim() ?? AppMessages.Localize("NotConfigured", "(Not configured)");
 
         var sLabel = string.IsNullOrWhiteSpace(simpleModel) ? defaultModel : simpleModel.Trim();
         var cLabel = string.IsNullOrWhiteSpace(complexModel) ? defaultModel : complexModel.Trim();
-        var model = sLabel == cLabel ? sLabel : $"簡單：{sLabel} ｜ 複雜：{cLabel}";
+        var model = sLabel == cLabel ? sLabel : AppMessages.LocalizeFormat("ModelTierSummary", "Simple: {0} | Complex: {1}", sLabel, cLabel);
 
         var simpleEp = await _store.GetSyncValueAsync("llm_simple_endpoint", _appCts.Token);
         var endpoint = string.IsNullOrWhiteSpace(simpleEp)
-            ? (_config.GetValue<string>("Foundry:Endpoint")?.Trim() ?? "（未設定）")
+            ? (_config.GetValue<string>("Foundry:Endpoint")?.Trim() ?? AppMessages.Localize("NotConfigured", "(Not configured)"))
             : simpleEp.Trim();
 
         long ReadCounter(string? raw) => long.TryParse(raw, out var v) ? v : 0L;
@@ -700,7 +700,7 @@ public sealed class SecretaryController : IDisposable
         var ok = await _gmail.AuthorizeInteractiveAsync(_appCts.Token);
         if (ok)
         {
-            await PushPetMessageAsync("Gmail 已連接成功，可以開始查詢信件。");
+            await PushPetMessageAsync(AppMessages.Localize("GmailConnected", "Gmail connected. You can now query your emails."));
         }
         return ok;
     }
@@ -723,7 +723,7 @@ public sealed class SecretaryController : IDisposable
             ConversationId = ConversationId,
             Role = "assistant",
             Content = "",
-            StatusText = "處理中…",
+            StatusText = AppMessages.Localize("ProcessingStatus", "Processing..."),
             IsStreaming = true,
             TaskId = taskId,
             CreatedAt = DateTimeOffset.UtcNow.AddMilliseconds(5)
@@ -739,7 +739,7 @@ public sealed class SecretaryController : IDisposable
             MainState = "Running",
             PlannerState = "Pending",
             WorkerState = "Pending",
-            CurrentStep = "MainAgent 接收指令"
+            CurrentStep = AppMessages.Localize("StepMainReceived", "MainAgent received prompt")
         };
         _agentRuns[taskId] = run;
         AgentsChanged?.Invoke();
@@ -929,7 +929,7 @@ public sealed class SecretaryController : IDisposable
                     if (run.MainState == "Running") run.MainState = "Done";
                     if (run.PlannerState == "Running") run.PlannerState = "Done";
                     if (run.WorkerState == "Running") run.WorkerState = "Done";
-                    run.CurrentStep = "已完成";
+                    run.CurrentStep = AppMessages.Localize("StepCompleted", "Completed");
                     AgentsChanged?.Invoke();
                 }
                 else
@@ -958,14 +958,14 @@ public sealed class SecretaryController : IDisposable
                 if (run.MainState == "Running") run.MainState = "Stopped";
                 if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                 if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-                run.CurrentStep = "已強制終止";
+                run.CurrentStep = AppMessages.Localize("StepStopped", "Stopped");
                 AgentsChanged?.Invoke();
 
                 assistantMsg.IsStreaming = false;
                 assistantMsg.StatusText = null;
                 assistantMsg.Content = string.IsNullOrWhiteSpace(assistantMsg.Content)
-                    ? "（已停止此次處理）"
-                    : assistantMsg.Content + "\n\n（已停止）";
+                    ? AppMessages.Localize("TurnStopped", "(Stopped)")
+                    : assistantMsg.Content + "\n\n" + AppMessages.Localize("TurnStoppedSuffix", "(Stopped)");
                 await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
                 StateChanged?.Invoke();
             }
@@ -975,12 +975,12 @@ public sealed class SecretaryController : IDisposable
                 if (run.MainState == "Running") run.MainState = "Stopped";
                 if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                 if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-                run.CurrentStep = $"錯誤：{ex.Message}";
+                run.CurrentStep = AppMessages.LocalizeFormat("StepError", "Error: {0}", ex.Message);
                 AgentsChanged?.Invoke();
 
                 assistantMsg.IsStreaming = false;
                 assistantMsg.StatusText = null;
-                assistantMsg.Content = $"處理時發生錯誤：{ex.Message}";
+                assistantMsg.Content = $"{AppMessages.ErrorPrefix}: {ex.Message}";
                 await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
                 StateChanged?.Invoke();
             }
@@ -1030,7 +1030,7 @@ public sealed class SecretaryController : IDisposable
                         {
                             if (run.PlannerState == "Running") run.PlannerState = "Done";
                             if (run.WorkerState == "Running") run.WorkerState = "Done";
-                            run.CurrentStep = "已完成";
+                            run.CurrentStep = AppMessages.Localize("StepCompleted", "Completed");
                             AgentsChanged?.Invoke();
 
                             if (!string.IsNullOrWhiteSpace(bgReportText))
@@ -1091,7 +1091,7 @@ public sealed class SecretaryController : IDisposable
                     {
                         if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                         if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-                        run.CurrentStep = "已強制終止";
+                        run.CurrentStep = AppMessages.Localize("StepStopped", "Stopped");
                         AgentsChanged?.Invoke();
                     }
                     catch (Exception ex)
@@ -1104,14 +1104,14 @@ public sealed class SecretaryController : IDisposable
                             acquired = true;
                             if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                             if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-                            run.CurrentStep = $"錯誤：{ex.Message}";
+                            run.CurrentStep = AppMessages.LocalizeFormat("StepError", "Error: {0}", ex.Message);
                             AgentsChanged?.Invoke();
 
                             var errMsg = new ChatMessageRecord
                             {
                                 ConversationId = ConversationId,
                                 Role = "assistant",
-                                Content = $"背景任務執行失敗：{ex.Message}",
+                                Content = AppMessages.LocalizeFormat("BgTaskFailed", "Background task failed: {0}", ex.Message),
                                 IsStreaming = false,
                                 TaskId = taskId,
                                 CreatedAt = DateTimeOffset.UtcNow
@@ -1190,7 +1190,7 @@ public sealed class SecretaryController : IDisposable
             if (run.MainState == "Running") run.MainState = "Stopped";
             if (run.PlannerState == "Running") run.PlannerState = "Stopped";
             if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-            if (run.CurrentStep != "已完成") run.CurrentStep = "已由 /kill magent 清除";
+            if (run.CurrentStep != AppMessages.Localize("StepCompleted", "Completed")) run.CurrentStep = AppMessages.Localize("StepKilledByUser", "Cleared by /kill magent");
         }
         AgentsChanged?.Invoke();
 
@@ -1200,7 +1200,7 @@ public sealed class SecretaryController : IDisposable
             m.IsStreaming = false;
             m.StatusText = null;
             if (string.IsNullOrWhiteSpace(m.Content))
-                m.Content = "（已執行 `/kill magent`，已清除卡住的 Agent 狀態）";
+                m.Content = AppMessages.Localize("KillCommandDone", "(Executed `/kill magent`; cleared stuck agent state)");
             await _store.UpsertChatMessageAsync(m, CancellationToken.None);
         }
         StateChanged?.Invoke();
@@ -1216,7 +1216,7 @@ public sealed class SecretaryController : IDisposable
     {
         await _store.UpdateNotificationStatusAsync(n.NotificationId, "Handled", null);
         StateChanged?.Invoke();
-        await SendUserPromptAsync($"幫我草擬回覆「{n.Title}」", targetMailId: n.MailId);
+        await SendUserPromptAsync(AppMessages.LocalizeFormat("DraftReplyPrompt", "Help me draft a reply to '{0}'", n.Title), targetMailId: n.MailId);
     }
 
     public IReadOnlyList<PinnedReminderItem> GetPinnedReminders()
@@ -1347,13 +1347,13 @@ public sealed class SecretaryController : IDisposable
         }
 
         if (targets.Count == 0)
-            return string.IsNullOrWhiteSpace(kw) ? "目前沒有置頂提醒。" : $"找不到符合「{kw}」的置頂提醒。";
+            return string.IsNullOrWhiteSpace(kw) ? AppMessages.Localize("NoPinnedReminders", "No pinned reminders right now.") : AppMessages.LocalizeFormat("PinnedNotFound", "No pinned reminder matching '{0}'.", kw);
 
         foreach (var t in targets)
             await DismissPinnedReminderAsync(t.Id);
 
         var names = string.Join("、", targets.Select(t => $"「{t.Title}」"));
-        return $"已解除置頂提醒：{names}。";
+        return AppMessages.LocalizeFormat("PinnedDismissed", "Dismissed pinned reminder(s): {0}.", names);
     }
 
     private async Task SavePinnedRemindersAsync()
@@ -1666,12 +1666,12 @@ public sealed class SecretaryController : IDisposable
         if (dueItems.Count == 1)
         {
             var item = dueItems[0];
-            await PushPetMessageAsync($"🔔 尚未確認提醒「{item.Title}」：{item.Summary}", ct);
+            await PushPetMessageAsync(AppMessages.LocalizeFormat("ReRemindSingle", "🔔 Unacknowledged reminder '{0}': {1}", item.Title, item.Summary), ct);
         }
         else
         {
             var lines = dueItems.Select(i => $"- **{i.Title}**：{i.Summary}");
-            await PushPetMessageAsync($"🔔 尚未確認提醒（{dueItems.Count} 項）：\n{string.Join("\n", lines)}", ct);
+            await PushPetMessageAsync(AppMessages.LocalizeFormat("ReRemindMulti", "🔔 Unacknowledged reminders ({0}):\n{1}", dueItems.Count, string.Join("\n", lines)), ct);
         }
     }
 
@@ -1775,8 +1775,8 @@ public sealed class SecretaryController : IDisposable
                 || r.SkillName!.Equals("sync_mail", StringComparison.OrdinalIgnoreCase);
 
             var prompt = string.IsNullOrWhiteSpace(r.Message)
-                ? $"排程背景執行：{r.Title}\n（請結合 <user_preferences> 判斷是否需要主動通知使用者；若無需通知請只回覆 NO_NOTIFY）"
-                : $"排程背景執行：{r.Title}\n排程規則：{r.Message}\n（請結合 <user_preferences> 判斷是否需要主動通知使用者；若無需通知請只回覆 NO_NOTIFY）";
+                ? $"Scheduled background run: {r.Title}\n(Check <user_preferences> to decide whether to notify the user; if not needed, reply ONLY with NO_NOTIFY)"
+                : $"Scheduled background run: {r.Title}\nRule: {r.Message}\n(Check <user_preferences> to decide whether to notify the user; if not needed, reply ONLY with NO_NOTIFY)";
 
             if (isMailPoller)
             {
@@ -1840,9 +1840,9 @@ public sealed class SecretaryController : IDisposable
         var extRes = await _browserBridge.RequestFillOtpAsync(code, TimeSpan.FromMilliseconds(1500), ct);
         if (extRes is { Filled: true })
         {
-            var title = string.IsNullOrWhiteSpace(extRes.Title) ? "瀏覽器分頁" : extRes.Title.Trim();
+            var title = string.IsNullOrWhiteSpace(extRes.Title) ? AppMessages.Localize("BrowserTabDefault", "Browser tab") : extRes.Title.Trim();
             if (title.Length > 24) title = title[..24] + "…";
-            return (true, $"已透過瀏覽器擴充功能將驗證碼 {code} 填入「{title}」（{extRes.Mode ?? "dom"}，未自動送出）。");
+            return (true, AppMessages.LocalizeFormat("OtpExtensionFilled", "Filled verification code {0} into '{1}' via browser extension ({2}, not auto-submitted).", code, title, extRes.Mode ?? "dom"));
         }
 
         return _activity.TryFillOtpInExternalWindow(code, serviceHint);

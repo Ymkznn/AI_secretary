@@ -107,7 +107,7 @@ public sealed class ScreenCaptureService
             using var encParams = new EncoderParameters(1);
             encParams.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 85L);
             toSave.Save(path, jpegEncoder, encParams);
-            return (true, $"已擷取畫面（{toSave.Width}x{toSave.Height}）", path);
+            return (true, $"Captured screen ({toSave.Width}x{toSave.Height})", path);
         }
         finally
         {

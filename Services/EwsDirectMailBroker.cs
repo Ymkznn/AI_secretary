@@ -96,7 +96,7 @@ public sealed class EwsDirectMailBroker : IMailBroker
             var received = DateTimeOffset.TryParse(receivedRaw, out var dto) ? dto : DateTimeOffset.UtcNow;
             if (since.HasValue && received <= since.Value) continue;
 
-            var subject = msg.Element(TNs + "Subject")?.Value ?? "(無主旨)";
+            var subject = msg.Element(TNs + "Subject")?.Value ?? "(no subject)";
             var mailbox = msg.Element(TNs + "From")?.Element(TNs + "Mailbox");
             var senderName = mailbox?.Element(TNs + "Name")?.Value ?? "";
             var senderEmail = mailbox?.Element(TNs + "EmailAddress")?.Value ?? "";
@@ -205,7 +205,7 @@ public sealed class EwsDirectMailBroker : IMailBroker
         var msg = xml.Descendants(TNs + "Message").FirstOrDefault();
         if (msg is null) return null;
 
-        var subject = msg.Element(TNs + "Subject")?.Value ?? "(無主旨)";
+        var subject = msg.Element(TNs + "Subject")?.Value ?? "(no subject)";
         var mailbox = msg.Element(TNs + "From")?.Element(TNs + "Mailbox");
         var senderName = mailbox?.Element(TNs + "Name")?.Value ?? "";
         var senderEmail = mailbox?.Element(TNs + "EmailAddress")?.Value ?? "";

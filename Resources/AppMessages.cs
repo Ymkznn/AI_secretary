@@ -92,6 +92,10 @@ public static class AppMessages
         return englishText;
     }
 
+    /// <summary>動態翻譯並格式化英文模板字串（免預先登錄於 messages_en.json）。</summary>
+    public static string LocalizeFormat(string cacheKey, string englishTemplate, params object?[] args)
+        => string.Format(CultureInfo.InvariantCulture, Localize(cacheKey, englishTemplate), args);
+
     private static void TriggerBackgroundTranslation(string targetLang, string key, string enTemplate)
     {
         if (_model is null || _store is null) return;
