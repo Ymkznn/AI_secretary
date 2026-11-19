@@ -600,11 +600,11 @@ public sealed class TtsService : IDisposable
             if (i == 0)
                 SafeInvoke(onBeforeFirstPlay);
 
-            if (wavBytes is { Length: >= 44 })
+            if (IsValidWav(wavBytes))
             {
                 await Task.Run(() =>
                 {
-                    using var ms = new MemoryStream(wavBytes);
+                    using var ms = new MemoryStream(wavBytes!);
                     using var player = new SoundPlayer(ms);
                     player.PlaySync();
                 }, ct);
@@ -613,6 +613,11 @@ public sealed class TtsService : IDisposable
 
         SafeInvoke(onBeforeFirstPlay);
     }
+
+    private static bool IsValidWav(byte[]? bytes)
+        => bytes is { Length: >= 44 }
+           && bytes[0] == (byte)'R' && bytes[1] == (byte)'I' && bytes[2] == (byte)'F' && bytes[3] == (byte)'F'
+           && bytes[8] == (byte)'W' && bytes[9] == (byte)'A' && bytes[10] == (byte)'V' && bytes[11] == (byte)'E';
 
     private (string? Root, string? Python, string? ApiScript) ResolveSoVitsServer()
     {
