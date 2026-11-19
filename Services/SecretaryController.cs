@@ -1250,11 +1250,7 @@ public sealed class SecretaryController : IDisposable
     {
         var id = $"confirm:{logicalTaskId}";
         var cleanTitle = (goal ?? "").ReplaceLineEndings(" ").Trim();
-        if (cleanTitle.Length > 28)
-            cleanTitle = cleanTitle[..28] + "…";
         var cleanSummary = (replySummary ?? "").Trim();
-        if (cleanSummary.Length > 120)
-            cleanSummary = cleanSummary[..120] + "…";
         var item = new PinnedReminderItem(
             id,
             cleanTitle,

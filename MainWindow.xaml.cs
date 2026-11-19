@@ -1394,7 +1394,10 @@ public partial class MainWindow : Window
         OutputActionsPanel.Children.Clear();
         OutputActionsPanel.Visibility = Visibility.Collapsed;
 
-        var latest = messages.LastOrDefault(m => m.Role is "assistant" or "notification");
+        var streamingAssistant = _controller.HasRunningTasks
+            ? messages.LastOrDefault(m => m.Role == "assistant" && m.IsStreaming)
+            : null;
+        var latest = streamingAssistant ?? messages.LastOrDefault(m => m.Role is "assistant" or "notification");
         if (latest is null)
         {
             _hasOutputContent = false;
@@ -2084,7 +2087,11 @@ public partial class MainWindow : Window
 
         var btn = new Button
         {
-            Content = label,
+            Content = new TextBlock
+            {
+                Text = label,
+                TextWrapping = TextWrapping.Wrap
+            },
             Padding = new Thickness(10, 4, 10, 4),
             Margin = new Thickness(0, 0, 6, 4),
             FontSize = 11.5,

@@ -107,6 +107,8 @@
                         <ScrollViewer x:Name="PinnedScroll"
                                       MaxHeight="260"
                                       VerticalAlignment="Bottom"
+                                      CanContentScroll="False"
+                                      PanningMode="VerticalOnly"
                                       VerticalScrollBarVisibility="Auto"
                                       HorizontalScrollBarVisibility="Disabled">
                             <StackPanel x:Name="PinnedRemindersPanel"
