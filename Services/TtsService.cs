@@ -514,7 +514,9 @@ public sealed class TtsService : IDisposable
     {
         if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
         var text = Regex.Replace(raw, @"https?://\S+", "");
-        text = Regex.Replace(text, @"[`*_#>\[\]()「」『』""']", "");
+        text = Regex.Replace(text, @"[`*_#>\[\]()「」『』""'~～♪★☆♡♥✨🔥⚠📌📅❓🔔⏰]", "");
+        // Strip remaining surrogate-pair emojis / symbols that can break GPT-SoVITS G2P and cause vocoder noise.
+        text = Regex.Replace(text, @"[\uD800-\uDBFF][\uDC00-\uDFFF]", "");
         if (pronunciationMap is { Count: > 0 })
         {
             var keys = pronunciationMap.Keys
@@ -546,14 +548,29 @@ public sealed class TtsService : IDisposable
 
     private static List<string> SplitSentences(string text)
     {
-        if (text.Length <= 60)
-            return new List<string> { text };
+        var rawParts = text.Length <= 60
+            ? new List<string> { text }
+            : Regex.Split(text, @"(?<=[。！？!?])")
+                .Select(s => s.Trim())
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .ToList();
 
-        var parts = Regex.Split(text, @"(?<=[。！？!?])")
-            .Select(s => s.Trim())
-            .Where(s => !string.IsNullOrWhiteSpace(s))
-            .ToList();
-        return parts.Count > 0 ? parts : new List<string> { text };
+        // Filter out punctuation-only fragments and merge tiny fragments (<= 3 chars) so GPT-SoVITS never hits EOS-loop static noise.
+        var merged = new List<string>();
+        foreach (var part in rawParts)
+        {
+            if (!Regex.IsMatch(part, @"[\p{L}\p{N}]"))
+                continue;
+
+            if (merged.Count > 0 && part.Length <= 3)
+                merged[^1] = merged[^1] + part;
+            else
+                merged.Add(part);
+        }
+
+        if (merged.Count == 0 && Regex.IsMatch(text, @"[\p{L}\p{N}]"))
+            merged.Add(text);
+        return merged;
     }
 
     public async Task SynthesizeAndPlayPipelinedAsync(string japaneseText, CancellationToken ct, Action? onBeforeFirstPlay = null)
