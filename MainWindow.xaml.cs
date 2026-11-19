@@ -684,11 +684,12 @@ public partial class MainWindow : Window
                     BorderThickness = new Thickness(0),
                     Foreground = BrushFrom(_isDark ? "#CBD5E1" : "#64748B"),
                     Cursor = System.Windows.Input.Cursors.Hand,
-                    VerticalAlignment = VerticalAlignment.Top
+                    VerticalAlignment = VerticalAlignment.Top,
+                    ToolTip = "最小化"
                 };
                 DockPanel.SetDock(closeBtn, Dock.Right);
                 var id = item.Id;
-                closeBtn.Click += async (_, _) => await _controller.DismissPinnedReminderAsync(id);
+                closeBtn.Click += (_, _) => CollapsePinnedToPill(force: true);
                 topDock.Children.Add(closeBtn);
 
                 var titleTb = new TextBlock
@@ -726,6 +727,9 @@ public partial class MainWindow : Window
                         b.Click += async (_, _) => await handler();
                         actions.Children.Add(b);
                     });
+                    var dismissBtn = MakeActionButton("已知（結束）", actions.Children.Count == 0);
+                    dismissBtn.Click += async (_, _) => await _controller.DismissPinnedReminderAsync(id);
+                    actions.Children.Add(dismissBtn);
                     stack.Children.Add(actions);
                 }
                 else if (item.Kind == PinnedItemKind.Confirmation)
@@ -747,6 +751,17 @@ public partial class MainWindow : Window
                         };
                         actions.Children.Add(choiceBtn);
                     }
+                    var dismissBtn = MakeActionButton("放棄", false);
+                    dismissBtn.Click += async (_, _) => await _controller.DismissPinnedReminderAsync(id);
+                    actions.Children.Add(dismissBtn);
+                    stack.Children.Add(actions);
+                }
+                else
+                {
+                    var actions = new WrapPanel { Margin = new Thickness(0, 6, 0, 0) };
+                    var dismissBtn = MakeActionButton("已知（結束）", true);
+                    dismissBtn.Click += async (_, _) => await _controller.DismissPinnedReminderAsync(id);
+                    actions.Children.Add(dismissBtn);
                     stack.Children.Add(actions);
                 }
 
@@ -785,17 +800,13 @@ public partial class MainWindow : Window
                         BorderThickness = new Thickness(0),
                         Foreground = BrushFrom(_isDark ? "#CBD5E1" : "#64748B"),
                         Cursor = System.Windows.Input.Cursors.Hand,
-                        VerticalAlignment = VerticalAlignment.Top
+                        VerticalAlignment = VerticalAlignment.Top,
+                        ToolTip = "最小化"
                     };
                     DockPanel.SetDock(closeBtn, Dock.Right);
                     var reqId = req.RequestId;
                     var reqKind = req.Kind;
-                    closeBtn.Click += (_, _) =>
-                    {
-                        if (reqKind == "path_permission") _controller.ResolvePathPermission(reqId, PathPermissionDecision.Deny);
-                        else if (reqKind == "command_approval") _controller.ResolveCommandApproval(reqId, CommandApprovalDecision.Deny);
-                        else _controller.ResolveConfirmation(reqId, false);
-                    };
+                    closeBtn.Click += (_, _) => CollapsePinnedToPill(force: true);
                     topDock.Children.Add(closeBtn);
 
                     var titleTb = new TextBlock
