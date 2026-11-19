@@ -649,7 +649,7 @@ public partial class MainWindow : Window
 
         SetPillFlash(PinnedNotifPill, _flashingKinds.Contains(PinnedItemKind.Notification));
         SetPillFlash(PinnedSchedulePill, _flashingKinds.Contains(PinnedItemKind.Schedule));
-        SetPillFlash(PinnedConfirmPill, _flashingKinds.Contains(PinnedItemKind.Confirmation));
+        SetPillFlash(PinnedConfirmPill, _flashingKinds.Contains(PinnedItemKind.Confirmation) || (pendingInteractions.Count > 0 && _expandedPinnedKind != PinnedItemKind.Confirmation));
 
         if (_expandedPinnedKind is PinnedItemKind expandedKind)
         {
