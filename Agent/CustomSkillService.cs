@@ -159,12 +159,15 @@ public sealed class CustomSkillService
         };
         if (!string.IsNullOrWhiteSpace(extraArgs))
             psi.Environment["SKILL_ARGS"] = extraArgs.Trim();
+        var script = NormalizePowerShellScript(skill.Command);
+        var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
+
         psi.ArgumentList.Add("-NoProfile");
         psi.ArgumentList.Add("-NonInteractive");
         psi.ArgumentList.Add("-ExecutionPolicy");
         psi.ArgumentList.Add("Bypass");
-        psi.ArgumentList.Add("-Command");
-        psi.ArgumentList.Add(skill.Command);
+        psi.ArgumentList.Add("-EncodedCommand");
+        psi.ArgumentList.Add(encoded);
 
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start process.");
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -182,5 +185,24 @@ public sealed class CustomSkillService
             return $"Execution failed (exit={proc.ExitCode}): {stderr}";
 
         return string.IsNullOrWhiteSpace(stdout) ? "Completed (no output)." : stdout;
+    }
+
+    /// <summary>
+    /// 移除模型偶爾多包一層的 `powershell ... -Command "..."` 外殼，避免雙重展開破壞變數語法。
+    /// </summary>
+    private static string NormalizePowerShellScript(string rawCommand)
+    {
+        var s = (rawCommand ?? "").Trim();
+        var m = System.Text.RegularExpressions.Regex.Match(
+            s,
+            @"^(?:powershell(?:\.exe)?|pwsh(?:\.exe)?)\s+(?:-\S+(?:\s+(?!-Command\b|-c\b)\S+)?\s+)*(?:-Command|-c)\s+([\s\S]+)$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (m.Success)
+        {
+            s = m.Groups[1].Value.Trim();
+            if ((s.StartsWith('"') && s.EndsWith('"')) || (s.StartsWith('\'') && s.EndsWith('\'')))
+                s = s[1..^1];
+        }
+        return s;
     }
 }
