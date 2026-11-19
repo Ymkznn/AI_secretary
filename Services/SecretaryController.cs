@@ -1378,7 +1378,7 @@ public sealed class SecretaryController : IDisposable
     public async Task PushProactiveNotificationAsync(string convId, string eventId, MailItem mail, string title, string summary, CancellationToken ct, int reRemindMinutes = 15, List<NotificationButtonOption>? actions = null)
     {
         var finalActions = actions is not null ? new List<NotificationButtonOption>(actions) : new List<NotificationButtonOption>();
-        var otpBtn = finalActions.FirstOrDefault(a => a.Type == "copy_otp");
+        var otpBtn = finalActions.FirstOrDefault(a => a.Type is "fill_otp" or "copy_otp");
         var otp = otpBtn?.Prompt;
         if (!string.IsNullOrEmpty(otp))
         {
@@ -1420,8 +1420,11 @@ public sealed class SecretaryController : IDisposable
 
                 if (!evCtx.Published)
                 {
-                    finalActions = finalActions.Select(a => a with { IsPrimary = false }).ToList();
-                    finalActions.Insert(0, new NotificationButtonOption("fill_otp", AppMessages.OtpFillLabel(otp), Prompt: otp, IsPrimary: true));
+                    if (!finalActions.Any(a => a.Type == "fill_otp"))
+                    {
+                        finalActions = finalActions.Select(a => a with { IsPrimary = false }).ToList();
+                        finalActions.Insert(0, new NotificationButtonOption("fill_otp", AppMessages.OtpFillLabel(otp), Prompt: otp, IsPrimary: true));
+                    }
                     await PersistNotificationAsync(convId, eventId, mail, title, summary, reRemindMinutes, finalActions, ct);
                 }
                 return;

@@ -312,23 +312,14 @@ public sealed class PlannerAgent
                     var type = a.TryGetProperty("type", out var ty) ? (ty.GetString() ?? "").Trim().ToLowerInvariant() : "";
                     var label = a.TryGetProperty("label", out var lb) ? (lb.GetString() ?? "").Trim() : "";
                     if (string.IsNullOrWhiteSpace(label)) continue;
-                    if (type is not ("view_mail" or "draft_reply" or "snooze" or "ask_ai")) continue;
+                    if (type is not ("view_mail" or "draft_reply" or "snooze" or "ask_ai" or "fill_otp" or "copy_otp")) continue;
                     var prompt = a.TryGetProperty("prompt", out var pr) ? pr.GetString()?.Trim() : null;
-                    if (type == "ask_ai" && string.IsNullOrWhiteSpace(prompt)) continue;
+                    if (type is ("ask_ai" or "fill_otp" or "copy_otp") && string.IsNullOrWhiteSpace(prompt)) continue;
                     var isPrimary = a.TryGetProperty("is_primary", out var ip) && ip.ValueKind == JsonValueKind.True;
                     parsed.Add(new NotificationButtonOption(type, label, prompt, isPrimary));
                     if (parsed.Count >= 4) break;
                 }
                 if (parsed.Count > 0) actions = parsed;
-            }
-            if (doc.RootElement.TryGetProperty("otp_code", out var otpEl) && otpEl.ValueKind == JsonValueKind.String)
-            {
-                var otp = otpEl.GetString()?.Trim();
-                if (!string.IsNullOrEmpty(otp) && otp.Length is >= 4 and <= 8 && otp.All(char.IsDigit))
-                {
-                    actions ??= new List<NotificationButtonOption>();
-                    actions.Insert(0, new NotificationButtonOption("copy_otp", AppMessages.OtpCopyLabel(otp), Prompt: otp, IsPrimary: false));
-                }
             }
         }
         catch (Exception ex)
