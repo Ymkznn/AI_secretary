@@ -108,14 +108,20 @@ Foundry__Model=your_model_name
 
    - 其餘服務參數（Outlook EWS `Ews:Url`、Gmail OAuth `Gmail`、語音合成 `Tts`、安全護欄 `Guard` 與沙盒路徑 `Sandbox`）可在 [appsettings.json](appsettings.json) 或「設定」視窗中調整；使用者覆寫設定與 SQLite 資料庫預設存放於 `%LOCALAPPDATA%\AiSecretary.Desktop\`。
 
-### 3. 建置與啟動
+### 3. 設定自己的 Gmail OAuth 憑證（選用）
+本專案開源不包含任何預置的 Google OAuth 金鑰（`.gitignore` 亦已排除 `gmail_credentials.json` 與 `gmail_token.json`）。若需使用 Gmail 同步功能，請使用你自己的 Google Cloud 專案憑證：
+1. 至 [Google Cloud Console](https://console.cloud.google.com/) 建立專案並啟用 **Gmail API**。
+2. 於「API 和服務 → 憑證」建立「**OAuth 用戶端 ID**」（應用程式類型選擇 **桌面應用程式**），取得 `Client ID` / `Client Secret` 或下載 `credentials.json`。
+3. 啟動程式後開啟「設定 → 連接 Gmail」填入 `Client ID` / `Client Secret` 或直接點「**匯入 JSON…**」，依照瀏覽器頁面完成 OAuth 授權即可（權杖僅儲存於本機 `%LOCALAPPDATA%\AiSecretary.Desktop\`）。
+
+### 4. 建置與啟動
 
 ```powershell
 dotnet build -c Release
 dotnet run --project AiSecretary.Desktop.csproj
 ```
 
-### 4. 載入瀏覽器擴充功能（選用）
+### 5. 載入瀏覽器擴充功能（選用）
 1. 開啟 Chrome 或 Edge 的擴充功能管理頁面（`chrome://extensions` 或 `edge://extensions`）。
 2. 開啟「開發人員模式」。
 3. 點選「載入未封裝項目」，選擇專案內的 `BrowserExtension` 資料夾。
