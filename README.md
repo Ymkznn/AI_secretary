@@ -78,12 +78,17 @@
 - **選用**：Chrome / Edge（載入 [BrowserExtension](BrowserExtension)）、[GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)
 
 ### 2. 設定模型與服務
-支援透過程式內的「**設定**」視窗或專案根目錄 `.env` 設定（支援 Anthropic、Google Gemini 與 OpenAI 相容端點；設定視窗儲存的設定優先權高於 `.env`）：
+支援透過程式內的「**設定**」視窗或專案根目錄 `.env` 設定（支援 Anthropic、Google Gemini 與 OpenAI 相容端點；設定視窗儲存的設定優先權高於 `.env`）。`.env` 支援設定最多兩組模型（複雜規劃 `Complex` 與輕量快速 `Simple`，未填 `Simple` 時自動沿用主設定）：
 
 ```env
-Foundry__Endpoint=https://your-endpoint.example.com/anthropic/v1/messages
-Foundry__ApiKey=your_api_key
-Foundry__Model=your_model_name
+Foundry__Complex__Endpoint=https://your-endpoint.example.com/anthropic/v1/messages
+Foundry__Complex__ApiKey=your_complex_api_key
+Foundry__Complex__Model=your_complex_model
+
+# 選填：輕量模型（未填則共用上方設定）
+Foundry__Simple__Endpoint=https://your-simple-endpoint.example.com/v1/chat/completions
+Foundry__Simple__ApiKey=your_simple_api_key
+Foundry__Simple__Model=your_simple_model
 ```
 
 Outlook EWS、Gmail OAuth、TTS 與其他服務參數可於「設定」視窗或 [appsettings.json](appsettings.json) 中調整。
