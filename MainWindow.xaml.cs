@@ -1333,7 +1333,7 @@ public partial class MainWindow : Window
             var ofd = new OpenFileDialog { Filter = "JSON 檔案|*.json" };
             if (ofd.ShowDialog() == true)
             {
-                File.Copy(ofd.FileName, Path.Combine(AppContext.BaseDirectory, "gmail_credentials.json"), overwrite: true);
+                File.Copy(ofd.FileName, Path.Combine(AppPaths.UserDataRoot, "gmail_credentials.json"), overwrite: true);
                 dlg.DialogResult = true;
                 dlg.Close();
             }

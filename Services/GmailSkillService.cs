@@ -46,7 +46,23 @@ public sealed class GmailSkillService
                 : ResolvePath(configured);
         }
     }
-    private string CredentialsFilePath => ResolvePath(_config.GetValue<string>("Gmail:CredentialsPath") ?? "gmail_credentials.json");
+    private string CredentialsFilePath
+    {
+        get
+        {
+            var configured = _config.GetValue<string>("Gmail:CredentialsPath");
+            if (string.IsNullOrWhiteSpace(configured) ||
+                configured.Trim().Equals("gmail_credentials.json", StringComparison.OrdinalIgnoreCase))
+            {
+                var userCreds = Path.Combine(AppPaths.UserDataRoot, "gmail_credentials.json");
+                if (File.Exists(userCreds)) return userCreds;
+                var baseCreds = Path.Combine(AppContext.BaseDirectory, "gmail_credentials.json");
+                if (File.Exists(baseCreds)) return baseCreds;
+                return userCreds;
+            }
+            return ResolvePath(configured);
+        }
+    }
 
     public bool HasClientCredentials => TryLoadClientCredentials(out _, out _);
 
@@ -444,11 +460,13 @@ public sealed class GmailSkillService
     private static string ResolvePath(string path)
     {
         if (Path.IsPathRooted(path)) return path;
+        var userCandidate = Path.Combine(AppPaths.UserDataRoot, path);
+        if (File.Exists(userCandidate)) return userCandidate;
         var baseCandidate = Path.Combine(AppContext.BaseDirectory, path);
         if (File.Exists(baseCandidate)) return baseCandidate;
         var cwdCandidate = Path.Combine(Directory.GetCurrentDirectory(), path);
         if (File.Exists(cwdCandidate)) return cwdCandidate;
-        return baseCandidate;
+        return userCandidate;
     }
 
     private static int GetAvailablePort()

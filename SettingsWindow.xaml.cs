@@ -206,7 +206,7 @@ public partial class SettingsWindow : Window
         {
             var row = new DockPanel { Margin = new Thickness(0, 4, 0, 6) };
 
-            if (s.Name.Equals("read_gmail", StringComparison.OrdinalIgnoreCase))
+            if (s.Name.Equals("manage_mail", StringComparison.OrdinalIgnoreCase))
             {
                 var authBtn = new Button
                 {
