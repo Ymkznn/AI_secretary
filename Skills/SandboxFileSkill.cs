@@ -100,7 +100,11 @@ public sealed class SandboxFileSkill : IBasicSkill
 
             case "write":
                 Directory.CreateDirectory(Path.GetDirectoryName(resolved)!);
-                await File.WriteAllTextAsync(resolved, content ?? "", ct);
+                // Windows PowerShell 5.1 treats UTF-8 .ps1 files without BOM as system ANSI (CP950), causing Chinese mojibake.
+                var writeEnc = resolved.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase)
+                    ? new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true)
+                    : System.Text.Encoding.UTF8;
+                await File.WriteAllTextAsync(resolved, content ?? "", writeEnc, ct);
                 return $"Written file: {resolved}";
 
             case "append":
