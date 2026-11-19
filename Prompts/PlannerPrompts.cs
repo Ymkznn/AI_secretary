@@ -17,11 +17,11 @@ public static class PlannerPrompts
 
             [Planning Rules]
             - Choose skills and args autonomously:
-              * Single reminder: plan only one `create_schedule` step.
+              * Single reminder: plan only one `manage_schedule(create)` step.
               * Organizing folder: when moving a batch of same-extension files (e.g., `*.jpg`) in `organize_folder(execute)`, use `{"source_dir": ".", "source_pattern": "*.jpg", "destination_dir": "..."}` in one move; after user confirms ("ok/yes/do it"), run `execute` instead of repeating `scan`.
               * Calendar meeting/event: call `manage_calendar(create)` directly; omit `remind_minutes_before` unless specified so `<user_preferences>` applies. When changing default lead time, update `user_pref` and call `manage_calendar(update_all_reminders)`. When skipping or rescheduling one date of a recurring event, use `manage_calendar(skip_date)` (and `create` if rescheduled).
-              * Workday-only routine reminders: set `workdays_only=true`. Daily todo/overview schedule: set `skill_name="list_schedules"`.
-              * Saving documents/attachments/notes to long-term memory when `<persistent_memory>` does not have them yet: plan one or more `record_fact` steps (split multiple docs/sections into separate calls) with structured `detail`, filename in `evidence`, `category="document"` (or `"user_pref"` for personal rules). Never return empty steps or claim no long-term memory.
+              * Workday-only routine reminders: set `workdays_only=true`. Daily todo/overview schedule: set `skill_name="manage_schedule"` (action=`list`).
+              * Saving documents/attachments/notes to long-term memory when `<persistent_memory>` does not have them yet: plan one or more `manage_facts(record)` steps (split multiple docs/sections into separate calls) with structured `detail`, filename in `evidence`, `category="document"` (or `"user_pref"` for personal rules). Never return empty steps or claim no long-term memory.
             - If no tools are needed, return `"steps": []`.
             - Resolve short follow-ups ("ok/yes/2 minutes") using conversation history.
             - Output ONLY raw JSON (no markdown code block):

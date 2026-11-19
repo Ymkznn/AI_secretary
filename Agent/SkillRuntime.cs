@@ -95,35 +95,35 @@ public sealed class SkillRuntime
 
     public async Task<IReadOnlyList<MailItem>> ReadInboxAsync(string? query = null, int? maxResults = null, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("read_inbox");
+        var check = _guard.CheckSkillExecution("manage_mail");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         return await _mailBroker.FetchRecentMailsAsync(null, ct, query, maxResults);
     }
 
     public async Task<MailItem?> GetMailDetailAsync(string mailId, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("get_mail_detail");
+        var check = _guard.CheckSkillExecution("manage_mail");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         return await _mailBroker.GetMailByIdAsync(mailId, ct);
     }
 
     public async Task<IReadOnlyList<MailItem>> ReadGmailAsync(string? query = null, int? maxResults = null, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("read_gmail");
+        var check = _guard.CheckSkillExecution("manage_mail");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         return await _gmail.ReadInboxAsync(query, maxResults, ct);
     }
 
     public async Task<MailItem?> GetGmailDetailAsync(string messageId, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("get_gmail_detail");
+        var check = _guard.CheckSkillExecution("manage_mail");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         return await _gmail.GetMailDetailAsync(messageId, ct);
     }
 
     public async Task<string> SyncMailAsync(string conversationId, string? source = null, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("sync_mail");
+        var check = _guard.CheckSkillExecution("manage_mail");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         if (SyncMailRequested is null)
             return "sync_mail: service not initialized.";
@@ -194,7 +194,7 @@ public sealed class SkillRuntime
     /// <summary>立即將指定提醒釘選至對話框置頂欄。</summary>
     public void PinReminderNow(string title, string message, int reRemindMinutes = 15)
     {
-        var check = _guard.CheckSkillExecution("create_schedule");
+        var check = _guard.CheckSkillExecution("manage_schedule");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         PinReminderRequested?.Invoke(title, message, reRemindMinutes);
     }
@@ -251,7 +251,7 @@ public sealed class SkillRuntime
 
     public async Task<IReadOnlyList<ReminderRecord>> ListSchedulesAsync(CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("list_schedules");
+        var check = _guard.CheckSkillExecution("manage_schedule");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         return await _store.GetPendingRemindersAsync(ct);
     }
@@ -266,7 +266,7 @@ public sealed class SkillRuntime
         string? skillArgsJson = null,
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("update_schedule");
+        var check = _guard.CheckSkillExecution("manage_schedule");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
 
         var pending = await _store.GetPendingRemindersAsync(ct);
@@ -293,7 +293,7 @@ public sealed class SkillRuntime
         List<string>? tags = null,
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("record_fact");
+        var check = _guard.CheckSkillExecution("manage_facts");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
 
         var normalizedConfidence = string.Equals(confidence, "inferred", StringComparison.OrdinalIgnoreCase)
@@ -329,21 +329,21 @@ public sealed class SkillRuntime
         int limit = 10,
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("search_facts");
+        var check = _guard.CheckSkillExecution("manage_facts");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         return await _store.ListFactsAsync(conversationId, keyword, category, limit, ct);
     }
 
     public async Task<KnowledgeFactRecord?> GetFactDetailAsync(string factId, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("get_fact_detail");
+        var check = _guard.CheckSkillExecution("manage_facts");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         return await _store.GetFactDetailAsync(factId, ct);
     }
 
     public async Task<bool> DeleteScheduleAsync(string idOrKeyword, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("delete_schedule");
+        var check = _guard.CheckSkillExecution("manage_schedule");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
 
         var pending = await _store.GetPendingRemindersAsync(ct);
@@ -366,7 +366,7 @@ public sealed class SkillRuntime
         string conversationId = "",
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("update_fact");
+        var check = _guard.CheckSkillExecution("manage_facts");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         var ok = await _store.UpdateFactAsync(factId, summary, detail, category, evidence, ct);
         if (ok && !string.IsNullOrWhiteSpace(conversationId))
@@ -376,7 +376,7 @@ public sealed class SkillRuntime
 
     public async Task<bool> DeleteFactAsync(string factId, string conversationId = "", CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("delete_fact");
+        var check = _guard.CheckSkillExecution("manage_facts");
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         var ok = await _store.DeleteFactAsync(factId, ct);
         if (ok && !string.IsNullOrWhiteSpace(conversationId))

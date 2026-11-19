@@ -117,8 +117,16 @@ public sealed class GuardService
 
     public void SetSkillEnabled(string skillName, bool enabled)
     {
-        if (enabled) _disabledSkills.Remove(skillName);
-        else _disabledSkills.Add(skillName);
+        var norm = NormalizeSkillKey(skillName);
+        if (enabled)
+        {
+            _disabledSkills.Remove(skillName);
+            _disabledSkills.Remove(norm);
+        }
+        else
+        {
+            _disabledSkills.Add(norm);
+        }
     }
 
     public void LoadDisabledSkills(IEnumerable<string> disabled)
@@ -127,7 +135,7 @@ public sealed class GuardService
         foreach (var s in disabled)
         {
             if (!string.IsNullOrWhiteSpace(s))
-                _disabledSkills.Add(s.Trim());
+                _disabledSkills.Add(NormalizeSkillKey(s));
         }
     }
 
