@@ -3,7 +3,6 @@ using System.Text;
 using System.Text.Json;
 using AiSecretary.Desktop.Agent.Providers;
 using AiSecretary.Desktop.Data;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Agent;
@@ -11,6 +10,7 @@ namespace AiSecretary.Desktop.Agent;
 public sealed class FoundryModelGateway : IModelGateway
 {
     private static readonly SemaphoreSlim RateGate = new(1, 1);
+    private static readonly SemaphoreSlim UsageLock = new(1, 1);
     private static DateTimeOffset _lastRequestUtc = DateTimeOffset.MinValue;
 
     private readonly HttpClient _http;
@@ -42,7 +42,7 @@ public sealed class FoundryModelGateway : IModelGateway
 
         if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(apiKey))
         {
-            throw new InvalidOperationException(AppMessages.MissingLlmConfig);
+            throw new InvalidOperationException("LLM Endpoint or API Key is not configured. Please set it in Settings -> LLM or .env.");
         }
 
         var adapter = _adapters.FirstOrDefault(a => a.CanHandle(endpoint))
@@ -180,6 +180,7 @@ public sealed class FoundryModelGateway : IModelGateway
 
     private async Task AccumulateUsageAsync(int inTok, int outTok, int cacheTok, CancellationToken ct)
     {
+        await UsageLock.WaitAsync(ct);
         try
         {
             await AddCounterAsync("tokens_input", inTok, ct);
@@ -189,6 +190,10 @@ public sealed class FoundryModelGateway : IModelGateway
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "Failed to persist token usage");
+        }
+        finally
+        {
+            UsageLock.Release();
         }
     }
 

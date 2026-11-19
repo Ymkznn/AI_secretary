@@ -71,6 +71,7 @@ public sealed class ApiServerHost : IAsyncDisposable
         _browserBridge.DomRequested += (requestId, selector, maxChars) => BroadcastEvent("browser_dom_request", new { requestId, selector, maxChars });
         _browserBridge.ApplyFillsRequested += fills => BroadcastEvent("browser_apply_fills", new { fills });
         _browserBridge.FillOtpRequested += (requestId, code) => BroadcastEvent("browser_fill_otp", new { requestId, code });
+        _browserBridge.TitleRequested += requestId => BroadcastEvent("browser_title_request", new { requestId });
     }
 
     public async Task StartAsync(CancellationToken ct = default)
@@ -223,6 +224,10 @@ public sealed class ApiServerHost : IAsyncDisposable
             _browserBridge.CompleteFillOtp(requestId, result)
                 ? Results.Ok(new { received = true })
                 : Results.NotFound(new { error = "OTP fill request not found or expired." }));
+        _app.MapPost("/api/browser/title-result/{requestId}", (string requestId, BrowserTabTitleResult result) =>
+            _browserBridge.CompleteTabTitle(requestId, result)
+                ? Results.Ok(new { received = true })
+                : Results.NotFound(new { error = "Title request not found or expired." }));
         _app.MapPost("/api/browser/page-signal", async (BrowserPageSignal signal, CancellationToken ct) =>
         {
             await _controller.HandleBrowserPageSignalAsync(signal, ct);

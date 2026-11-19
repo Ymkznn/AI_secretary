@@ -1,5 +1,4 @@
 using AiSecretary.Desktop.Agent;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -14,6 +13,7 @@ public sealed class DismissReminderSkill : IBasicSkill
 
     public string Name => "dismiss_reminder";
     public string DisplayDescription => "Dismiss pinned desktop reminder cards";
+    public string StatusText => "Dismissing reminder...";
     public string MainAgentSpec => """
             dismiss_reminder
                - Purpose: Dismiss a pinned desktop reminder card by ID or keyword (or "all").
@@ -25,9 +25,10 @@ public sealed class DismissReminderSkill : IBasicSkill
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
         var kw = ctx.GetArg("keyword") ?? "";
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Dismissing reminder..."));
+        var skillName = ctx.EffectiveName(Name);
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
         var res = await _skills.DismissPinnedReminderAsync(kw);
         ctx.Observations.Add(res);
-        ctx.CompletedSteps.Add($"dismiss_reminder:{kw}");
+        ctx.CompletedSteps.Add($"{skillName}:{kw}");
     }
 }

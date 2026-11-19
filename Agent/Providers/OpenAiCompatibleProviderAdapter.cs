@@ -67,7 +67,8 @@ public sealed class OpenAiCompatibleProviderAdapter : ILlmProviderAdapter
                 cache = cv;
             }
         }
-        return (input, output, cache);
+        var nonCachedInput = Math.Max(0, input - cache);
+        return (nonCachedInput, output, cache);
     }
 
     private static object BuildContent(string text)

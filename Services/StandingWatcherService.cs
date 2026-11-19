@@ -6,7 +6,6 @@ using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Skills;
 
 namespace AiSecretary.Desktop.Services;
@@ -21,6 +20,7 @@ public sealed class StandingWatcherService
     private readonly GuardService _guard;
     private readonly IHttpClientFactory _httpFactory;
     private readonly BrowserHostService _browserHost;
+    private readonly UiLocalizer _localizer;
     private readonly ILogger<StandingWatcherService> _logger;
     private readonly SemaphoreSlim _tickLock = new(1, 1);
 
@@ -29,12 +29,14 @@ public sealed class StandingWatcherService
         GuardService guard,
         IHttpClientFactory httpFactory,
         BrowserHostService browserHost,
+        UiLocalizer localizer,
         ILogger<StandingWatcherService> logger)
     {
         _store = store;
         _guard = guard;
         _httpFactory = httpFactory;
         _browserHost = browserHost;
+        _localizer = localizer;
         _logger = logger;
     }
 
@@ -79,7 +81,8 @@ public sealed class StandingWatcherService
             if (status == "needs_auth")
             {
                 await _store.UpdateWatcherStateAsync(w.WatcherId, w.LastSnapshot, now, nextAt, w.FailureCount, "NeedsAuth", ct);
-                await onTriggeredAsync(w, AppMessages.LocalizeFormat("WatcherNeedsAuth", "Session expired for '{0}'. Please reopen the dedicated browser and sign in to resume.", w.Title));
+                var needsAuthMsg = await _localizer.TextAsync("WatcherNeedsAuth", "Session expired for '{0}'. Please reopen the dedicated browser and sign in to resume.", new object?[] { w.Title }, ct);
+                await onTriggeredAsync(w, needsAuthMsg);
                 return (false, "needs_auth");
             }
 
@@ -89,7 +92,10 @@ public sealed class StandingWatcherService
                 var newStatus = fails >= 5 ? "Paused" : w.Status;
                 await _store.UpdateWatcherStateAsync(w.WatcherId, w.LastSnapshot, now, nextAt, fails, newStatus, ct);
                 if (newStatus == "Paused")
-                    await onTriggeredAsync(w, AppMessages.LocalizeFormat("WatcherPaused", "Watcher '{0}' paused automatically after {1} consecutive failures: {2}", w.Title, fails, currentValue));
+                {
+                    var pausedMsg = await _localizer.TextAsync("WatcherPaused", "Watcher '{0}' paused automatically after {1} consecutive failures: {2}", new object?[] { w.Title, fails, currentValue }, ct);
+                    await onTriggeredAsync(w, pausedMsg);
+                }
                 return (false, currentValue);
             }
 
@@ -99,8 +105,8 @@ public sealed class StandingWatcherService
             if (triggered)
             {
                 var alertMsg = string.IsNullOrWhiteSpace(w.ThresholdValue)
-                    ? AppMessages.LocalizeFormat("WatcherChanged", "'{0}' detected a new change:\n{1}", w.Title, currentValue)
-                    : AppMessages.LocalizeFormat("WatcherMatched", "'{0}' matched condition (current: {1}, threshold: {2})\n{3}", w.Title, currentValue, w.ThresholdValue, w.Url);
+                    ? await _localizer.TextAsync("WatcherChanged", "'{0}' detected a new change:\n{1}", new object?[] { w.Title, currentValue }, ct)
+                    : await _localizer.TextAsync("WatcherMatched", "'{0}' matched condition (current: {1}, threshold: {2})\n{3}", new object?[] { w.Title, currentValue, w.ThresholdValue, w.Url }, ct);
                 await onTriggeredAsync(w, alertMsg);
             }
 

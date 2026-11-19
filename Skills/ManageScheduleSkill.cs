@@ -1,6 +1,5 @@
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -18,6 +17,8 @@ public sealed class ManageScheduleSkill : IBasicSkill
 
     public string Name => "manage_schedule";
     public string DisplayDescription => "Create, list, update, and delete reminders & schedules";
+    public string StatusText => "Updating schedules...";
+    public string? Capability => "schedule";
     public string MainAgentSpec => """
             manage_schedule
                - Purpose: Create, list, update, or delete timed reminders, recurring schedules, and automated rules.
@@ -66,7 +67,7 @@ public sealed class ManageScheduleSkill : IBasicSkill
         var skillArgs = ctx.GetArg("skill_args");
         var recurrenceRule = ctx.GetArg("recurrence_rule") ?? ctx.GetArg("rule_pattern");
 
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Updating schedules..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var rec = await _skills.CreateReminderAsync(
             ctx.ConversationId,
             remindAt,
@@ -87,7 +88,7 @@ public sealed class ManageScheduleSkill : IBasicSkill
 
     private async Task ListAsync(SkillExecutionContext ctx)
     {
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Updating schedules..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var items = await _skills.ListSchedulesAsync(ctx.Ct);
         if (items.Count == 0)
         {
@@ -113,7 +114,7 @@ public sealed class ManageScheduleSkill : IBasicSkill
         var skillName = ctx.GetArg("skill_name");
         var skillArgs = ctx.GetArg("skill_args");
 
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Updating schedules..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var updated = await _skills.UpdateScheduleAsync(id, title, message, remindAt, interval, skillName, skillArgs, ctx.Ct);
         if (updated is null)
         {
@@ -127,7 +128,7 @@ public sealed class ManageScheduleSkill : IBasicSkill
     private async Task DeleteAsync(SkillExecutionContext ctx)
     {
         var id = ctx.GetArg("id") ?? ctx.GetArg("keyword") ?? ctx.GetArg("title") ?? "";
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Updating schedules..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var ok = await _skills.DeleteScheduleAsync(id, ctx.Ct);
         ctx.Observations.Add(ok
             ? $"manage_schedule: deleted '{id}'."

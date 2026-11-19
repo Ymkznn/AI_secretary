@@ -1,5 +1,4 @@
 using AiSecretary.Desktop.Agent;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -14,6 +13,7 @@ public sealed class ManageCalendarSkill : IBasicSkill
 
     public string Name => "manage_calendar";
     public string DisplayDescription => "Read, create, update, and delete calendar events";
+    public string StatusText => "Accessing calendar...";
     public string MainAgentSpec => """
             manage_calendar
                - Purpose: List, create, update, delete, check conflicts, skip a date, or update meeting reminders in the calendar.
@@ -38,7 +38,7 @@ public sealed class ManageCalendarSkill : IBasicSkill
         var rmbRaw = ctx.GetArg("remind_minutes_before");
         int? remindMinutesBefore = int.TryParse(rmbRaw, out var rmb) ? Math.Max(0, rmb) : null;
 
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Accessing calendar..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         switch (action)
         {
             case "list":

@@ -1,6 +1,6 @@
+using System.Text.Json;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Skills;
@@ -23,6 +23,7 @@ public sealed class PowerPointAssistantSkill : IBasicSkill
 
     public string Name => "powerpoint_assistant";
     public string DisplayDescription => "Inspect, read, or update slides/notes in PowerPoint";
+    public string StatusText => "Processing PowerPoint deck...";
     public string MainAgentSpec => """
             powerpoint_assistant
                - Purpose: Inspect active PowerPoint slide/outline/notes or safely update slide text/notes (backup + confirmation required).
@@ -33,8 +34,9 @@ public sealed class PowerPointAssistantSkill : IBasicSkill
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
+        var skillName = ctx.EffectiveName(Name);
         var action = (ctx.GetArg("action") ?? "inspect_slide").Trim().ToLowerInvariant();
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Processing PowerPoint deck..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
 
         if (action is "inspect_slide" or "inspect_outline")
         {
@@ -45,7 +47,7 @@ public sealed class PowerPointAssistantSkill : IBasicSkill
                 return;
             }
 
-            if (!await _skills.EnsureExternalPathAccessAsync(filePath, Name, ctx.ConfirmAsync))
+            if (!await _skills.EnsureExternalPathAccessAsync(filePath, skillName, ctx.ConfirmAsync, ctx.Ct))
             {
                 ctx.Observations.Add($"powerpoint_assistant: user denied read permission for {filePath}.");
                 return;
@@ -73,11 +75,15 @@ public sealed class PowerPointAssistantSkill : IBasicSkill
             return;
         }
 
-        var approved = await ctx.ConfirmAsync(
-            "PowerPoint Update Confirmation",
-            $"Update slide #{slideIndex} (backup created automatically):\n" +
-            (shapeIndex.HasValue ? $"- Shape #{shapeIndex}: {text}\n" : "") +
-            (notes is not null ? $"- Notes: {notes}" : ""));
+        var details = (shapeIndex.HasValue ? $"- Shape #{shapeIndex}: {text}\n" : "")
+                    + (notes is not null ? $"- Notes: {notes}" : "");
+        var confirmTitle = await ctx.TextAsync("confirm_ppt_update_title", "PowerPoint Update Confirmation");
+        var confirmBody = await ctx.TextAsync(
+            "confirm_ppt_update_body",
+            "Update slide #{0} (backup created automatically):\n{1}",
+            slideIndex,
+            details);
+        var approved = await ctx.ConfirmAsync(confirmTitle, confirmBody);
         if (!approved)
         {
             ctx.Observations.Add("powerpoint_assistant: user declined update.");

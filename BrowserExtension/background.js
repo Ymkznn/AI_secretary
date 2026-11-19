@@ -113,6 +113,28 @@ async function handleFillOtp(requestId, code) {
   } catch {}
 }
 
+async function handleTabTitle(requestId) {
+  let result = { title: null, incognito: false };
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (tab) {
+      if (tab.incognito) {
+        result = { title: null, incognito: true };
+      } else {
+        result = { title: tab.title || '', incognito: false };
+      }
+    }
+  } catch {}
+
+  try {
+    await fetch(`${API_BASE}/api/browser/title-result/${encodeURIComponent(requestId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(result)
+    });
+  } catch {}
+}
+
 function connectSse() {
   if (sse) {
     try { sse.close(); } catch {}
@@ -140,6 +162,12 @@ function connectSse() {
     try {
       const data = JSON.parse(ev.data);
       if (data?.requestId && data?.code) handleFillOtp(data.requestId, data.code);
+    } catch {}
+  });
+  sse.addEventListener('browser_title_request', (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      if (data?.requestId) handleTabTitle(data.requestId);
     } catch {}
   });
   sse.onerror = () => {

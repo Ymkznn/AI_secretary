@@ -36,7 +36,7 @@ public static class SystemAutomationPrompts
            "Set shorter next_review_after_* when tuning is unstable or samples are low, and longer intervals when hit rate is already stable to save tokens. " +
            "Only disable workflows with repeated misses (MissCount >= 3 and MissCount > HitCount).";
 
-    public static string BuildBrowserFormSuggestPrompt(BrowserFormContext form)
+    public static string BuildBrowserFormSuggestPrompt(BrowserFormContext form, string replyLang = "繁體中文")
     {
         var fieldsBlock = string.Join("\n", form.Fields.Take(30).Select(f =>
             $"- field_id={f.FieldId} | label={f.Label} | type={f.ControlType} | current={f.CurrentValue ?? ""}" +
@@ -50,7 +50,7 @@ public static class SystemAutomationPrompts
             {{fieldsBlock}}
 
             Use <persistent_memory> and <user_preferences> to propose values and return raw JSON only (no Markdown fence):
-            {"summary": "short explanation in user reply language", "fills": [{"field_id": "...", "value": "..."}]}
+            {"summary": "short explanation strictly in '{{replyLang}}'", "fills": [{"field_id": "...", "value": "..."}]}
             """;
     }
 

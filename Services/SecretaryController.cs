@@ -4,7 +4,7 @@ using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
 using AiSecretary.Desktop.Prompts;
-using AiSecretary.Desktop.Resources;
+using AiSecretary.Desktop.Skills;
 
 namespace AiSecretary.Desktop.Services;
 
@@ -18,11 +18,13 @@ public sealed class SecretaryController : IDisposable
     private readonly PlannerAgent _planner;
     private readonly WorkerAgent _worker;
     private readonly SkillRuntime _skills;
+    private readonly SkillRegistry _skillRegistry;
     private readonly CustomSkillService _customSkills;
     private readonly SandboxService _sandbox;
     private readonly GuardService _guard;
     private readonly StyleService _styles;
     private readonly TtsService _tts;
+    private readonly UiLocalizer _localizer;
     private readonly AppSettingsService _settings;
     private readonly InteractionGateway _interaction;
     private readonly ActivityMonitorService _activity;
@@ -108,7 +110,7 @@ public sealed class SecretaryController : IDisposable
     public event Action<StandingWatcherRecord, string>? WatcherTriggered;
 
     public string ConversationId { get; private set; } = "conv-main";
-    public string MonitorStatus { get; private set; } = AppMessages.Localize("MonitorStandby", "Standby");
+    public string MonitorStatus => _localizer.TextCached("MonitorDefault", "Scheduled sync (configurable)");
     public bool IsGmailAuthorized => _gmail.IsAuthorized;
     public bool HasGmailClientCredentials => _gmail.HasClientCredentials;
     public string SandboxRootPath => _sandbox.RootPath;
@@ -122,11 +124,13 @@ public sealed class SecretaryController : IDisposable
         PlannerAgent planner,
         WorkerAgent worker,
         SkillRuntime skills,
+        SkillRegistry skillRegistry,
         CustomSkillService customSkills,
         SandboxService sandbox,
         GuardService guard,
         StyleService styles,
         TtsService tts,
+        UiLocalizer localizer,
         AppSettingsService settings,
         InteractionGateway interaction,
         ActivityMonitorService activity,
@@ -147,11 +151,13 @@ public sealed class SecretaryController : IDisposable
         _planner = planner;
         _worker = worker;
         _skills = skills;
+        _skillRegistry = skillRegistry;
         _customSkills = customSkills;
         _sandbox = sandbox;
         _guard = guard;
         _styles = styles;
         _tts = tts;
+        _localizer = localizer;
         _settings = settings;
         _interaction = interaction;
         _activity = activity;
@@ -200,16 +206,6 @@ public sealed class SecretaryController : IDisposable
     public async Task InitializeAsync()
     {
         ConversationId = await _store.GetActiveConversationIdAsync();
-        var disabledJson = await _store.GetSyncValueAsync("disabled_skills", _appCts.Token);
-        if (!string.IsNullOrWhiteSpace(disabledJson))
-        {
-            try
-            {
-                var disabled = JsonSerializer.Deserialize<List<string>>(disabledJson);
-                if (disabled is not null) _guard.LoadDisabledSkills(disabled);
-            }
-            catch { }
-        }
 
         var pinnedJson = await _store.GetSyncValueAsync("pinned_reminders", _appCts.Token);
         if (!string.IsNullOrWhiteSpace(pinnedJson))
@@ -289,7 +285,7 @@ public sealed class SecretaryController : IDisposable
             m.IsStreaming = false;
             m.StatusText = null;
             if (string.IsNullOrWhiteSpace(m.Content))
-                m.Content = AppMessages.Localize("TaskInterrupted", "(Previous task was interrupted)");
+                m.Content = await _localizer.TextAsync("TaskInterrupted", "(Previous task was interrupted)", Array.Empty<object?>(), _appCts.Token);
             await _store.UpsertChatMessageAsync(m, _appCts.Token);
         }
 
@@ -297,23 +293,27 @@ public sealed class SecretaryController : IDisposable
         var bootstrapped = await _store.GetSyncValueAsync("mail_monitor_bootstrapped", _appCts.Token);
         if (bootstrapped != "1")
         {
-            var existing = await _store.GetPendingRemindersAsync(_appCts.Token);
-            if (!existing.Any(r =>
-                    string.Equals(r.SkillName, "manage_mail", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(r.SkillName, "sync_mail", StringComparison.OrdinalIgnoreCase)))
+            var mailSkill = _skillRegistry.FindByCapability("mail");
+            if (mailSkill is not null)
             {
-                var intervalMins = Math.Max(1, _config.GetValue<int>("MailMonitor:PollIntervalSeconds", 60) / 60);
-                await _store.CreateReminderAsync(new ReminderRecord(
-                    ReminderId: Guid.NewGuid().ToString("N"),
-                    ConversationId: ConversationId,
-                    Title: "Mail Sync",
-                    Message: "Periodically sync Outlook EWS and Gmail and triage urgent mail.",
-                    RelatedMailId: null,
-                    RemindAt: DateTimeOffset.UtcNow.AddSeconds(10),
-                    Status: "Pending",
-                    IntervalMinutes: intervalMins,
-                    SkillName: "manage_mail",
-                    SkillArgsJson: """{"action":"sync","source":"all"}"""), _appCts.Token);
+                var existing = await _store.GetPendingRemindersAsync(_appCts.Token);
+                if (!existing.Any(r =>
+                        !string.IsNullOrWhiteSpace(r.SkillName) &&
+                        string.Equals(_skillRegistry.Resolve(r.SkillName)?.Name, mailSkill.Name, StringComparison.OrdinalIgnoreCase)))
+                {
+                    var intervalMins = Math.Max(1, _config.GetValue<int>("MailMonitor:PollIntervalSeconds", 60) / 60);
+                    await _store.CreateReminderAsync(new ReminderRecord(
+                        ReminderId: Guid.NewGuid().ToString("N"),
+                        ConversationId: ConversationId,
+                        Title: "Mail Sync",
+                        Message: "Periodically sync Outlook EWS and Gmail and triage urgent mail.",
+                        RelatedMailId: null,
+                        RemindAt: DateTimeOffset.UtcNow.AddSeconds(10),
+                        Status: "Pending",
+                        IntervalMinutes: intervalMins,
+                        SkillName: mailSkill.Name,
+                        SkillArgsJson: """{"action":"sync","source":"all"}"""), _appCts.Token);
+                }
             }
             await _store.SetSyncValueAsync("mail_monitor_bootstrapped", "1", _appCts.Token);
         }
@@ -380,22 +380,15 @@ public sealed class SecretaryController : IDisposable
             ? _gmail.GetMailDetailAsync(mailId)
             : _mailBroker.GetMailByIdAsync(mailId);
 
+    public Task<string> LocalizeAsync(string key, string englishTemplate, params object?[] args)
+        => _localizer.TextAsync(key, englishTemplate, args, _appCts.Token);
+
     public async Task<IReadOnlyList<SkillMenuEntry>> GetAllSkillsAsync()
-    {
-        var list = _skills.GetBuiltInSkills().ToList();
-        var custom = await _customSkills.ListAsync(_appCts.Token);
-        foreach (var c in custom)
-        {
-            list.Add(new SkillMenuEntry(c.Name, c.Description, true, _guard.IsSkillEnabled(c.Name)));
-        }
-        return list;
-    }
+        => await _skillRegistry.GetMenuEntriesAsync(_appCts.Token);
 
     public async Task SetSkillEnabledAsync(string skillName, bool enabled)
     {
-        _guard.SetSkillEnabled(skillName, enabled);
-        var json = JsonSerializer.Serialize(_guard.GetDisabledSkills());
-        await _store.SetSyncValueAsync("disabled_skills", json, _appCts.Token);
+        await _skillRegistry.SetEnabledAsync(skillName, enabled, _appCts.Token);
         SkillsChanged?.Invoke();
     }
 
@@ -475,8 +468,9 @@ public sealed class SecretaryController : IDisposable
 
     public async Task<(bool Ok, string Message)> ImportVoicePackageAsync(string zipPath)
     {
+        var ct = _appCts.Token;
         if (string.IsNullOrWhiteSpace(zipPath) || !File.Exists(zipPath))
-            return (false, AppMessages.Localize("ZipNotFound", "Selected zip file was not found."));
+            return (false, await _localizer.TextAsync("ZipNotFound", "Selected zip file was not found.", Array.Empty<object?>(), ct));
 
         try
         {
@@ -492,7 +486,7 @@ public sealed class SecretaryController : IDisposable
 
             if (ckpt is null || pth is null || wavs.Count == 0)
             {
-                return (false, AppMessages.Localize("ZipMissingCoreFiles", "Zip must contain at least 3 required files: .ckpt (GPT weights), .pth (SoVITS weights), and .wav (reference audio)."));
+                return (false, await _localizer.TextAsync("ZipMissingCoreFiles", "Zip must contain at least 3 required files: .ckpt (GPT weights), .pth (SoVITS weights), and .wav (reference audio).", Array.Empty<object?>(), ct));
             }
 
             var rawName = Path.GetFileNameWithoutExtension(zipPath).Trim();
@@ -547,7 +541,7 @@ public sealed class SecretaryController : IDisposable
             }
 
             if (extractedCkpt is null || extractedPth is null || mainWav is null)
-                return (false, AppMessages.Localize("ZipExtractMissingFiles", "Required files (.ckpt / .pth / .wav) are missing after extraction."));
+                return (false, await _localizer.TextAsync("ZipExtractMissingFiles", "Required files (.ckpt / .pth / .wav) are missing after extraction.", Array.Empty<object?>(), ct));
 
             var promptText = promptTxtPath is not null && File.Exists(promptTxtPath)
                 ? (await File.ReadAllTextAsync(promptTxtPath)).Trim()
@@ -570,11 +564,11 @@ public sealed class SecretaryController : IDisposable
             await _settings.SaveOverridesAsync(s => s.Tts.Profiles[profileKey] = profile);
             var (_, _, curMode) = GetTtsSettings();
             await SaveTtsSettingsAsync(true, profileKey, curMode);
-            return (true, AppMessages.LocalizeFormat("ZipImportSuccess", "Imported and switched to voice '{0}'.", rawName));
+            return (true, await _localizer.TextAsync("ZipImportSuccess", "Imported and switched to voice '{0}'.", new object?[] { rawName }, ct));
         }
         catch (Exception ex)
         {
-            return (false, AppMessages.LocalizeFormat("ZipImportFailed", "Failed to import voice package: {0}", ex.Message));
+            return (false, await _localizer.TextAsync("ZipImportFailed", "Failed to import voice package: {0}", new object?[] { ex.Message }, ct));
         }
     }
 
@@ -607,17 +601,21 @@ public sealed class SecretaryController : IDisposable
 
     public async Task<(string Model, string Endpoint, long InputTokens, long OutputTokens, long CacheTokens)> GetModelAndUsageInfoAsync()
     {
-        var simpleModel = await _store.GetSyncValueAsync("llm_simple_model", _appCts.Token);
-        var complexModel = await _store.GetSyncValueAsync("llm_complex_model", _appCts.Token);
-        var defaultModel = _config.GetValue<string>("Foundry:Model")?.Trim() ?? AppMessages.Localize("NotConfigured", "(Not configured)");
+        var ct = _appCts.Token;
+        var simpleModel = await _store.GetSyncValueAsync("llm_simple_model", ct);
+        var complexModel = await _store.GetSyncValueAsync("llm_complex_model", ct);
+        var notConfigured = await _localizer.TextAsync("NotConfigured", "(Not configured)", Array.Empty<object?>(), ct);
+        var defaultModel = _config.GetValue<string>("Foundry:Model")?.Trim() ?? notConfigured;
 
         var sLabel = string.IsNullOrWhiteSpace(simpleModel) ? defaultModel : simpleModel.Trim();
         var cLabel = string.IsNullOrWhiteSpace(complexModel) ? defaultModel : complexModel.Trim();
-        var model = sLabel == cLabel ? sLabel : AppMessages.LocalizeFormat("ModelTierSummary", "Simple: {0} | Complex: {1}", sLabel, cLabel);
+        var model = sLabel == cLabel
+            ? sLabel
+            : await _localizer.TextAsync("ModelTierSummary", "Simple: {0} | Complex: {1}", new object?[] { sLabel, cLabel }, ct);
 
-        var simpleEp = await _store.GetSyncValueAsync("llm_simple_endpoint", _appCts.Token);
+        var simpleEp = await _store.GetSyncValueAsync("llm_simple_endpoint", ct);
         var endpoint = string.IsNullOrWhiteSpace(simpleEp)
-            ? (_config.GetValue<string>("Foundry:Endpoint")?.Trim() ?? AppMessages.Localize("NotConfigured", "(Not configured)"))
+            ? (_config.GetValue<string>("Foundry:Endpoint")?.Trim() ?? notConfigured)
             : simpleEp.Trim();
 
         long ReadCounter(string? raw) => long.TryParse(raw, out var v) ? v : 0L;
@@ -660,6 +658,8 @@ public sealed class SecretaryController : IDisposable
     {
         var val = string.IsNullOrWhiteSpace(replyLanguage) ? "繁體中文" : replyLanguage.Trim();
         await _settings.SaveOverridesAsync(s => s.Llm.ReplyLanguage = val, _appCts.Token);
+        await _localizer.RefreshLanguageAsync(UiLocalizer.BuildCoreHotEntries(_skillRegistry), _appCts.Token);
+        SkillsChanged?.Invoke();
     }
 
     public async Task<string?> GetPetImagePathAsync()
@@ -688,7 +688,11 @@ public sealed class SecretaryController : IDisposable
     public async Task<bool> DeleteCustomSkillAsync(string name)
     {
         var ok = await _store.DeleteCustomSkillAsync(name, _appCts.Token);
-        if (ok) SkillsChanged?.Invoke();
+        if (ok)
+        {
+            await _skillRegistry.ReloadFromStoreAsync(_appCts.Token);
+            SkillsChanged?.Invoke();
+        }
         return ok;
     }
 
@@ -700,7 +704,7 @@ public sealed class SecretaryController : IDisposable
         var ok = await _gmail.AuthorizeInteractiveAsync(_appCts.Token);
         if (ok)
         {
-            await PushPetMessageAsync(await AppMessages.LocalizeAsync("GmailConnected", "Gmail connected. You can now query your emails."));
+            await PushPetMessageAsync(await _localizer.TextAsync("GmailConnected", "Gmail connected. You can now query your emails.", Array.Empty<object?>(), _appCts.Token));
         }
         return ok;
     }
@@ -709,6 +713,22 @@ public sealed class SecretaryController : IDisposable
     {
         _lastUserActivityUtc = DateTimeOffset.UtcNow;
         var taskId = Guid.NewGuid().ToString("N");
+        var appCt = _appCts.Token;
+        var linked = CancellationTokenSource.CreateLinkedTokenSource(appCt);
+        _runningTasks[taskId] = linked;
+
+        var run = new ActiveAgentRun
+        {
+            TaskId = taskId,
+            Goal = prompt.Length > 40 ? prompt[..40] + "…" : prompt,
+            MainState = "Running",
+            PlannerState = "Pending",
+            WorkerState = "Pending",
+            CurrentStep = _localizer.TextCached("StepMainReceived", "MainAgent received prompt")
+        };
+        _agentRuns[taskId] = run;
+        AgentsChanged?.Invoke();
+
         var userMsg = new ChatMessageRecord
         {
             ConversationId = ConversationId,
@@ -723,7 +743,7 @@ public sealed class SecretaryController : IDisposable
             ConversationId = ConversationId,
             Role = "assistant",
             Content = "",
-            StatusText = await AppMessages.LocalizeAsync("ProcessingStatus", "Processing..."),
+            StatusText = await _localizer.TextAsync("ProcessingStatus", "Processing...", Array.Empty<object?>(), appCt),
             IsStreaming = true,
             TaskId = taskId,
             CreatedAt = DateTimeOffset.UtcNow.AddMilliseconds(5)
@@ -734,43 +754,38 @@ public sealed class SecretaryController : IDisposable
         await _store.UpsertChatMessageAsync(assistantMsg);
         StateChanged?.Invoke();
 
-        var run = new ActiveAgentRun
-        {
-            TaskId = taskId,
-            Goal = prompt.Length > 40 ? prompt[..40] + "…" : prompt,
-            MainState = "Running",
-            PlannerState = "Pending",
-            WorkerState = "Pending",
-            CurrentStep = AppMessages.Localize("StepMainReceived", "MainAgent received prompt")
-        };
-        _agentRuns[taskId] = run;
-        AgentsChanged?.Invoke();
-
         _ = Task.Run(async () =>
         {
-            var appCt = _appCts.Token;
-            var linked = CancellationTokenSource.CreateLinkedTokenSource(appCt);
-            _runningTasks[taskId] = linked;
             string? directTtsText = null;
             string? pendingText = null;
             List<MailSourceRef>? pendingSources = null;
-            var replyReady = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             int replyRevealed = 0;
             Func<CancellationToken, Func<string, List<MailSourceRef>, Task>, Action<string>?, Action<IReadOnlyList<string>>?, Task>? dispatchedWork = null;
 
-            void RevealReply()
+            async Task RevealReplyAsync()
             {
                 if (Interlocked.Exchange(ref replyRevealed, 1) != 0) return;
                 if (!string.IsNullOrWhiteSpace(pendingText))
                     assistantMsg.Content = pendingText;
                 if (pendingSources is not null)
                     assistantMsg.Sources = pendingSources;
-                assistantMsg.IsStreaming = false;
-                assistantMsg.StatusText = null;
-                _ = _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
+
+                if (dispatchedWork is null)
+                {
+                    assistantMsg.IsStreaming = false;
+                    assistantMsg.StatusText = null;
+                }
+                else
+                {
+                    // Keep IsStreaming = true while background Worker/Planner is executing so notifications never hijack the bubble
+                    assistantMsg.IsStreaming = true;
+                    assistantMsg.StatusText = run.CurrentStep;
+                }
+
+                await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
                 StateChanged?.Invoke();
-                if (!string.IsNullOrWhiteSpace(assistantMsg.Content))
-                    ProactiveAlert?.Invoke(AppMessages.Localize("AlertTitleReply", "AI Secretary Reply"), assistantMsg.Content);
+                if (dispatchedWork is null && !string.IsNullOrWhiteSpace(assistantMsg.Content))
+                    ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReply", "AI Secretary Reply"), assistantMsg.Content);
             }
 
             bool turnGateAcquired = false;
@@ -819,7 +834,6 @@ public sealed class SecretaryController : IDisposable
                         pendingText = text;
                         pendingSources = sources;
                         turnLastSummary = text;
-                        replyReady.TrySetResult(true);
                         return Task.CompletedTask;
                     },
                     onStageChanged: (stage, detail) =>
@@ -848,20 +862,16 @@ public sealed class SecretaryController : IDisposable
                                 run.WorkerState = "Running";
                                 break;
                         }
+                        if (assistantMsg.IsStreaming)
+                        {
+                            assistantMsg.StatusText = detail;
+                        }
                         AgentsChanged?.Invoke();
                     },
                     linked.Token,
                     onDirectTtsText: ttsText =>
                     {
                         directTtsText = ttsText;
-                        if (_tts.IsEnabled && _tts.ChatMode != "notify_only" && !string.IsNullOrWhiteSpace(ttsText))
-                        {
-                            _tts.EnqueueJapaneseSpeech(ttsText, onBeforePlay: () =>
-                            {
-                                replyReady.Task.GetAwaiter().GetResult();
-                                RevealReply();
-                            });
-                        }
                     },
                     onChoices: choices =>
                     {
@@ -932,7 +942,7 @@ public sealed class SecretaryController : IDisposable
                     if (run.MainState == "Running") run.MainState = "Done";
                     if (run.PlannerState == "Running") run.PlannerState = "Done";
                     if (run.WorkerState == "Running") run.WorkerState = "Done";
-                    run.CurrentStep = AppMessages.Localize("StepCompleted", "Completed");
+                    run.CurrentStep = _localizer.TextCached("StepCompleted", "Completed");
                     AgentsChanged?.Invoke();
                 }
                 else
@@ -941,19 +951,16 @@ public sealed class SecretaryController : IDisposable
                     AgentsChanged?.Invoke();
                 }
 
-                replyReady.TrySetResult(true);
+                // Reveal reply atomically before releasing the turn gate or removing from _runningTasks
+                await RevealReplyAsync();
 
-                if (string.IsNullOrWhiteSpace(pendingText))
+                if (!string.IsNullOrWhiteSpace(directTtsText) && _tts.IsEnabled && _tts.ChatMode != "notify_only")
                 {
-                    RevealReply();
+                    _tts.EnqueueJapaneseSpeech(directTtsText);
                 }
-                else if (string.IsNullOrWhiteSpace(directTtsText))
+                else if (!string.IsNullOrWhiteSpace(pendingText) && string.IsNullOrWhiteSpace(directTtsText))
                 {
-                    _tts.EnqueueSummarySpeech(AppMessages.Localize("AlertTitleReply", "AI Secretary Reply"), pendingText, RevealReply);
-                }
-                else if (!_tts.IsEnabled || _tts.ChatMode == "notify_only")
-                {
-                    RevealReply();
+                    _tts.EnqueueSummarySpeech(_localizer.TextCached("AlertTitleReply", "AI Secretary Reply"), pendingText, kind: SpeechKind.ChatReply);
                 }
             }
             catch (OperationCanceledException)
@@ -961,14 +968,15 @@ public sealed class SecretaryController : IDisposable
                 if (run.MainState == "Running") run.MainState = "Stopped";
                 if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                 if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-                run.CurrentStep = AppMessages.Localize("StepStopped", "Stopped");
+                run.CurrentStep = _localizer.TextCached("StepStopped", "Stopped");
                 AgentsChanged?.Invoke();
 
                 assistantMsg.IsStreaming = false;
                 assistantMsg.StatusText = null;
+                var stoppedText = await _localizer.TextAsync("TurnStopped", "(Stopped)", Array.Empty<object?>(), CancellationToken.None);
                 assistantMsg.Content = string.IsNullOrWhiteSpace(assistantMsg.Content)
-                    ? AppMessages.Localize("TurnStopped", "(Stopped)")
-                    : assistantMsg.Content + "\n\n" + AppMessages.Localize("TurnStoppedSuffix", "(Stopped)");
+                    ? stoppedText
+                    : assistantMsg.Content + "\n\n" + stoppedText;
                 await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
                 StateChanged?.Invoke();
             }
@@ -978,12 +986,13 @@ public sealed class SecretaryController : IDisposable
                 if (run.MainState == "Running") run.MainState = "Stopped";
                 if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                 if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-                run.CurrentStep = AppMessages.LocalizeFormat("StepError", "Error: {0}", ex.Message);
+                run.CurrentStep = _localizer.TextCached("StepError", "Error: {0}", ex.Message);
                 AgentsChanged?.Invoke();
 
                 assistantMsg.IsStreaming = false;
                 assistantMsg.StatusText = null;
-                assistantMsg.Content = $"{AppMessages.ErrorPrefix}: {ex.Message}";
+                var errPrefix = await _localizer.TextAsync("ErrorPrefix", "Error", Array.Empty<object?>(), CancellationToken.None);
+                assistantMsg.Content = $"❌ {errPrefix}: {ex.Message}";
                 await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
                 StateChanged?.Invoke();
             }
@@ -998,6 +1007,7 @@ public sealed class SecretaryController : IDisposable
                     _runningTasks.TryRemove(taskId, out _);
                     linked.Dispose();
                     AgentsChanged?.Invoke();
+                    StateChanged?.Invoke();
                 }
             }
 
@@ -1033,8 +1043,12 @@ public sealed class SecretaryController : IDisposable
                         {
                             if (run.PlannerState == "Running") run.PlannerState = "Done";
                             if (run.WorkerState == "Running") run.WorkerState = "Done";
-                            run.CurrentStep = AppMessages.Localize("StepCompleted", "Completed");
+                            run.CurrentStep = _localizer.TextCached("StepCompleted", "Completed");
                             AgentsChanged?.Invoke();
+
+                            assistantMsg.IsStreaming = false;
+                            assistantMsg.StatusText = null;
+                            await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
 
                             if (!string.IsNullOrWhiteSpace(bgReportText))
                             {
@@ -1056,33 +1070,22 @@ public sealed class SecretaryController : IDisposable
                                     _latestChoicesLogicalTaskId = activePlannerTaskIdThisTurn;
                                 }
 
-                                var reportReady = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                                int reportRevealed = 0;
-                                void RevealReport()
-                                {
-                                    if (Interlocked.Exchange(ref reportRevealed, 1) != 0) return;
-                                    _ = _store.UpsertChatMessageAsync(reportMsg, CancellationToken.None);
-                                    StateChanged?.Invoke();
-                                    ProactiveAlert?.Invoke(AppMessages.Localize("AlertTitleReport", "AI Secretary Report"), bgReportText);
-                                }
+                                await _store.UpsertChatMessageAsync(reportMsg, CancellationToken.None);
+                                StateChanged?.Invoke();
+                                ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), bgReportText);
 
                                 if (!string.IsNullOrWhiteSpace(bgDirectTtsText) && _tts.IsEnabled && _tts.ChatMode != "notify_only")
                                 {
-                                    _tts.EnqueueJapaneseSpeech(bgDirectTtsText, onBeforePlay: () =>
-                                    {
-                                        reportReady.Task.GetAwaiter().GetResult();
-                                        RevealReport();
-                                    });
-                                    reportReady.TrySetResult(true);
+                                    _tts.EnqueueJapaneseSpeech(bgDirectTtsText);
                                 }
-                                else
+                                else if (string.IsNullOrWhiteSpace(bgDirectTtsText))
                                 {
-                                    reportReady.TrySetResult(true);
-                                    if (string.IsNullOrWhiteSpace(bgDirectTtsText))
-                                        _tts.EnqueueSummarySpeech(AppMessages.Localize("AlertTitleReport", "AI Secretary Report"), bgReportText, RevealReport);
-                                    else
-                                        RevealReport();
+                                    _tts.EnqueueSummarySpeech(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), bgReportText, kind: SpeechKind.Report);
                                 }
+                            }
+                            else
+                            {
+                                StateChanged?.Invoke();
                             }
                         }
                         finally
@@ -1094,8 +1097,17 @@ public sealed class SecretaryController : IDisposable
                     {
                         if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                         if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-                        run.CurrentStep = AppMessages.Localize("StepStopped", "Stopped");
+                        run.CurrentStep = _localizer.TextCached("StepStopped", "Stopped");
                         AgentsChanged?.Invoke();
+
+                        assistantMsg.IsStreaming = false;
+                        assistantMsg.StatusText = null;
+                        var stoppedText = await _localizer.TextAsync("TurnStopped", "(Stopped)", Array.Empty<object?>(), CancellationToken.None);
+                        assistantMsg.Content = string.IsNullOrWhiteSpace(assistantMsg.Content)
+                            ? stoppedText
+                            : assistantMsg.Content + "\n\n" + stoppedText;
+                        await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
+                        StateChanged?.Invoke();
                     }
                     catch (Exception ex)
                     {
@@ -1107,14 +1119,18 @@ public sealed class SecretaryController : IDisposable
                             acquired = true;
                             if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                             if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-                            run.CurrentStep = AppMessages.LocalizeFormat("StepError", "Error: {0}", ex.Message);
+                            run.CurrentStep = _localizer.TextCached("StepError", "Error: {0}", ex.Message);
                             AgentsChanged?.Invoke();
+
+                            assistantMsg.IsStreaming = false;
+                            assistantMsg.StatusText = null;
+                            await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
 
                             var errMsg = new ChatMessageRecord
                             {
                                 ConversationId = ConversationId,
                                 Role = "assistant",
-                                Content = await AppMessages.LocalizeFormatAsync("BgTaskFailed", "Background task failed: {0}", ex.Message),
+                                Content = $"❌ {await _localizer.TextAsync("BgTaskFailed", "Background task failed: {0}", new object?[] { ex.Message }, CancellationToken.None)}",
                                 IsStreaming = false,
                                 TaskId = taskId,
                                 CreatedAt = DateTimeOffset.UtcNow
@@ -1130,10 +1146,17 @@ public sealed class SecretaryController : IDisposable
                     }
                     finally
                     {
+                        if (assistantMsg.IsStreaming)
+                        {
+                            assistantMsg.IsStreaming = false;
+                            assistantMsg.StatusText = null;
+                            _ = _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
+                        }
                         ReleasePlannerRunningIfUnreported();
                         _runningTasks.TryRemove(taskId, out _);
                         linked.Dispose();
                         AgentsChanged?.Invoke();
+                        StateChanged?.Invoke();
                     }
                 });
             }
@@ -1188,12 +1211,14 @@ public sealed class SecretaryController : IDisposable
             RemovePinnedConfirmation(id);
         }
         _activePlannerTasks.Clear();
+        var completedLabel = _localizer.TextCached("StepCompleted", "Completed");
+        var killedLabel = _localizer.TextCached("StepKilledByUser", "Cleared by /kill magent");
         foreach (var run in _agentRuns.Values)
         {
             if (run.MainState == "Running") run.MainState = "Stopped";
             if (run.PlannerState == "Running") run.PlannerState = "Stopped";
             if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-            if (run.CurrentStep != AppMessages.Localize("StepCompleted", "Completed")) run.CurrentStep = AppMessages.Localize("StepKilledByUser", "Cleared by /kill magent");
+            if (run.CurrentStep != completedLabel) run.CurrentStep = killedLabel;
         }
         AgentsChanged?.Invoke();
 
@@ -1203,7 +1228,7 @@ public sealed class SecretaryController : IDisposable
             m.IsStreaming = false;
             m.StatusText = null;
             if (string.IsNullOrWhiteSpace(m.Content))
-                m.Content = AppMessages.Localize("KillCommandDone", "(Executed `/kill magent`; cleared stuck agent state)");
+                m.Content = await _localizer.TextAsync("KillCommandDone", "(Executed `/kill magent`; cleared stuck agent state)", Array.Empty<object?>(), CancellationToken.None);
             await _store.UpsertChatMessageAsync(m, CancellationToken.None);
         }
         StateChanged?.Invoke();
@@ -1219,7 +1244,8 @@ public sealed class SecretaryController : IDisposable
     {
         await _store.UpdateNotificationStatusAsync(n.NotificationId, "Handled", null);
         StateChanged?.Invoke();
-        await SendUserPromptAsync(AppMessages.LocalizeFormat("DraftReplyPrompt", "Help me draft a reply to '{0}'", n.Title), targetMailId: n.MailId);
+        var promptText = await _localizer.TextAsync("DraftReplyPrompt", "Help me draft a reply to '{0}'", new object?[] { n.Title }, _appCts.Token);
+        await SendUserPromptAsync(promptText, targetMailId: n.MailId);
     }
 
     public IReadOnlyList<PinnedReminderItem> GetPinnedReminders()
@@ -1346,13 +1372,15 @@ public sealed class SecretaryController : IDisposable
         }
 
         if (targets.Count == 0)
-            return string.IsNullOrWhiteSpace(kw) ? AppMessages.Localize("NoPinnedReminders", "No pinned reminders right now.") : AppMessages.LocalizeFormat("PinnedNotFound", "No pinned reminder matching '{0}'.", kw);
+            return string.IsNullOrWhiteSpace(kw)
+                ? await _localizer.TextAsync("NoPinnedReminders", "No pinned reminders right now.", Array.Empty<object?>(), _appCts.Token)
+                : await _localizer.TextAsync("PinnedNotFound", "No pinned reminder matching '{0}'.", new object?[] { kw }, _appCts.Token);
 
         foreach (var t in targets)
             await DismissPinnedReminderAsync(t.Id);
 
         var names = string.Join("、", targets.Select(t => $"「{t.Title}」"));
-        return AppMessages.LocalizeFormat("PinnedDismissed", "Dismissed pinned reminder(s): {0}.", names);
+        return await _localizer.TextAsync("PinnedDismissed", "Dismissed pinned reminder(s): {0}.", new object?[] { names }, _appCts.Token);
     }
 
     private async Task SavePinnedRemindersAsync()
@@ -1468,7 +1496,7 @@ public sealed class SecretaryController : IDisposable
         };
         await _store.UpsertChatMessageAsync(msg, ct);
         StateChanged?.Invoke();
-        RaiseProactiveAlert(AppMessages.Localize("AlertTitleDefault", "AI Secretary"), content);
+        RaiseProactiveAlert(_localizer.TextCached("AlertTitleDefault", "AI Secretary"), content);
     }
 
     private void RaiseProactiveAlert(string title, string content)
@@ -1663,12 +1691,12 @@ public sealed class SecretaryController : IDisposable
         if (dueItems.Count == 1)
         {
             var item = dueItems[0];
-            await PushPetMessageAsync(await AppMessages.LocalizeFormatAsync("ReRemindSingle", "🔔 Unacknowledged reminder '{0}': {1}", item.Title, item.Summary), ct);
+            await PushPetMessageAsync(await _localizer.TextAsync("ReRemindSingle", "🔔 Unacknowledged reminder '{0}': {1}", new object?[] { item.Title, item.Summary }, ct), ct);
         }
         else
         {
             var lines = dueItems.Select(i => $"- **{i.Title}**：{i.Summary}");
-            await PushPetMessageAsync(await AppMessages.LocalizeFormatAsync("ReRemindMulti", "🔔 Unacknowledged reminders ({0}):\n{1}", dueItems.Count, string.Join("\n", lines)), ct);
+            await PushPetMessageAsync(await _localizer.TextAsync("ReRemindMulti", "🔔 Unacknowledged reminders ({0}):\n{1}", new object?[] { dueItems.Count, string.Join("\n", lines) }, ct), ct);
         }
     }
 
@@ -1725,8 +1753,9 @@ public sealed class SecretaryController : IDisposable
         lock (_pinnedLock)
             pinnedTitles = _pinnedReminders.Select(p => p.Title).ToList();
 
-        var (reply, ttsText) = await _mainAgent.GenerateProactiveStyleLineAsync(ConversationId, pinnedTitles, ct);
-        if (string.IsNullOrWhiteSpace(reply))
+        var activeWindow = await BuildProactiveWindowLabelAsync(ct);
+        var (reply, ttsText) = await _mainAgent.GenerateProactiveStyleLineAsync(ConversationId, pinnedTitles, ct, activeWindow);
+        if (string.IsNullOrWhiteSpace(reply) || HasRunningTasks || IsDndActive())
             return;
 
         var msg = new ChatMessageRecord
@@ -1737,15 +1766,49 @@ public sealed class SecretaryController : IDisposable
             CreatedAt = DateTimeOffset.UtcNow
         };
         await _store.UpsertChatMessageAsync(msg, ct);
+        var alertTitle = _localizer.TextCached("AlertTitleDefault", "AI Secretary");
         void RevealProactive()
         {
             StateChanged?.Invoke();
-            ProactiveAlert?.Invoke(AppMessages.Localize("AlertTitleDefault", "AI Secretary"), reply);
+            ProactiveAlert?.Invoke(alertTitle, reply);
         }
         if (!string.IsNullOrWhiteSpace(ttsText))
             _tts.EnqueueJapaneseSpeech(ttsText, RevealProactive);
         else
-            _tts.EnqueueSummarySpeech(AppMessages.Localize("AlertTitleDefault", "AI Secretary"), reply, RevealProactive);
+            _tts.EnqueueSummarySpeech(alertTitle, reply, RevealProactive);
+    }
+
+    private static readonly HashSet<string> BrowserProcessNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "msedge", "chrome", "firefox", "brave", "opera", "vivaldi", "arc"
+    };
+
+    private async Task<string?> BuildProactiveWindowLabelAsync(CancellationToken ct)
+    {
+        var lastWin = _activity.GetLastExternalTarget();
+        if (lastWin is null)
+            return null;
+
+        var uiaTitle = string.IsNullOrWhiteSpace(lastWin.Title) ? lastWin.ProcessName : lastWin.Title.Trim();
+        if (!BrowserProcessNames.Contains(lastWin.ProcessName))
+            return $"{lastWin.ProcessName}: {uiaTitle}";
+
+        // If foreground is a browser, try asking the Extension for the active tab title (returns null/incognito if private or not installed).
+        try
+        {
+            var ext = await _browserBridge.RequestActiveTabTitleAsync(TimeSpan.FromMilliseconds(750), ct);
+            if (ext is not null)
+            {
+                if (ext.Incognito)
+                    return $"{lastWin.ProcessName} (private browsing)";
+                if (!string.IsNullOrWhiteSpace(ext.Title))
+                    return $"{lastWin.ProcessName}: {ext.Title.Trim()}";
+            }
+        }
+        catch { }
+
+        // Fallback when extension is not installed or timed out: use Windows UIA foreground window title.
+        return $"{lastWin.ProcessName}: {uiaTitle}";
     }
 
     private async Task RunScheduledSkillSilentlyAsync(ReminderRecord r, CancellationToken ct)
@@ -1766,10 +1829,7 @@ public sealed class SecretaryController : IDisposable
                 }
             }
 
-            var isMailPoller = r.SkillName!.Equals("manage_mail", StringComparison.OrdinalIgnoreCase)
-                || r.SkillName!.Equals("read_inbox", StringComparison.OrdinalIgnoreCase)
-                || r.SkillName!.Equals("read_gmail", StringComparison.OrdinalIgnoreCase)
-                || r.SkillName!.Equals("sync_mail", StringComparison.OrdinalIgnoreCase);
+            var isMailPoller = _skillRegistry.Resolve(r.SkillName!)?.IsSilentPoller == true;
 
             var prompt = string.IsNullOrWhiteSpace(r.Message)
                 ? $"Scheduled background run: {r.Title}\n(Check <user_preferences> to decide whether to notify the user; if not needed, reply ONLY with NO_NOTIFY)"
@@ -1837,12 +1897,15 @@ public sealed class SecretaryController : IDisposable
         var extRes = await _browserBridge.RequestFillOtpAsync(code, TimeSpan.FromMilliseconds(1500), ct);
         if (extRes is { Filled: true })
         {
-            var title = string.IsNullOrWhiteSpace(extRes.Title) ? AppMessages.Localize("BrowserTabDefault", "Browser tab") : extRes.Title.Trim();
+            var title = string.IsNullOrWhiteSpace(extRes.Title)
+                ? await _localizer.TextAsync("BrowserTabDefault", "Browser tab", Array.Empty<object?>(), ct)
+                : extRes.Title.Trim();
             if (title.Length > 24) title = title[..24] + "…";
-            return (true, AppMessages.LocalizeFormat("OtpExtensionFilled", "Filled verification code {0} into '{1}' via browser extension ({2}, not auto-submitted).", code, title, extRes.Mode ?? "dom"));
+            var msg = await _localizer.TextAsync("OtpExtensionFilled", "Filled verification code {0} into '{1}' via browser extension ({2}, not auto-submitted).", new object?[] { code, title, extRes.Mode ?? "dom" }, ct);
+            return (true, msg);
         }
 
-        return _activity.TryFillOtpInExternalWindow(code, serviceHint);
+        return await _activity.TryFillOtpInExternalWindowAsync(code, serviceHint, ct);
     }
 
     public Task<BranchTelemetryStats> GetBranchTelemetryAsync(CancellationToken ct = default)
@@ -1877,7 +1940,7 @@ public sealed class SecretaryController : IDisposable
 
     public async Task<string> SuggestFormFillAsync(BrowserFormContext form, CancellationToken ct = default)
     {
-        var prompt = SystemAutomationPrompts.BuildBrowserFormSuggestPrompt(form);
+        var prompt = SystemAutomationPrompts.BuildBrowserFormSuggestPrompt(form, GetReplyLanguage());
         await SendUserPromptAsync(prompt);
         var msgs = await _store.GetChatMessagesAsync(ConversationId, 5, ct);
         return msgs.LastOrDefault(m => m.Role == "assistant")?.Content ?? "";

@@ -7,13 +7,11 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
-using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Services;
 
 /// <summary>
-/// Gmail REST API v1 client exposed as Agent Skills (read_gmail, get_gmail_detail).
+/// Gmail REST API v1 client exposed as Agent Skills.
 /// Supports Google OAuth2 Desktop credentials (gmail_credentials.json or Gmail:ClientId/ClientSecret)
 /// and persists refresh tokens in gmail_token.json.
 /// </summary>
@@ -23,16 +21,18 @@ public sealed class GmailSkillService
     private readonly IHttpClientFactory _httpFactory;
     private readonly IConfiguration _config;
     private readonly GuardService _guard;
+    private readonly UiLocalizer _localizer;
     private readonly ILogger<GmailSkillService> _logger;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
     private GmailTokenState? _cachedToken;
 
-    public GmailSkillService(IHttpClientFactory httpFactory, IConfiguration config, GuardService guard, ILogger<GmailSkillService> logger)
+    public GmailSkillService(IHttpClientFactory httpFactory, IConfiguration config, GuardService guard, UiLocalizer localizer, ILogger<GmailSkillService> logger)
     {
         _httpFactory = httpFactory;
         _config = config;
         _guard = guard;
+        _localizer = localizer;
         _logger = logger;
     }
 
@@ -95,7 +95,7 @@ public sealed class GmailSkillService
         if (!TryLoadClientCredentials(out var clientId, out var clientSecret))
         {
             throw new InvalidOperationException(
-                AppMessages.Localize("GmailMissingCreds", "Gmail OAuth credentials are not configured. Set Gmail__ClientId / Gmail__ClientSecret in .env or place gmail_credentials.json in the app data folder."));
+                await _localizer.TextAsync("GmailMissingCreds", "Gmail OAuth credentials are not configured. Set Gmail__ClientId / Gmail__ClientSecret in .env or place gmail_credentials.json in the app data folder.", Array.Empty<object?>(), ct));
         }
 
         var port = GetAvailablePort();
@@ -129,8 +129,8 @@ public sealed class GmailSkillService
         var error = ctx.Request.QueryString["error"];
 
         var html = string.IsNullOrWhiteSpace(code) || !string.IsNullOrWhiteSpace(error)
-            ? AppMessages.Localize("GmailAuthFailedHtml", "<html><body style='font-family:sans-serif;padding:24px'><h2>Gmail authorization failed or canceled</h2><p>Please close this tab and try again.</p></body></html>")
-            : AppMessages.Localize("GmailAuthSuccessHtml", "<html><body style='font-family:sans-serif;padding:24px'><h2>Gmail authorized!</h2><p>You can close this tab and return to the desktop assistant.</p></body></html>");
+            ? await _localizer.TextAsync("GmailAuthFailedHtml", "<html><body style='font-family:sans-serif;padding:24px'><h2>Gmail authorization failed or canceled</h2><p>Please close this tab and try again.</p></body></html>", Array.Empty<object?>(), ct)
+            : await _localizer.TextAsync("GmailAuthSuccessHtml", "<html><body style='font-family:sans-serif;padding:24px'><h2>Gmail authorized!</h2><p>You can close this tab and return to the desktop assistant.</p></body></html>", Array.Empty<object?>(), ct);
 
         var buffer = Encoding.UTF8.GetBytes(html);
         ctx.Response.ContentType = "text/html; charset=utf-8";
@@ -348,13 +348,13 @@ public sealed class GmailSkillService
             if (string.IsNullOrWhiteSpace(refreshToken))
             {
                 throw new InvalidOperationException(
-                    AppMessages.Localize("GmailNotAuthorized", "Gmail is not authorized. Please connect in Settings -> Skills -> manage_mail, or set Gmail__RefreshToken / Gmail__AccessToken in .env."));
+                    await _localizer.TextAsync("GmailNotAuthorized", "Gmail is not authorized. Please connect in Settings -> Skills -> Mail, or set Gmail__RefreshToken / Gmail__AccessToken in .env.", Array.Empty<object?>(), ct));
             }
 
             if (!TryLoadClientCredentials(out var clientId, out var clientSecret))
             {
                 throw new InvalidOperationException(
-                    AppMessages.Localize("GmailMissingClientForRefresh", "Missing Gmail ClientId / ClientSecret; cannot refresh Access Token."));
+                    await _localizer.TextAsync("GmailMissingClientForRefresh", "Missing Gmail ClientId / ClientSecret; cannot refresh Access Token.", Array.Empty<object?>(), ct));
             }
 
             var http = _httpFactory.CreateClient();

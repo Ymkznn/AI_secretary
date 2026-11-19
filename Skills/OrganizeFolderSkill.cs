@@ -2,7 +2,7 @@ using System.Text;
 using System.Text.Json;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
+using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -51,16 +51,19 @@ public sealed class OrganizeFolderSkill : IBasicSkill
     private readonly GuardService _guard;
     private readonly SandboxService _sandbox;
     private readonly SkillRuntime _skills;
+    private readonly UiLocalizer _localizer;
 
-    public OrganizeFolderSkill(GuardService guard, SandboxService sandbox, SkillRuntime skills)
+    public OrganizeFolderSkill(GuardService guard, SandboxService sandbox, SkillRuntime skills, UiLocalizer localizer)
     {
         _guard = guard;
         _sandbox = sandbox;
         _skills = skills;
+        _localizer = localizer;
     }
 
     public string Name => "organize_folder";
     public string DisplayDescription => "Scan and organize local folders safely";
+    public string StatusText => "Processing folder...";
     public string MainAgentSpec => """
             organize_folder
                - Purpose: Two-step safe folder organizer (scan first, then execute moves/quarantine/CSV log).
@@ -71,12 +74,13 @@ public sealed class OrganizeFolderSkill : IBasicSkill
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
+        var skillName = ctx.EffectiveName(Name);
         var action = ctx.GetArg("action") ?? "scan";
         var targetFolder = ctx.GetArg("target_folder") ?? ctx.GetArg("path");
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Processing folder..."));
-        var res = await OrganizeFolderAsync(action, targetFolder, ctx.Args, ctx.ConfirmAsync, ctx.Ct);
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
+        var res = await OrganizeFolderAsync(action, targetFolder, ctx.Args, ctx.ConfirmAsync, ctx.Ct, skillName);
         ctx.Observations.Add(res);
-        ctx.CompletedSteps.Add($"organize_folder:{action}");
+        ctx.CompletedSteps.Add($"{skillName}:{action}");
     }
 
     public async Task<string> OrganizeFolderAsync(
@@ -84,9 +88,10 @@ public sealed class OrganizeFolderSkill : IBasicSkill
         string? targetFolder,
         JsonElement args,
         Func<string, string, Task<bool>> confirmAsync,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        string? skillName = null)
     {
-        var check = _guard.CheckSkillExecution("organize_folder");
+        var check = _guard.CheckSkillExecution(string.IsNullOrWhiteSpace(skillName) ? Name : skillName);
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
 
         if (string.IsNullOrWhiteSpace(targetFolder))
@@ -140,10 +145,16 @@ public sealed class OrganizeFolderSkill : IBasicSkill
 
         if (isDriveRoot || isUserProfileRoot)
         {
-            var label = isDriveRoot ? AppMessages.RootLabelDrive : AppMessages.RootLabelUserProfile;
-            var approvedRoot = await confirmAsync(
-                AppMessages.OrganizeRootTitle(label),
-                AppMessages.OrganizeRootMessage(label, rootFull));
+            var label = isDriveRoot
+                ? await _localizer.TextAsync("RootLabelDrive", "Drive Root", Array.Empty<object?>(), ct)
+                : await _localizer.TextAsync("RootLabelUserProfile", "User Profile Root", Array.Empty<object?>(), ct);
+            var rootTitle = await _localizer.TextAsync("OrganizeRootTitle", "Confirm Organizing {0}", new object?[] { label }, ct);
+            var rootMsg = await _localizer.TextAsync(
+                "OrganizeRootMessage",
+                "About to organize moves in {0} {1}.\nSystem/default folders (Windows, Program Files, Users, AppData, Desktop, Documents, Downloads, etc.) and hidden/system files are skipped automatically, and no deletion will run.\n\nContinue?",
+                new object?[] { label, rootFull },
+                ct);
+            var approvedRoot = await confirmAsync(rootTitle, rootMsg);
             if (!approvedRoot)
                 return $"User denied organizing root folder: {rootFull}";
         }
@@ -163,9 +174,11 @@ public sealed class OrganizeFolderSkill : IBasicSkill
             if (declinedExternalRoots.Contains(parent))
                 return false;
 
+            var crossTitle = await _localizer.TextAsync("CrossFolderTitle", "Cross-Folder Path Permission", Array.Empty<object?>(), ct);
+            var crossMsg = await _localizer.TextAsync("CrossFolderMessage", "Organize operation's '{0}' path escapes target folder and trusted list (target: {1}). Allow access?", new object?[] { opLabel, rootFull }, ct);
             var decision = await _skills.RequestPathPermissionAsync(
-                AppMessages.CrossFolderTitle,
-                AppMessages.CrossFolderMessage(opLabel, rootFull),
+                crossTitle,
+                crossMsg,
                 path,
                 confirmAsync);
             if (decision == PathPermissionDecision.TrustPermanently)
@@ -195,7 +208,9 @@ public sealed class OrganizeFolderSkill : IBasicSkill
                 return;
             }
 
-            if (!await EnsurePathTrustedAsync(src, AppMessages.OpLabelSource) || !await EnsurePathTrustedAsync(dst, AppMessages.OpLabelDest))
+            var srcLabel = await _localizer.TextAsync("OpLabelSource", "Source", Array.Empty<object?>(), ct);
+            var dstLabel = await _localizer.TextAsync("OpLabelDest", "Destination", Array.Empty<object?>(), ct);
+            if (!await EnsurePathTrustedAsync(src, srcLabel) || !await EnsurePathTrustedAsync(dst, dstLabel))
             {
                 skippedCount++;
                 logRows.Add((nowStr, CsvStage1Move, CsvActionMove, src, dst, CsvStatusSkippedUnauthorized, reason));
@@ -253,7 +268,9 @@ public sealed class OrganizeFolderSkill : IBasicSkill
                         continue;
 
                     var dstDir = ResolveInsideOrFull(rootFull, dstDirTarget);
-                    if (!await EnsurePathTrustedAsync(srcDir, AppMessages.OpLabelSourceDir) || !await EnsurePathTrustedAsync(dstDir, AppMessages.OpLabelDestDir))
+                    var srcDirLabel = await _localizer.TextAsync("OpLabelSourceDir", "Source Folder", Array.Empty<object?>(), ct);
+                    var dstDirLabel = await _localizer.TextAsync("OpLabelDestDir", "Destination Folder", Array.Empty<object?>(), ct);
+                    if (!await EnsurePathTrustedAsync(srcDir, srcDirLabel) || !await EnsurePathTrustedAsync(dstDir, dstDirLabel))
                     {
                         skippedCount++;
                         logRows.Add((DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss"), CsvStage1Move, CsvActionBatchMove, $"{srcDir}\\{pattern}", dstDir, CsvStatusSkippedUnauthorized, reason));
@@ -321,7 +338,8 @@ public sealed class OrganizeFolderSkill : IBasicSkill
                     continue;
                 }
 
-                if (!await EnsurePathTrustedAsync(src, AppMessages.OpLabelDeleteSource))
+                var delLabel = await _localizer.TextAsync("OpLabelDeleteSource", "Delete Candidate", Array.Empty<object?>(), ct);
+                if (!await EnsurePathTrustedAsync(src, delLabel))
                 {
                     skippedCount++;
                     logRows.Add((nowStr, CsvStage1Quarantine, CsvActionQuarantine, src, quarantineDir, CsvStatusSkippedUnauthorized, reason));
@@ -358,10 +376,16 @@ public sealed class OrganizeFolderSkill : IBasicSkill
         if (quarantineDir is not null && Directory.Exists(quarantineDir) && IsUnderFolder(quarantineDir, rootFull))
         {
             var previewLines = quarantinedFiles.Take(20).Select(p => $"- {Path.GetRelativePath(quarantineDir, p)}");
-            var moreNote = quarantinedFiles.Count > 20 ? AppMessages.Stage2MoreNote(quarantinedFiles.Count - 20) : "";
-            var approvedDelete = await confirmAsync(
-                AppMessages.Stage2DeleteTitle,
-                AppMessages.Stage2DeleteMessage(quarantineDir, quarantinedFiles.Count, string.Join("\n", previewLines), moreNote));
+            var moreNote = quarantinedFiles.Count > 20
+                ? await _localizer.TextAsync("Stage2MoreNote", "\n...and {0} more item(s)", new object?[] { quarantinedFiles.Count - 20 }, ct)
+                : "";
+            var stage2Title = await _localizer.TextAsync("Stage2DeleteTitle", "Stage 2: Confirm Deletion", Array.Empty<object?>(), ct);
+            var stage2Body = await _localizer.TextAsync(
+                "Stage2DeleteMessage",
+                "Stage 1 moves finished.\nQuarantine folder (ONLY this folder will be deleted):\n{0}\n\nTotal {1} item(s):\n{2}{3}\n\nAllow deleting ONLY this quarantine folder?\n(Declining keeps it for manual review)",
+                new object?[] { quarantineDir, quarantinedFiles.Count, string.Join("\n", previewLines), moreNote },
+                ct);
+            var approvedDelete = await confirmAsync(stage2Title, stage2Body);
 
             var nowStr = DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss");
             if (approvedDelete)

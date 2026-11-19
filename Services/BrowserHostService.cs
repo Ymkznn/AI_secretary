@@ -3,7 +3,6 @@ using System.Net.Http;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Services;
 
@@ -17,13 +16,15 @@ public sealed class BrowserHostService : IDisposable
     public int CdpDebugPort { get; }
 
     private readonly IHttpClientFactory _httpFactory;
+    private readonly UiLocalizer _localizer;
     private readonly ILogger<BrowserHostService> _logger;
     private readonly SemaphoreSlim _launchLock = new(1, 1);
     private Process? _process;
 
-    public BrowserHostService(IHttpClientFactory httpFactory, IConfiguration config, ILogger<BrowserHostService> logger)
+    public BrowserHostService(IHttpClientFactory httpFactory, UiLocalizer localizer, IConfiguration config, ILogger<BrowserHostService> logger)
     {
         _httpFactory = httpFactory;
+        _localizer = localizer;
         _logger = logger;
         CdpDebugPort = Math.Clamp(config.GetValue<int>("Browser:CdpPort", 19877), 1024, 65535);
     }
@@ -54,7 +55,7 @@ public sealed class BrowserHostService : IDisposable
         {
             var exe = FindSystemBrowserExecutable();
             if (exe is null)
-                return (false, AppMessages.Localize("BrowserExeMissing", "Microsoft Edge or Google Chrome was not found on this system."));
+                return (false, await _localizer.TextAsync("BrowserExeMissing", "Microsoft Edge or Google Chrome was not found on this system.", Array.Empty<object?>(), ct));
 
             Directory.CreateDirectory(AppPaths.BrowserProfileDir);
 
@@ -63,7 +64,7 @@ public sealed class BrowserHostService : IDisposable
             {
                 if (!string.IsNullOrWhiteSpace(startUrl))
                     await OpenTabViaCdpAsync(startUrl, ct);
-                return (true, AppMessages.Localize("BrowserAlreadyRunning", "Dedicated browser is already running and a new tab was opened. Background watchers will reuse this login session."));
+                return (true, await _localizer.TextAsync("BrowserAlreadyRunning", "Dedicated browser is already running and a new tab was opened. Background watchers will reuse this login session.", Array.Empty<object?>(), ct));
             }
 
             if (_process is { HasExited: false })
@@ -82,9 +83,9 @@ public sealed class BrowserHostService : IDisposable
             });
 
             if (_process is null)
-                return (false, AppMessages.Localize("BrowserStartFailed", "Failed to launch dedicated browser."));
+                return (false, await _localizer.TextAsync("BrowserStartFailed", "Failed to launch dedicated browser.", Array.Empty<object?>(), ct));
 
-            return (true, AppMessages.LocalizeFormat("BrowserStarted", "Opened isolated dedicated browser (profile: {0}). Please sign in manually inside that window; session cookies stay isolated.", AppPaths.BrowserProfileDir));
+            return (true, await _localizer.TextAsync("BrowserStarted", "Opened isolated dedicated browser (profile: {0}). Please sign in manually inside that window; session cookies stay isolated.", new object?[] { AppPaths.BrowserProfileDir }, ct));
         }
         finally
         {

@@ -131,12 +131,22 @@ public sealed class SqliteStore
                 SkillArgsJson TEXT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS CustomSkills (
+            CREATE TABLE IF NOT EXISTS Skills (
                 Name TEXT PRIMARY KEY,
-                Description TEXT NOT NULL,
-                Command TEXT NOT NULL,
-                CreatedAt TEXT NOT NULL
+                Kind TEXT NOT NULL DEFAULT 'basic',
+                HandlerType TEXT NULL,
+                DisplayDescription TEXT NOT NULL,
+                MainAgentSpec TEXT NOT NULL DEFAULT '',
+                PlannerSpec TEXT NOT NULL DEFAULT '',
+                Command TEXT NULL,
+                AliasesJson TEXT NOT NULL DEFAULT '[]',
+                Capability TEXT NULL,
+                IsSilentPoller INTEGER NOT NULL DEFAULT 0,
+                IsEnabled INTEGER NOT NULL DEFAULT 1,
+                CreatedAt TEXT NOT NULL,
+                UpdatedAt TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS IX_Skills_Kind ON Skills(Kind, Name);
 
             CREATE TABLE IF NOT EXISTS GuardAuditLogs (
                 Id TEXT PRIMARY KEY,
@@ -785,49 +795,305 @@ public sealed class SqliteStore
         return await cmd.ExecuteNonQueryAsync(ct) > 0;
     }
 
-    public async Task<List<CustomSkillRecord>> GetCustomSkillsAsync(CancellationToken ct = default)
+    public async Task<List<SkillRecord>> GetSkillsAsync(string? kind = null, CancellationToken ct = default)
     {
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT Name, Description, Command, CreatedAt FROM CustomSkills ORDER BY CreatedAt ASC;";
-        var list = new List<CustomSkillRecord>();
-        await using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+        if (string.IsNullOrWhiteSpace(kind))
         {
-            list.Add(new CustomSkillRecord(
-                reader.GetString(0),
-                reader.GetString(1),
-                reader.GetString(2),
-                DateTimeOffset.Parse(reader.GetString(3))));
+            cmd.CommandText = """
+                SELECT Name, Kind, HandlerType, DisplayDescription, MainAgentSpec, PlannerSpec, Command, AliasesJson, Capability, IsSilentPoller, IsEnabled, CreatedAt, UpdatedAt
+                FROM Skills
+                ORDER BY Kind ASC, Name ASC;
+                """;
+        }
+        else
+        {
+            cmd.CommandText = """
+                SELECT Name, Kind, HandlerType, DisplayDescription, MainAgentSpec, PlannerSpec, Command, AliasesJson, Capability, IsSilentPoller, IsEnabled, CreatedAt, UpdatedAt
+                FROM Skills
+                WHERE Kind = $kind
+                ORDER BY CreatedAt ASC, Name ASC;
+                """;
+            cmd.Parameters.AddWithValue("$kind", kind.Trim());
+        }
+
+        var list = new List<SkillRecord>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            var aliasesJson = r.IsDBNull(7) ? "[]" : r.GetString(7);
+            List<string> aliases;
+            try { aliases = JsonSerializer.Deserialize<List<string>>(aliasesJson) ?? new List<string>(); }
+            catch { aliases = new List<string>(); }
+
+            list.Add(new SkillRecord(
+                Name: r.GetString(0),
+                Kind: r.GetString(1),
+                HandlerType: r.IsDBNull(2) ? null : r.GetString(2),
+                DisplayDescription: r.GetString(3),
+                MainAgentSpec: r.GetString(4),
+                PlannerSpec: r.GetString(5),
+                Command: r.IsDBNull(6) ? null : r.GetString(6),
+                Aliases: aliases,
+                Capability: r.IsDBNull(8) ? null : r.GetString(8),
+                IsSilentPoller: r.GetInt32(9) != 0,
+                IsEnabled: r.GetInt32(10) != 0,
+                CreatedAt: DateTimeOffset.Parse(r.GetString(11)),
+                UpdatedAt: DateTimeOffset.Parse(r.GetString(12))));
         }
         return list;
     }
 
-    public async Task UpsertCustomSkillAsync(CustomSkillRecord skill, CancellationToken ct = default)
+    public async Task UpsertSkillAsync(SkillRecord skill, CancellationToken ct = default)
     {
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO CustomSkills (Name, Description, Command, CreatedAt)
-            VALUES ($name, $desc, $cmd, $created)
+            INSERT INTO Skills (Name, Kind, HandlerType, DisplayDescription, MainAgentSpec, PlannerSpec, Command, AliasesJson, Capability, IsSilentPoller, IsEnabled, CreatedAt, UpdatedAt)
+            VALUES ($name, $kind, $handler, $desc, $mspec, $pspec, $cmd, $aliases, $cap, $poller, $enabled, $created, $updated)
             ON CONFLICT(Name) DO UPDATE SET
-                Description = excluded.Description,
-                Command = excluded.Command;
+                Kind = excluded.Kind,
+                HandlerType = excluded.HandlerType,
+                DisplayDescription = excluded.DisplayDescription,
+                MainAgentSpec = excluded.MainAgentSpec,
+                PlannerSpec = excluded.PlannerSpec,
+                Command = excluded.Command,
+                AliasesJson = excluded.AliasesJson,
+                Capability = excluded.Capability,
+                IsSilentPoller = excluded.IsSilentPoller,
+                UpdatedAt = excluded.UpdatedAt;
             """;
         cmd.Parameters.AddWithValue("$name", skill.Name);
-        cmd.Parameters.AddWithValue("$desc", skill.Description);
-        cmd.Parameters.AddWithValue("$cmd", skill.Command);
+        cmd.Parameters.AddWithValue("$kind", skill.Kind);
+        cmd.Parameters.AddWithValue("$handler", (object?)skill.HandlerType ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$desc", skill.DisplayDescription);
+        cmd.Parameters.AddWithValue("$mspec", skill.MainAgentSpec);
+        cmd.Parameters.AddWithValue("$pspec", skill.PlannerSpec);
+        cmd.Parameters.AddWithValue("$cmd", (object?)skill.Command ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$aliases", JsonSerializer.Serialize(skill.Aliases ?? new List<string>()));
+        cmd.Parameters.AddWithValue("$cap", (object?)skill.Capability ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$poller", skill.IsSilentPoller ? 1 : 0);
+        cmd.Parameters.AddWithValue("$enabled", skill.IsEnabled ? 1 : 0);
         cmd.Parameters.AddWithValue("$created", skill.CreatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$updated", skill.UpdatedAt.ToString("O"));
         await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task SyncBasicSkillsAsync(
+        IReadOnlyList<SkillRecord> defaults,
+        IReadOnlySet<string> legacyDisabled,
+        CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+
+        var existingBasic = new List<SkillRecord>();
+        await using (var q = conn.CreateCommand())
+        {
+            q.Transaction = tx;
+            q.CommandText = """
+                SELECT Name, Kind, HandlerType, DisplayDescription, MainAgentSpec, PlannerSpec, Command, AliasesJson, Capability, IsSilentPoller, IsEnabled, CreatedAt, UpdatedAt
+                FROM Skills
+                WHERE Kind = 'basic';
+                """;
+            await using var r = await q.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                var aliasesJson = r.IsDBNull(7) ? "[]" : r.GetString(7);
+                List<string> aliases;
+                try { aliases = JsonSerializer.Deserialize<List<string>>(aliasesJson) ?? new List<string>(); }
+                catch { aliases = new List<string>(); }
+
+                existingBasic.Add(new SkillRecord(
+                    Name: r.GetString(0),
+                    Kind: r.GetString(1),
+                    HandlerType: r.IsDBNull(2) ? null : r.GetString(2),
+                    DisplayDescription: r.GetString(3),
+                    MainAgentSpec: r.GetString(4),
+                    PlannerSpec: r.GetString(5),
+                    Command: r.IsDBNull(6) ? null : r.GetString(6),
+                    Aliases: aliases,
+                    Capability: r.IsDBNull(8) ? null : r.GetString(8),
+                    IsSilentPoller: r.GetInt32(9) != 0,
+                    IsEnabled: r.GetInt32(10) != 0,
+                    CreatedAt: DateTimeOffset.Parse(r.GetString(11)),
+                    UpdatedAt: DateTimeOffset.Parse(r.GetString(12))));
+            }
+        }
+
+        var defaultHandlers = defaults
+            .Where(d => !string.IsNullOrWhiteSpace(d.HandlerType))
+            .Select(d => d.HandlerType!)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Remove orphaned built-in skills whose handler classes no longer exist
+        foreach (var ex in existingBasic)
+        {
+            if (string.IsNullOrWhiteSpace(ex.HandlerType) || !defaultHandlers.Contains(ex.HandlerType))
+            {
+                await using var del = conn.CreateCommand();
+                del.Transaction = tx;
+                del.CommandText = "DELETE FROM Skills WHERE Name = $name AND Kind = 'basic';";
+                del.Parameters.AddWithValue("$name", ex.Name);
+                await del.ExecuteNonQueryAsync(ct);
+            }
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        foreach (var def in defaults)
+        {
+            var match = existingBasic.FirstOrDefault(e =>
+                            !string.IsNullOrWhiteSpace(e.HandlerType) &&
+                            string.Equals(e.HandlerType, def.HandlerType, StringComparison.OrdinalIgnoreCase))
+                        ?? existingBasic.FirstOrDefault(e =>
+                            string.Equals(e.Name, def.Name, StringComparison.OrdinalIgnoreCase));
+
+            if (match is null)
+            {
+                bool disabledByLegacy = legacyDisabled.Contains(def.Name)
+                    || (def.Aliases is { Count: > 0 } && def.Aliases.Any(a => legacyDisabled.Contains(a)));
+                await InsertSkillRowAsync(conn, tx, def with
+                {
+                    IsEnabled = !disabledByLegacy,
+                    CreatedAt = now,
+                    UpdatedAt = now
+                }, ct);
+            }
+            // Existing basic skill rows are left untouched so SQLite remains the single source of truth.
+        }
+
+        await tx.CommitAsync(ct);
+    }
+
+    private static async Task InsertSkillRowAsync(SqliteConnection conn, SqliteTransaction tx, SkillRecord skill, CancellationToken ct)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT OR REPLACE INTO Skills (Name, Kind, HandlerType, DisplayDescription, MainAgentSpec, PlannerSpec, Command, AliasesJson, Capability, IsSilentPoller, IsEnabled, CreatedAt, UpdatedAt)
+            VALUES ($name, $kind, $handler, $desc, $mspec, $pspec, $cmd, $aliases, $cap, $poller, $enabled, $created, $updated);
+            """;
+        cmd.Parameters.AddWithValue("$name", skill.Name);
+        cmd.Parameters.AddWithValue("$kind", skill.Kind);
+        cmd.Parameters.AddWithValue("$handler", (object?)skill.HandlerType ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$desc", skill.DisplayDescription);
+        cmd.Parameters.AddWithValue("$mspec", skill.MainAgentSpec);
+        cmd.Parameters.AddWithValue("$pspec", skill.PlannerSpec);
+        cmd.Parameters.AddWithValue("$cmd", (object?)skill.Command ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$aliases", JsonSerializer.Serialize(skill.Aliases ?? new List<string>()));
+        cmd.Parameters.AddWithValue("$cap", (object?)skill.Capability ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$poller", skill.IsSilentPoller ? 1 : 0);
+        cmd.Parameters.AddWithValue("$enabled", skill.IsEnabled ? 1 : 0);
+        cmd.Parameters.AddWithValue("$created", skill.CreatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$updated", skill.UpdatedAt.ToString("O"));
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task<int> MigrateLegacyCustomSkillsAsync(IReadOnlySet<string> legacyDisabled, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using (var chk = conn.CreateCommand())
+        {
+            chk.CommandText = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='CustomSkills' LIMIT 1;";
+            if (await chk.ExecuteScalarAsync(ct) is null)
+                return 0;
+        }
+
+        var legacyRows = new List<(string Name, string Description, string Command, string CreatedAt)>();
+        await using (var q = conn.CreateCommand())
+        {
+            q.CommandText = "SELECT Name, Description, Command, CreatedAt FROM CustomSkills;";
+            await using var r = await q.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                legacyRows.Add((r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3)));
+        }
+
+        int inserted = 0;
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        foreach (var row in legacyRows)
+        {
+            await using var ins = conn.CreateCommand();
+            ins.CommandText = """
+                INSERT OR IGNORE INTO Skills (Name, Kind, HandlerType, DisplayDescription, MainAgentSpec, PlannerSpec, Command, AliasesJson, Capability, IsSilentPoller, IsEnabled, CreatedAt, UpdatedAt)
+                VALUES ($name, 'custom', NULL, $desc, '', '', $cmd, '[]', NULL, 0, $enabled, $created, $updated);
+                """;
+            ins.Parameters.AddWithValue("$name", row.Name);
+            ins.Parameters.AddWithValue("$desc", row.Description);
+            ins.Parameters.AddWithValue("$cmd", row.Command);
+            ins.Parameters.AddWithValue("$enabled", legacyDisabled.Contains(row.Name) ? 0 : 1);
+            ins.Parameters.AddWithValue("$created", row.CreatedAt);
+            ins.Parameters.AddWithValue("$updated", now);
+            inserted += await ins.ExecuteNonQueryAsync(ct);
+        }
+        return inserted;
+    }
+
+    public async Task<bool> SetSkillEnabledInDbAsync(string canonicalName, bool enabled, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE Skills SET IsEnabled = $en, UpdatedAt = $at WHERE lower(Name) = lower($name);";
+        cmd.Parameters.AddWithValue("$en", enabled ? 1 : 0);
+        cmd.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$name", canonicalName);
+        return await cmd.ExecuteNonQueryAsync(ct) > 0;
+    }
+
+    public async Task<List<CustomSkillRecord>> GetCustomSkillsAsync(CancellationToken ct = default)
+    {
+        var skills = await GetSkillsAsync("custom", ct);
+        return skills.Select(s => new CustomSkillRecord(
+            s.Name,
+            s.DisplayDescription,
+            s.Command ?? "",
+            s.CreatedAt)).ToList();
+    }
+
+    public async Task UpsertCustomSkillAsync(CustomSkillRecord skill, CancellationToken ct = default)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var rec = new SkillRecord(
+            Name: skill.Name,
+            Kind: "custom",
+            HandlerType: null,
+            DisplayDescription: skill.Description,
+            MainAgentSpec: "",
+            PlannerSpec: "",
+            Command: skill.Command,
+            Aliases: new List<string>(),
+            Capability: null,
+            IsSilentPoller: false,
+            IsEnabled: true,
+            CreatedAt: skill.CreatedAt,
+            UpdatedAt: now);
+        await UpsertSkillAsync(rec, ct);
     }
 
     public async Task<bool> DeleteCustomSkillAsync(string name, CancellationToken ct = default)
     {
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM CustomSkills WHERE lower(Name) = lower($name);";
+        cmd.CommandText = "DELETE FROM Skills WHERE lower(Name) = lower($name) AND Kind = 'custom';";
         cmd.Parameters.AddWithValue("$name", name);
-        return await cmd.ExecuteNonQueryAsync(ct) > 0;
+        var deleted = await cmd.ExecuteNonQueryAsync(ct) > 0;
+
+        // Clean legacy table if present so re-migration cannot reintroduce it
+        try
+        {
+            await using var chk = conn.CreateCommand();
+            chk.CommandText = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='CustomSkills' LIMIT 1;";
+            if (await chk.ExecuteScalarAsync(ct) is not null)
+            {
+                await using var legacyDel = conn.CreateCommand();
+                legacyDel.CommandText = "DELETE FROM CustomSkills WHERE lower(Name) = lower($name);";
+                legacyDel.Parameters.AddWithValue("$name", name);
+                await legacyDel.ExecuteNonQueryAsync(ct);
+            }
+        }
+        catch { }
+
+        return deleted;
     }
 
     public async Task<string?> GetSyncValueAsync(string key, CancellationToken ct = default)

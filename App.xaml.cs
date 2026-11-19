@@ -3,7 +3,6 @@ using System.Windows;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Agent.Providers;
 using AiSecretary.Desktop.Data;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Server;
 using AiSecretary.Desktop.Services;
 using AiSecretary.Desktop.Skills;
@@ -69,6 +68,7 @@ public partial class App : System.Windows.Application
             });
         sc.AddSingleton<SqliteStore>();
         sc.AddSingleton<GuardAuditStore>();
+        sc.AddSingleton<UiLocalizer>();
         sc.AddSingleton<StyleService>();
         sc.AddSingleton<TtsService>();
         sc.AddSingleton<SandboxService>();
@@ -106,17 +106,17 @@ public partial class App : System.Windows.Application
 
         _services = sc.BuildServiceProvider();
 
-        var appSettings = _services.GetRequiredService<AppSettingsService>();
-        await AppMessages.InitializeAsync(
-            () => appSettings.Current.Llm.ReplyLanguage,
-            _services.GetRequiredService<SqliteStore>(),
-            _services.GetRequiredService<IModelGateway>());
+        var skillRegistry = _services.GetRequiredService<SkillRegistry>();
+        await skillRegistry.InitializeAsync();
+        _services.GetRequiredService<GuardService>().BindSkillCatalog(skillRegistry);
+
+        var localizer = _services.GetRequiredService<UiLocalizer>();
+        await localizer.InitializeAsync(UiLocalizer.BuildCoreHotEntries(skillRegistry));
+
         await HolidayHelper.InitializeAsync(
             _services.GetRequiredService<SqliteStore>(),
             _services.GetRequiredService<HolidaySyncAgent>());
 
-        _services.GetRequiredService<GuardService>()
-            .RegisterSkillNames(_services.GetRequiredService<SkillRegistry>().All.Select(s => s.Name));
         _services.GetRequiredService<SkillRuntime>().ValidateAtStartup();
         var controller = _services.GetRequiredService<SecretaryController>();
         await controller.InitializeAsync();

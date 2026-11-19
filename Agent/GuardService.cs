@@ -4,7 +4,6 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 using AiSecretary.Desktop.Skills;
 
@@ -34,21 +33,21 @@ public sealed record GuardAuditEntry(
 /// <summary>
 /// Developer-managed security boundary, REST API permission gate,
 /// two-tier command risk gate (High = deny, Low = per-execution ask), and isolated audit log (guard_audit.db).
-/// Policy rules are loaded from read-only guard_policy.json in AppContext.BaseDirectory (never user-writable).
+/// Skill enable/disable state is backed dynamically by SQLite (<see cref="ISkillCatalogLookup"/>);
+/// policy rules are loaded from read-only guard_policy.json in AppContext.BaseDirectory.
 /// </summary>
 public sealed class GuardService
 {
-    private readonly HashSet<string> _allowedSkills;
-    private readonly HashSet<string> _disabledSkills = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<GuardAuditEntry> _auditRing = new();
     private readonly GuardAuditStore _auditStore;
     private readonly InteractionGateway _interaction;
     private readonly AppSettingsService _settings;
+    private readonly UiLocalizer _localizer;
     private readonly ILogger<GuardService> _logger;
     private readonly IConfiguration _config;
-    private readonly bool _allowSendWithoutConfirm;
     private readonly string _ewsHost;
     private readonly HashSet<string> _allowedBackgroundServices;
+    private ISkillCatalogLookup? _catalog;
     // 僅限單一邏輯任務（taskId）期間有效的低風險指令授權快取（可跨多輪對話與 Session 輪替，切換新任務或關閉即清除）
     private readonly ConcurrentDictionary<string, HashSet<string>> _taskApprovals = new();
 
@@ -59,27 +58,20 @@ public sealed class GuardService
 
     public int MaxWorkerStepsPerTask { get; }
 
-    public void RegisterSkillNames(IEnumerable<string> skillNames)
-    {
-        foreach (var name in skillNames)
-        {
-            if (!string.IsNullOrWhiteSpace(name))
-                _allowedSkills.Add(name);
-        }
-        if (_allowedSkills.Contains("create_schedule"))
-            _allowedSkills.Add("create_reminder");
-    }
+    public void BindSkillCatalog(ISkillCatalogLookup catalog) => _catalog = catalog;
 
     public GuardService(
         IConfiguration config,
         GuardAuditStore auditStore,
         InteractionGateway interaction,
         AppSettingsService settings,
+        UiLocalizer localizer,
         ILogger<GuardService> logger)
     {
         _auditStore = auditStore;
         _interaction = interaction;
         _settings = settings;
+        _localizer = localizer;
         _logger = logger;
         _config = config;
 
@@ -88,88 +80,28 @@ public sealed class GuardService
         var bgServices = config.GetSection("Guard:AllowedBackgroundServices").Get<string[]>() ?? Array.Empty<string>();
         _allowedBackgroundServices = new HashSet<string>(bgServices, StringComparer.OrdinalIgnoreCase);
 
-        var skills = config.GetSection("Guard:AllowedSkills").Get<string[]>() ?? Array.Empty<string>();
-        _allowedSkills = new HashSet<string>(skills, StringComparer.OrdinalIgnoreCase);
-        if (_allowedSkills.Contains("create_schedule"))
-            _allowedSkills.Add("create_reminder");
-
-        _allowSendWithoutConfirm = config.GetValue<bool>("Guard:AllowSendMailWithoutConfirmation", false);
         MaxWorkerStepsPerTask = config.GetValue<int>("Guard:MaxWorkerStepsPerTask", 15);
 
         var ewsUrl = config.GetValue<string>("Ews:Url") ?? "";
         _ewsHost = Uri.TryCreate(ewsUrl, UriKind.Absolute, out var u) ? u.Host : "";
     }
 
-    private static string NormalizeSkillKey(string skillName) => skillName.Trim().ToLowerInvariant() switch
-    {
-        "read_inbox" or "get_mail_detail" or "read_gmail" or "get_gmail_detail" or "sync_mail" => "manage_mail",
-        "create_reminder" or "create_schedule" or "list_schedules" or "update_schedule" or "delete_schedule" => "manage_schedule",
-        "record_fact" or "search_facts" or "get_fact_detail" or "update_fact" or "delete_fact" => "manage_facts",
-        "create_skill" or "delete_skill" => "manage_custom_skill",
-        _ => skillName
-    };
-
-    public bool IsSkillEnabled(string skillName)
-    {
-        var norm = NormalizeSkillKey(skillName);
-        return !_disabledSkills.Contains(skillName) && !_disabledSkills.Contains(norm);
-    }
-
-    public void SetSkillEnabled(string skillName, bool enabled)
-    {
-        var norm = NormalizeSkillKey(skillName);
-        if (enabled)
-        {
-            _disabledSkills.Remove(skillName);
-            _disabledSkills.Remove(norm);
-        }
-        else
-        {
-            _disabledSkills.Add(norm);
-        }
-    }
-
-    public void LoadDisabledSkills(IEnumerable<string> disabled)
-    {
-        _disabledSkills.Clear();
-        foreach (var s in disabled)
-        {
-            if (!string.IsNullOrWhiteSpace(s))
-                _disabledSkills.Add(NormalizeSkillKey(s));
-        }
-    }
-
-    public IReadOnlyCollection<string> GetDisabledSkills() => _disabledSkills.ToArray();
+    public bool IsSkillEnabled(string skillName) => _catalog?.IsEnabled(skillName) ?? false;
 
     public IReadOnlyList<GuardAuditEntry> GetRecentAuditLogs() => _auditRing.ToArray();
 
     public GuardDecision CheckSkillExecution(string skillName, bool userExplicitlyConfirmed = false)
     {
-        var norm = NormalizeSkillKey(skillName);
-        if (_disabledSkills.Contains(skillName) || _disabledSkills.Contains(norm))
+        var rec = _catalog?.Resolve(skillName);
+        if (rec is null)
+            return Block(skillName, skillName, $"Skill '{skillName}' is not registered in the skill catalog.");
+
+        if (!rec.IsEnabled)
         {
-            return Block(skillName, skillName, Resources.AppMessages.LocalizeFormat("GuardSkillDisabled", "Skill '{0}' is disabled.", skillName));
+            return Block(rec.Name, rec.Name, _localizer.TextCached("GuardSkillDisabled", "Skill '{0}' is disabled.", rec.Name));
         }
 
-        if (!_allowedSkills.Contains(skillName) && !_allowedSkills.Contains(norm))
-        {
-            return Block(skillName, skillName, $"Skill '{skillName}' is not in Guard:AllowedSkills.");
-        }
-
-        if (skillName.Equals("send_mail", StringComparison.OrdinalIgnoreCase) &&
-            !_allowSendWithoutConfirm &&
-            !userExplicitlyConfirmed)
-        {
-            RecordAudit(skillName, skillName, "RequireConfirm", "Sending email requires explicit user confirmation.");
-            return new GuardDecision
-            {
-                Allowed = false,
-                RequiresUserConfirmation = true,
-                Reason = "Sending email requires explicit user confirmation."
-            };
-        }
-
-        RecordAudit(skillName, skillName, "Allow", "Skill permitted");
+        RecordAudit(rec.Name, rec.Name, "Allow", "Skill permitted");
         return new GuardDecision { Allowed = true };
     }
 
@@ -224,33 +156,33 @@ public sealed class GuardService
         return new GuardDecision { Allowed = true };
     }
 
-    public GuardDecision CheckWatcherRegistration(string kind, string url, int intervalSeconds, int currentActiveCount)
+    public GuardDecision CheckWatcherRegistration(string skillName, string kind, string url, int intervalSeconds, int currentActiveCount)
     {
         int maxWatchers = Math.Clamp(_config.GetValue<int>("Guard:MaxActiveWatchers", 5), 1, 50);
         int minInterval = Math.Clamp(_config.GetValue<int>("Guard:MinWatcherIntervalSeconds", 60), 15, 3600);
 
         if (currentActiveCount >= maxWatchers)
-            return Block("manage_watcher", url, $"Active watcher limit reached (max {maxWatchers}).");
+            return Block(skillName, url, $"Active watcher limit reached (max {maxWatchers}).");
 
         if (intervalSeconds < minInterval)
-            return Block("manage_watcher", url, $"Watcher interval cannot be below {minInterval} seconds.");
+            return Block(skillName, url, $"Watcher interval cannot be below {minInterval} seconds.");
 
         var normKind = kind.Trim().ToLowerInvariant();
         if (normKind is not ("http_text" or "http_json" or "browser_dom"))
-            return Block("manage_watcher", kind, $"Unsupported watcher kind: {kind}");
+            return Block(skillName, kind, $"Unsupported watcher kind: {kind}");
 
         if (!Uri.TryCreate(url?.Trim(), UriKind.Absolute, out var uri) ||
             (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
-            return Block("manage_watcher", url ?? "", $"Invalid watcher URL: {url}");
+            return Block(skillName, url ?? "", $"Invalid watcher URL: {url}");
 
         if (string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase) ||
             uri.Host.EndsWith(".local", StringComparison.OrdinalIgnoreCase))
-            return Block("manage_watcher", url!, "Loopback and local hostnames are blocked for watchers.");
+            return Block(skillName, url!, "Loopback and local hostnames are blocked for watchers.");
 
         if (IPAddress.TryParse(uri.Host, out var ip) && WebFetchSkill.IsPrivateOrLoopback(ip))
-            return Block("manage_watcher", url!, "Private and loopback IP ranges are blocked for watchers.");
+            return Block(skillName, url!, "Private and loopback IP ranges are blocked for watchers.");
 
-        RecordAudit("manage_watcher", $"{normKind} {uri.Host}", "Allow", "Watcher policy permitted");
+        RecordAudit(skillName, $"{normKind} {uri.Host}", "Allow", "Watcher policy permitted");
         return new GuardDecision { Allowed = true };
     }
 
@@ -267,11 +199,12 @@ public sealed class GuardService
         @"^[\s\+\-=@]*(?:cmd|msexcel|exec)\s*\||=\s*(?:WEBSERVICE|REGISTER\.ID|CALL)\s*\(",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    public GuardDecision CheckExcelFormula(string? value)
+    public GuardDecision CheckExcelFormula(string? value, string? skillName = null)
     {
         if (string.IsNullOrEmpty(value)) return new GuardDecision { Allowed = true };
+        var auditKey = string.IsNullOrWhiteSpace(skillName) ? "office_formula" : skillName;
         if (DangerousExcelFormulaRegex.IsMatch(value))
-            return BlockHighRisk("excel_assistant", value.Length > 80 ? value[..80] : value, "Blocked high-risk DDE or external-fetch Excel formula.");
+            return BlockHighRisk(auditKey, value.Length > 80 ? value[..80] : value, "Blocked high-risk DDE or external-fetch Excel formula.");
 
         return new GuardDecision { Allowed = true };
     }
@@ -347,10 +280,16 @@ public sealed class GuardService
 
         if (guardCheck.RequiresUserConfirmation && !IsApprovedForTask(taskId, skillName))
         {
-            var decision = await _interaction.RequestCommandApprovalAsync(
-                AppMessages.ExecuteSkillTitle,
-                AppMessages.ExecuteSkillPrompt(skillName, command, extraArgs, sandboxRoot),
+            var execTitle = await _localizer.TextAsync("ExecuteSkillTitle", "Confirm Low-Risk Command", Array.Empty<object?>(), ct);
+            var argsLine = string.IsNullOrWhiteSpace(extraArgs)
+                ? ""
+                : await _localizer.TextAsync("ExecuteSkillArgsLine", "\nArgs: {0}", new object?[] { extraArgs }, ct);
+            var execPrompt = await _localizer.TextAsync(
+                "ExecuteSkillPrompt",
+                "Assistant requests to run a custom command skill (per-execution confirmation):\n\nSkill: {0}\nCommand: {1}{2}\nWorking directory: {3}\n\nAllow running once?",
+                new object?[] { skillName, command, argsLine, sandboxRoot },
                 ct);
+            var decision = await _interaction.RequestCommandApprovalAsync(execTitle, execPrompt, ct);
             if (decision == CommandApprovalDecision.Deny)
                 return (false, $"User declined running skill '{skillName}'.");
             if (decision == CommandApprovalDecision.AllowForTask)

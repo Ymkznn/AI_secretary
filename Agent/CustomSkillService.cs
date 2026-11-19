@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 using AiSecretary.Desktop.Skills;
 using Microsoft.Extensions.DependencyInjection;
@@ -19,6 +18,7 @@ public sealed class CustomSkillService
     private readonly SandboxService _sandbox;
     private readonly GuardService _guard;
     private readonly AppSettingsService _settings;
+    private readonly UiLocalizer _localizer;
     private readonly IServiceProvider _services;
     private readonly ILogger<CustomSkillService> _logger;
 
@@ -30,6 +30,7 @@ public sealed class CustomSkillService
         SandboxService sandbox,
         GuardService guard,
         AppSettingsService settings,
+        UiLocalizer localizer,
         IServiceProvider services,
         ILogger<CustomSkillService> logger)
     {
@@ -37,6 +38,7 @@ public sealed class CustomSkillService
         _sandbox = sandbox;
         _guard = guard;
         _settings = settings;
+        _localizer = localizer;
         _services = services;
         _logger = logger;
     }
@@ -71,20 +73,27 @@ public sealed class CustomSkillService
             return (false, "Custom skill name must be 2-48 chars, lowercase letters/digits/underscores starting with a letter.");
 
         // 禁止覆蓋或冒名內建技能
-        if (_services.GetRequiredService<SkillRegistry>().Contains(cleanName))
+        var registry = _services.GetRequiredService<SkillRegistry>();
+        if (registry.ContainsBasic(cleanName))
             return (false, $"Skill name '{cleanName}' collides with a built-in skill.");
 
-        var guardCheck = _guard.CheckCommandExecution($"create_skill:{cleanName}", command);
+        var guardCheck = _guard.CheckCommandExecution($"custom_create:{cleanName}", command);
         if (!guardCheck.Allowed && !guardCheck.RequiresUserConfirmation)
             return (false, $"Guard blocked: {guardCheck.Reason}");
 
-        var prompt = AppMessages.CreateSkillPrompt(cleanName, description, command, _sandbox.RootPath);
-        var approved = await confirmAsync(AppMessages.CreateSkillTitle, prompt);
+        var title = await _localizer.TextAsync("CreateSkillTitle", "Confirm Skill Creation", Array.Empty<object?>(), ct);
+        var prompt = await _localizer.TextAsync(
+            "CreateSkillPrompt",
+            "Assistant requests to create a new skill:\n\nName: {0}\nDescription: {1}\nCommand: {2}\nSandbox: {3}\n\nAllow creating this skill?",
+            new object?[] { cleanName, description, command, _sandbox.RootPath },
+            ct);
+        var approved = await confirmAsync(title, prompt);
         if (!approved)
             return (false, $"User declined creating skill '{cleanName}'.");
 
         var rec = new CustomSkillRecord(cleanName, description.Trim(), command.Trim(), DateTimeOffset.UtcNow);
         await _store.UpsertCustomSkillAsync(rec, ct);
+        await registry.ReloadFromStoreAsync(ct);
         SkillsChanged?.Invoke();
         return (true, $"Created and enabled skill '{cleanName}'.");
     }
@@ -99,12 +108,18 @@ public sealed class CustomSkillService
         if (existing is null)
             return (false, $"Custom skill '{name}' not found.");
 
-        var prompt = AppMessages.DeleteSkillPrompt(existing.Name, existing.Description);
-        var approved = await confirmAsync(AppMessages.DeleteSkillTitle, prompt);
+        var title = await _localizer.TextAsync("DeleteSkillTitle", "Confirm Skill Deletion", Array.Empty<object?>(), ct);
+        var prompt = await _localizer.TextAsync(
+            "DeleteSkillPrompt",
+            "Assistant requests to delete skill:\n\nName: {0}\nDescription: {1}\n\nAllow deleting this skill?",
+            new object?[] { existing.Name, existing.Description },
+            ct);
+        var approved = await confirmAsync(title, prompt);
         if (!approved)
             return (false, $"User declined deleting skill '{existing.Name}'.");
 
         await _store.DeleteCustomSkillAsync(existing.Name, ct);
+        await _services.GetRequiredService<SkillRegistry>().ReloadFromStoreAsync(ct);
         SkillsChanged?.Invoke();
         return (true, $"Deleted skill '{existing.Name}'.");
     }

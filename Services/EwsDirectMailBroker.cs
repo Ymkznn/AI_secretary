@@ -7,7 +7,6 @@ using System.Xml;
 using System.Xml.Linq;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 using Microsoft.Extensions.Configuration;
 
 namespace AiSecretary.Desktop.Services;

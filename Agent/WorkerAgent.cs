@@ -21,6 +21,7 @@ public sealed class WorkerAgent
     private readonly StyleService _styles;
     private readonly TtsService _tts;
     private readonly SkillRegistry _skillRegistry;
+    private readonly UiLocalizer _localizer;
     private readonly AppSettingsService _settings;
     private readonly ILogger<WorkerAgent> _logger;
 
@@ -33,6 +34,7 @@ public sealed class WorkerAgent
         StyleService styles,
         TtsService tts,
         SkillRegistry skillRegistry,
+        UiLocalizer localizer,
         AppSettingsService settings,
         ILogger<WorkerAgent> logger)
     {
@@ -44,12 +46,13 @@ public sealed class WorkerAgent
         _styles = styles;
         _tts = tts;
         _skillRegistry = skillRegistry;
+        _localizer = localizer;
         _settings = settings;
         _logger = logger;
     }
 
     /// <summary>
-    /// 執行單一技能並彙整成繁體中文回覆；若該技能未被處理則回傳 Handled=false 以便退回 Planner。
+    /// 執行單一技能並以使用者指定語系彙整回覆；若該技能未被處理則回傳 Handled=false 以便退回 Planner。
     /// </summary>
     public async Task<(bool Handled, string Summary, List<MailSourceRef> Sources)> ExecuteSingleSkillAsync(
         string conversationId,
@@ -76,14 +79,6 @@ public sealed class WorkerAgent
             return (false, "", sources);
 
         var activeStylePrompt = _tts.GetActiveStylePrompt() ?? _styles.GetActiveStylePrompt();
-
-        // 若未啟用角色語氣，確定性操作直接回傳觀察結果以節省一次 LLM 呼叫。
-        var lower = skillName.Trim().ToLowerInvariant();
-        if (string.IsNullOrWhiteSpace(activeStylePrompt) &&
-            lower is "launch_app" or "manage_schedule" or "manage_facts" or "manage_custom_skill" or "create_schedule" or "update_schedule" or "delete_schedule" or "create_reminder" or "dismiss_reminder" or "update_fact" or "delete_fact" or "create_skill" or "delete_skill" or "set_quiet_mode" or "sync_mail" or "fill_otp" or "push_notification")
-        {
-            return (true, string.Join("\n", observations), sources);
-        }
 
         var mainSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Main", ct: ct);
         var prefFacts = await _store.RecallRelevantUserPrefFactsAsync(conversationId, userPrompt, 5, ct);
@@ -134,33 +129,43 @@ public sealed class WorkerAgent
         CancellationToken ct,
         string? taskId = null)
     {
-        var builtIn = _skillRegistry.Find(skillName);
-        if (builtIn is null)
+        var basic = _skillRegistry.FindBasic(skillName);
+        if (basic is null)
         {
             await ExecuteCustomStepAsync(skillName, args, observations, completedSteps, taskId, onStatusAsync, ct);
             return;
         }
 
-        var check = _guard.CheckSkillExecution(builtIn.Name);
+        var (record, handler) = basic.Value;
+        var check = _guard.CheckSkillExecution(record.Name);
         if (!check.Allowed)
         {
-            observations.Add($"Skill {skillName} denied by Guard: {check.Reason}");
+            observations.Add($"Skill {record.Name} denied by Guard: {check.Reason}");
             return;
         }
 
-        await builtIn.ExecuteAsync(new SkillExecutionContext
+        try
         {
-            ConversationId = conversationId,
-            UserPrompt = userPrompt,
-            Args = args,
-            TargetMailId = targetMailId,
-            ConfirmAsync = confirmAsync,
-            OnStatusAsync = onStatusAsync,
-            Sources = sources,
-            Observations = observations,
-            CompletedSteps = completedSteps,
-            Ct = ct
-        });
+            await handler.ExecuteAsync(new SkillExecutionContext
+            {
+                SkillName = record.Name,
+                ConversationId = conversationId,
+                UserPrompt = userPrompt,
+                Args = args,
+                TargetMailId = targetMailId,
+                ConfirmAsync = confirmAsync,
+                OnStatusAsync = onStatusAsync,
+                LocalizeAsync = (k, en, a) => _localizer.TextAsync(k, en, a, ct),
+                Sources = sources,
+                Observations = observations,
+                CompletedSteps = completedSteps,
+                Ct = ct
+            });
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            observations.Add($"{record.Name} failed: {ex.Message}");
+        }
     }
 
     private async Task ExecuteCustomStepAsync(
@@ -178,13 +183,15 @@ public sealed class WorkerAgent
             observations.Add($"Custom skill not found: {skillName}");
             return;
         }
-        if (!_guard.IsSkillEnabled(skill.Name))
+        var check = _guard.CheckSkillExecution(skill.Name);
+        if (!check.Allowed)
         {
             observations.Add($"Custom skill disabled: {skill.Name}");
             return;
         }
 
-        await onStatusAsync($"執行 {skill.Name}…");
+        var statusMsg = await _localizer.TextAsync("CustomSkillRunning", "Running {0}...", new object?[] { skill.Name }, ct);
+        await onStatusAsync(statusMsg);
         try
         {
             var extraArgs = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("args", out var a) && a.ValueKind == JsonValueKind.String

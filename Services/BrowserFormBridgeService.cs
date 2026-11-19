@@ -18,6 +18,10 @@ public sealed record BrowserDomSnapshot(
     bool Truncated,
     string? Error = null);
 
+public sealed record BrowserTabTitleResult(
+    string? Title = null,
+    bool Incognito = false);
+
 /// <summary>
 /// Bridges on-demand form read/fill, full DOM read, and OTP DOM fill commands between C# Agent skills and the Chrome/Edge MV3 Extension over SSE + HTTP,
 /// so the user never has to manually click the browser extension icon.
@@ -27,11 +31,13 @@ public sealed class BrowserFormBridgeService
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserFormContext?>> _extractWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserDomSnapshot?>> _domWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserOtpFillResult?>> _otpWaiters = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserTabTitleResult?>> _titleWaiters = new();
 
     public event Action<string>? ExtractRequested;
     public event Action<string, string?, int>? DomRequested;
     public event Action<IReadOnlyList<BrowserFillAction>>? ApplyFillsRequested;
     public event Action<string, string>? FillOtpRequested;
+    public event Action<string>? TitleRequested;
 
     public Task<BrowserFormContext?> RequestActiveTabFormAsync(TimeSpan timeout, CancellationToken ct = default)
         => WaitWithTimeoutAsync(_extractWaiters, id => ExtractRequested?.Invoke(id), timeout, ct);
@@ -41,6 +47,9 @@ public sealed class BrowserFormBridgeService
 
     public Task<BrowserOtpFillResult?> RequestFillOtpAsync(string code, TimeSpan timeout, CancellationToken ct = default)
         => WaitWithTimeoutAsync(_otpWaiters, id => FillOtpRequested?.Invoke(id, code), timeout, ct);
+
+    public Task<BrowserTabTitleResult?> RequestActiveTabTitleAsync(TimeSpan timeout, CancellationToken ct = default)
+        => WaitWithTimeoutAsync(_titleWaiters, id => TitleRequested?.Invoke(id), timeout, ct);
 
     private static async Task<T?> WaitWithTimeoutAsync<T>(
         ConcurrentDictionary<string, TaskCompletionSource<T?>> waiters,
@@ -91,6 +100,14 @@ public sealed class BrowserFormBridgeService
     public bool CompleteFillOtp(string requestId, BrowserOtpFillResult result)
     {
         if (!_otpWaiters.TryRemove(requestId, out var tcs))
+            return false;
+        tcs.TrySetResult(result);
+        return true;
+    }
+
+    public bool CompleteTabTitle(string requestId, BrowserTabTitleResult result)
+    {
+        if (!_titleWaiters.TryRemove(requestId, out var tcs))
             return false;
         tcs.TrySetResult(result);
         return true;

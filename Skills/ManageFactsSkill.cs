@@ -1,5 +1,4 @@
 using AiSecretary.Desktop.Agent;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -17,6 +16,8 @@ public sealed class ManageFactsSkill : IBasicSkill
 
     public string Name => "manage_facts";
     public string DisplayDescription => "Record, search, update, and delete long-term memory facts";
+    public string StatusText => "Updating memory...";
+    public string? Capability => "memory";
     public string MainAgentSpec => """
         manage_facts
            - Purpose: Record, search, inspect, update, or delete structured long-term memory facts (user_pref, document, project, email, general), AND manage cascade-deleted annotations attached to any of the 6 memory types (fact|workflow|page_intent|schedule|calendar|watcher).
@@ -76,7 +77,7 @@ public sealed class ManageFactsSkill : IBasicSkill
         var confidence = ctx.GetArg("confidence") ?? "observed";
         var tags = ctx.GetStringArrayArg("tags");
 
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Accessing memory facts..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var fact = await _skills.RecordFactAsync(ctx.ConversationId, summary, detail, evidence, confidence, category, tags, ctx.Ct);
         ctx.Observations.Add($"manage_facts: recorded id={fact.FactId} category={fact.Category} confidence={fact.Confidence} summary=\"{fact.Summary}\".");
         ctx.CompletedSteps.Add($"manage_facts:record:{fact.FactId}");
@@ -88,7 +89,7 @@ public sealed class ManageFactsSkill : IBasicSkill
         var category = ctx.GetArg("category");
         var limit = int.TryParse(ctx.GetArg("limit"), out var lim) ? Math.Clamp(lim, 1, 30) : 10;
 
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Accessing memory facts..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var items = await _skills.SearchFactsAsync(ctx.ConversationId, keyword, category, limit, ctx.Ct);
         if (items.Count == 0)
         {
@@ -111,7 +112,7 @@ public sealed class ManageFactsSkill : IBasicSkill
             return;
         }
 
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Accessing memory facts..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var fact = await _skills.GetFactDetailAsync(factId, ctx.Ct);
         if (fact is null)
         {
@@ -131,7 +132,7 @@ public sealed class ManageFactsSkill : IBasicSkill
             return;
         }
 
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Accessing memory facts..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var ok = await _skills.UpdateFactAsync(
             factId,
             ctx.GetArg("summary"),
@@ -155,7 +156,7 @@ public sealed class ManageFactsSkill : IBasicSkill
             return;
         }
 
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Accessing memory facts..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var ok = await _skills.DeleteFactAsync(factId, ctx.ConversationId, ctx.Ct);
         ctx.Observations.Add(ok
             ? $"manage_facts: deleted id={factId}."
@@ -173,7 +174,7 @@ public sealed class ManageFactsSkill : IBasicSkill
             ctx.Observations.Add("manage_facts: annotate requires target_type, target_id, and note.");
             return;
         }
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Accessing memory facts..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var rec = await _skills.AnnotateMemoryAsync(ctx.ConversationId, targetType, targetId, note, ctx.GetArg("source_fact_id"), ctx.Ct);
         ctx.Observations.Add($"manage_facts: annotated {rec.TargetType}:{rec.TargetId} (annotation_id={rec.AnnotationId}): {rec.Note}");
         ctx.CompletedSteps.Add($"manage_facts:annotate:{rec.AnnotationId}");
@@ -181,7 +182,7 @@ public sealed class ManageFactsSkill : IBasicSkill
 
     private async Task ListAnnotationsAsync(SkillExecutionContext ctx)
     {
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Accessing memory facts..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var items = await _skills.ListAnnotationsAsync(ctx.GetArg("target_type"), ctx.GetArg("target_id"), ctx.Ct);
         if (items.Count == 0)
         {

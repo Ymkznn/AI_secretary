@@ -1,6 +1,5 @@
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Skills;
@@ -22,6 +21,7 @@ public sealed class PushNotificationSkill : IBasicSkill
 
     public string Name => "push_notification";
     public string DisplayDescription => "Publish desktop notification cards and pinned reminders";
+    public string StatusText => "Publishing notification...";
     public string MainAgentSpec => """
             push_notification
                - Purpose: Publish a desktop notification card and pinned reminder.

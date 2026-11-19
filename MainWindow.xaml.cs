@@ -520,7 +520,7 @@ public partial class MainWindow : Window
                                         await _controller.DismissPinnedReminderAsync(pinnedId);
                                     else
                                         await DismissPinnedForNotificationAsync(n);
-                                    OutputStatusText.Text = AiSecretary.Desktop.Resources.AppMessages.OtpCopiedStatus(code);
+                                    OutputStatusText.Text = await _controller.LocalizeAsync("OtpCopiedStatus", "Copied code {0}!", code);
                                 }
                             });
                         }
@@ -620,11 +620,16 @@ public partial class MainWindow : Window
         }
 
         bool hasBubbleVisible = OutputBorder.Visibility == Visibility.Visible;
-        if (newlyAddedKind is not null && !hasBubbleVisible && !_isReplying && !HasPendingPrompt)
+        if (newlyAddedKind is not null && !hasBubbleVisible && !_isReplying && !HasPendingPrompt && !_controller.HasRunningTasks)
         {
-            // When no bubble is open, show the speech bubble first and shrink into the pill later (avoid duplicate display).
+            // When no bubble is open and no active turn is running, show the speech bubble first and shrink into the pill later.
             _suppressPinnedDuringAlertBubble = true;
             _expandedPinnedKind = null;
+        }
+        else if (_controller.HasRunningTasks || _isReplying || HasPendingPrompt)
+        {
+            // When a conversation turn or confirmation is active, never suppress the pinned pill bar so notifications stay visible as pills without hijacking the bubble.
+            _suppressPinnedDuringAlertBubble = false;
         }
 
         if (_expandedPinnedKind is PinnedItemKind active && items.All(i => i.Kind != active))
@@ -1395,10 +1400,10 @@ public partial class MainWindow : Window
         OutputActionsPanel.Children.Clear();
         OutputActionsPanel.Visibility = Visibility.Collapsed;
 
-        var streamingAssistant = _controller.HasRunningTasks
-            ? messages.LastOrDefault(m => m.Role == "assistant" && m.IsStreaming)
-            : null;
-        var latest = streamingAssistant ?? messages.LastOrDefault(m => m.Role is "assistant" or "notification");
+        var streamingAssistant = messages.LastOrDefault(m => m.Role == "assistant" && m.IsStreaming);
+        var latest = (_controller.HasRunningTasks && streamingAssistant is not null)
+            ? streamingAssistant
+            : messages.LastOrDefault(m => m.Role is "assistant" or "notification");
         if (latest is null)
         {
             _hasOutputContent = false;

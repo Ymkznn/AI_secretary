@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
+using AiSecretary.Desktop.Skills;
 
 namespace AiSecretary.Desktop.Services;
 
@@ -16,7 +16,7 @@ public sealed class MailSyncService
     private readonly IMailBroker _mailBroker;
     private readonly GmailSkillService _gmail;
     private readonly MailRuleEngine _ruleEngine;
-    private readonly GuardService _guard;
+    private readonly SkillRegistry _skillRegistry;
     private readonly PlannerAgent _planner;
     private readonly ILogger<MailSyncService> _logger;
     private readonly SemaphoreSlim _triageGate = new(2, 2);
@@ -26,7 +26,7 @@ public sealed class MailSyncService
         IMailBroker mailBroker,
         GmailSkillService gmail,
         MailRuleEngine ruleEngine,
-        GuardService guard,
+        SkillRegistry skillRegistry,
         PlannerAgent planner,
         ILogger<MailSyncService> logger)
     {
@@ -34,7 +34,7 @@ public sealed class MailSyncService
         _mailBroker = mailBroker;
         _gmail = gmail;
         _ruleEngine = ruleEngine;
-        _guard = guard;
+        _skillRegistry = skillRegistry;
         _planner = planner;
         _logger = logger;
     }
@@ -143,7 +143,8 @@ public sealed class MailSyncService
         Func<string, MailItem, string, string, int, List<NotificationButtonOption>?, Task> onNotifyAsync,
         CancellationToken ct)
     {
-        if (!_gmail.IsAuthorized || !_guard.IsSkillEnabled("read_gmail"))
+        var mailSkill = _skillRegistry.FindByCapability("mail");
+        if (!_gmail.IsAuthorized || (mailSkill is not null && !mailSkill.IsEnabled))
             return 0;
 
         var cursorRaw = await _store.GetSyncValueAsync("gmail_sync_cursor", ct);

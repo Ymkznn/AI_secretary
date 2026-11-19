@@ -89,7 +89,8 @@ public sealed class GeminiProviderAdapter : ILlmProviderAdapter
             if (gmUsage.TryGetProperty("candidatesTokenCount", out var ctEl) && ctEl.TryGetInt32(out var ctv)) output = ctv;
             if (gmUsage.TryGetProperty("cachedContentTokenCount", out var cc) && cc.TryGetInt32(out var ccv)) cache = ccv;
         }
-        return (input, output, cache);
+        var nonCachedInput = Math.Max(0, input - cache);
+        return (nonCachedInput, output, cache);
     }
 
     private static object[] BuildParts(string text)

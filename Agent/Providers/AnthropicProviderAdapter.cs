@@ -105,7 +105,8 @@ public sealed class AnthropicProviderAdapter : ILlmProviderAdapter
         int input = 0, output = 0, cache = 0;
         if (root.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
         {
-            if (usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv)) input = itv;
+            if (usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv)) input += itv;
+            if (usage.TryGetProperty("cache_creation_input_tokens", out var cw) && cw.TryGetInt32(out var cwv)) input += cwv;
             if (usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv)) output = otv;
             if (usage.TryGetProperty("cache_read_input_tokens", out var cr) && cr.TryGetInt32(out var crv)) cache = crv;
         }

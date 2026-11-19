@@ -1,7 +1,6 @@
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -21,6 +20,7 @@ public sealed class ManageWatcherSkill : IBasicSkill
 
     public string Name => "manage_watcher";
     public string DisplayDescription => "Manage standing web monitors (price/stock/page updates)";
+    public string StatusText => "Updating web monitors...";
     public string MainAgentSpec => """
             manage_watcher
                - Purpose: Create, list, pause, resume, or delete standing web/price/API/DOM monitors.
@@ -31,8 +31,9 @@ public sealed class ManageWatcherSkill : IBasicSkill
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
+        var skillName = ctx.EffectiveName(Name);
         var action = (ctx.GetArg("action") ?? "list").Trim().ToLowerInvariant();
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Updating web monitors..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
 
         if (action == "list")
         {
@@ -92,16 +93,24 @@ public sealed class ManageWatcherSkill : IBasicSkill
 
         var existing = await _store.GetWatchersAsync(null, ctx.Ct);
         var activeCount = existing.Count(w => w.Status == "Active");
-        var guardRes = _guard.CheckWatcherRegistration(kind, url, interval, activeCount);
+        var guardRes = _guard.CheckWatcherRegistration(skillName, kind, url, interval, activeCount);
         if (!guardRes.Allowed)
         {
             ctx.Observations.Add($"manage_watcher: blocked by guard: {guardRes.Reason}");
             return;
         }
 
-        var approved = await ctx.ConfirmAsync(
-            "Standing Watcher Confirmation",
-            $"Create standing background monitor:\n\nTitle: {title}\nKind: {kind}\nURL: {url}\nInterval: {interval}s\nCondition: {cond} {thresh}");
+        var confirmTitle = await ctx.TextAsync("confirm_watcher_create_title", "Standing Watcher Confirmation");
+        var confirmBody = await ctx.TextAsync(
+            "confirm_watcher_create_body",
+            "Create standing background monitor:\n\nTitle: {0}\nKind: {1}\nURL: {2}\nInterval: {3}s\nCondition: {4} {5}",
+            title,
+            kind,
+            url,
+            interval,
+            cond,
+            thresh ?? "");
+        var approved = await ctx.ConfirmAsync(confirmTitle, confirmBody);
         if (!approved)
         {
             ctx.Observations.Add("manage_watcher: user declined creating watcher.");

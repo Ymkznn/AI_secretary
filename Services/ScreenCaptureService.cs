@@ -76,6 +76,10 @@ public sealed class ScreenCaptureService
                 g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
             }
         }
+        catch (Exception ex)
+        {
+            return (false, $"Screen capture unavailable in current desktop session: {ex.Message}", null);
+        }
         finally
         {
             if (hidSelf && mainWin is not null)

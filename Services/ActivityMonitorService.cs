@@ -4,7 +4,6 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Automation;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Services;
 
@@ -32,6 +31,7 @@ public sealed class ActivityMonitorService : IDisposable
 {
     private readonly ILogger<ActivityMonitorService> _logger;
     private readonly PageIntentPredictorService _pagePredictor;
+    private readonly UiLocalizer _localizer;
     private readonly object _lock = new();
     private readonly LinkedList<ExternalWindowTarget> _recentTargets = new();
     private readonly ConcurrentDictionary<string, DateTimeOffset> _titleCooldowns = new(StringComparer.OrdinalIgnoreCase);
@@ -73,9 +73,10 @@ public sealed class ActivityMonitorService : IDisposable
 
     public bool ProactiveMonitoringEnabled { get; set; } = true;
 
-    public ActivityMonitorService(PageIntentPredictorService pagePredictor, ILogger<ActivityMonitorService> logger)
+    public ActivityMonitorService(PageIntentPredictorService pagePredictor, UiLocalizer localizer, ILogger<ActivityMonitorService> logger)
     {
         _pagePredictor = pagePredictor;
+        _localizer = localizer;
         _logger = logger;
     }
 
@@ -106,10 +107,10 @@ public sealed class ActivityMonitorService : IDisposable
         return false;
     }
 
-    public (bool Ok, string Message) TryFillOtpInExternalWindow(string code, string? serviceHint = null)
+    public async Task<(bool Ok, string Message)> TryFillOtpInExternalWindowAsync(string code, string? serviceHint = null, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(code))
-            return (false, AppMessages.Localize("OtpEmpty", "Verification code is empty."));
+            return (false, await _localizer.TextAsync("OtpEmpty", "Verification code is empty.", Array.Empty<object?>(), ct));
 
         var targets = GetRecentExternalTargets();
         var target = targets.FirstOrDefault(t =>
@@ -118,13 +119,13 @@ public sealed class ActivityMonitorService : IDisposable
                      ?? targets.FirstOrDefault();
 
         if (target is null)
-            return (false, AppMessages.Localize("OtpTargetMissing", "No matching external browser or login window found."));
+            return (false, await _localizer.TextAsync("OtpTargetMissing", "No matching external browser or login window found.", Array.Empty<object?>(), ct));
 
         try
         {
             var root = AutomationElement.FromHandle(target.Hwnd);
             if (root is null)
-                return (false, AppMessages.Localize("OtpWindowInaccessible", "Cannot access target window UI."));
+                return (false, await _localizer.TextAsync("OtpWindowInaccessible", "Cannot access target window UI.", Array.Empty<object?>(), ct));
 
             var doc = root.FindFirst(
                 TreeScope.Descendants,
@@ -142,24 +143,24 @@ public sealed class ActivityMonitorService : IDisposable
             }
 
             if (chosen is null)
-                return (false, AppMessages.LocalizeFormat("OtpFieldNotFound", "No fillable input found in '{0}'; copied to clipboard instead.", Truncate(target.Title, 24)));
+                return (false, await _localizer.TextAsync("OtpFieldNotFound", "No fillable input found in '{0}'; copied to clipboard instead.", new object?[] { Truncate(target.Title, 24) }, ct));
 
             SetForegroundWindow(target.Hwnd);
             if (chosen.TryGetCurrentPattern(ValuePattern.Pattern, out var vpObj) && vpObj is ValuePattern vp && !vp.Current.IsReadOnly)
             {
                 vp.SetValue(code);
-                return (true, AppMessages.LocalizeFormat("OtpFilled", "Filled verification code {0} into '{1}' (not auto-submitted).", code, Truncate(target.Title, 24)));
+                return (true, await _localizer.TextAsync("OtpFilled", "Filled verification code {0} into '{1}' (not auto-submitted).", new object?[] { code, Truncate(target.Title, 24) }, ct));
             }
 
             chosen.SetFocus();
             System.Windows.Forms.SendKeys.SendWait("^a");
             System.Windows.Forms.SendKeys.SendWait(code);
-            return (true, AppMessages.LocalizeFormat("OtpTyped", "Entered verification code {0} into '{1}' (not auto-submitted).", code, Truncate(target.Title, 24)));
+            return (true, await _localizer.TextAsync("OtpTyped", "Entered verification code {0} into '{1}' (not auto-submitted).", new object?[] { code, Truncate(target.Title, 24) }, ct));
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "TryFillOtpInExternalWindow failed");
-            return (false, AppMessages.LocalizeFormat("OtpAutoFillFailed", "Auto-fill failed: {0}", ex.Message));
+            _logger.LogDebug(ex, "TryFillOtpInExternalWindowAsync failed");
+            return (false, await _localizer.TextAsync("OtpAutoFillFailed", "Auto-fill failed: {0}", new object?[] { ex.Message }, ct));
         }
     }
 
@@ -339,10 +340,15 @@ public sealed class ActivityMonitorService : IDisposable
                             {
                                 _suggestedForCurrentDwell = true;
                                 _titleCooldowns[title] = DateTimeOffset.UtcNow;
+                                var switchMsg = await _localizer.TextAsync(
+                                    "ActivitySwitchBack",
+                                    "Were you looking up info to fill into '{0}'? Want me to help organize or prefill it?",
+                                    new object?[] { Truncate(title, 30) },
+                                    ct);
                                 ProactiveSuggestionRaised?.Invoke(new ProactiveSuggestionEvent(
                                     "switch_back",
                                     enriched,
-                                    AppMessages.LocalizeFormat("ActivitySwitchBack", "Were you looking up info to fill into '{0}'? Want me to help organize or prefill it?", Truncate(title, 30))));
+                                    switchMsg));
                             }
                         }, ct);
                     }
@@ -364,10 +370,15 @@ public sealed class ActivityMonitorService : IDisposable
                         {
                             _suggestedForCurrentDwell = true;
                             _titleCooldowns[title] = now;
+                            var stuckMsg = await _localizer.TextAsync(
+                                "ActivityFormStuck",
+                                "Noticed you've been on '{0}' for a while. Need fill suggestions from memory?",
+                                new object?[] { Truncate(title, 30) },
+                                ct);
                             ProactiveSuggestionRaised?.Invoke(new ProactiveSuggestionEvent(
                                 "form_stuck",
                                 target,
-                                AppMessages.LocalizeFormat("ActivityFormStuck", "Noticed you've been on '{0}' for a while. Need fill suggestions from memory?", Truncate(title, 30))));
+                                stuckMsg));
                         }
                     }
                 }

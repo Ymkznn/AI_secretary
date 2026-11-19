@@ -9,7 +9,6 @@ using System.Threading.Channels;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
 using AiSecretary.Desktop.Prompts;
-using AiSecretary.Desktop.Resources;
 using Microsoft.Extensions.Configuration;
 
 namespace AiSecretary.Desktop.Services;
@@ -23,8 +22,9 @@ public sealed class TtsService : IDisposable
     private readonly IModelGateway _model;
     private readonly AppSettingsService _settings;
     private readonly StyleService _styles;
+    private readonly UiLocalizer _localizer;
     private readonly ILogger<TtsService> _logger;
-    private readonly Channel<(string Title, string Content, bool IsDirectJapanese, Action? OnBeforePlay)> _queue;
+    private readonly Channel<(string Title, string Content, bool IsDirectJapanese, SpeechKind Kind, Action? OnBeforePlay)> _queue;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _workerTask;
     private bool _weightsInitialized;
@@ -43,6 +43,7 @@ public sealed class TtsService : IDisposable
         IModelGateway model,
         AppSettingsService settings,
         StyleService styles,
+        UiLocalizer localizer,
         ILogger<TtsService> logger)
     {
         _http = httpFactory.CreateClient("TtsClient");
@@ -50,14 +51,15 @@ public sealed class TtsService : IDisposable
         _model = model;
         _settings = settings;
         _styles = styles;
+        _localizer = localizer;
         _logger = logger;
         var defProf = settings.Current.Tts.DefaultProfile;
         _voiceProfile = string.IsNullOrWhiteSpace(defProf) ? "default" : defProf.Trim().ToLowerInvariant();
         _loadedWeightGroup = GetWeightGroup(_voiceProfile);
 
-        _queue = Channel.CreateBounded<(string, string, bool, Action?)>(new BoundedChannelOptions(16)
+        _queue = Channel.CreateBounded<(string, string, bool, SpeechKind, Action?)>(new BoundedChannelOptions(16)
         {
-            FullMode = BoundedChannelFullMode.DropOldest,
+            FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true
         });
 
@@ -130,7 +132,7 @@ public sealed class TtsService : IDisposable
         }
 
         if (result.Count == 0)
-            return new[] { ("default", AppMessages.Localize("TtsDefaultVoice", "Default Voice")) };
+            return new[] { ("default", _localizer.TextCached("TtsDefaultVoice", "Default Voice")) };
 
         return result.Select(kv => (kv.Key, kv.Value)).ToList();
     }
@@ -141,7 +143,7 @@ public sealed class TtsService : IDisposable
         if (!string.IsNullOrWhiteSpace(custom))
             return custom;
 
-        return AppMessages.Localize("TtsTestPhrase", "Voice test completed. Ready whenever you are.");
+        return _localizer.TextCached("TtsTestPhrase", "Voice test completed. Ready whenever you are.");
     }
 
     private TtsVoiceProfileSettings? GetActiveProfileSettings()
@@ -294,19 +296,17 @@ public sealed class TtsService : IDisposable
         return idx > 0 ? profile[..idx] : profile;
     }
 
-    public void EnqueueSummarySpeech(string title, string content, Action? onBeforePlay = null)
+    public void EnqueueSummarySpeech(string title, string content, Action? onBeforePlay = null, SpeechKind kind = SpeechKind.Notification)
     {
         if (!IsEnabled || string.IsNullOrWhiteSpace(content) ||
             (ChatMode == "notify_only" &&
-             (string.Equals(title, AppMessages.Localize("AlertTitleReply", "AI Secretary Reply"), StringComparison.Ordinal) ||
-              string.Equals(title, AppMessages.Localize("AlertTitleReport", "AI Secretary Report"), StringComparison.Ordinal) ||
-              string.Equals(title, AppMessages.Localize("AlertTitleStatus", "AI Secretary Status"), StringComparison.Ordinal))))
+             kind is SpeechKind.ChatReply or SpeechKind.Report or SpeechKind.Status))
         {
             SafeInvoke(onBeforePlay);
             return;
         }
 
-        if (!_queue.Writer.TryWrite((title ?? "", content, false, onBeforePlay)))
+        if (!_queue.Writer.TryWrite((title ?? "", content, false, kind, onBeforePlay)))
             SafeInvoke(onBeforePlay);
     }
 
@@ -318,7 +318,7 @@ public sealed class TtsService : IDisposable
             return;
         }
 
-        if (!_queue.Writer.TryWrite(("", japaneseText, true, onBeforePlay)))
+        if (!_queue.Writer.TryWrite(("", japaneseText, true, SpeechKind.ChatReply, onBeforePlay)))
             SafeInvoke(onBeforePlay);
     }
 
@@ -332,7 +332,7 @@ public sealed class TtsService : IDisposable
     {
         try
         {
-            await foreach (var (title, content, isDirect, onBeforePlay) in _queue.Reader.ReadAllAsync(ct))
+            await foreach (var (title, content, isDirect, kind, onBeforePlay) in _queue.Reader.ReadAllAsync(ct))
             {
                 bool revealed = false;
                 void RevealOnce()
@@ -348,7 +348,7 @@ public sealed class TtsService : IDisposable
                     var speechLang = TargetLang;
                     var jaText = isDirect
                         ? CleanSpokenText(content, ChatMode == "full" ? 800 : 240, speechLang == "ja", GetPronunciationMap())
-                        : await ToSpeechTextAsync(title, content, ct);
+                        : await ToSpeechTextAsync(title, content, kind, ct);
                     var llmMs = sw.ElapsedMilliseconds;
 
                     if (string.IsNullOrWhiteSpace(jaText))
@@ -396,10 +396,10 @@ public sealed class TtsService : IDisposable
         };
     }
 
-    private async Task<string> ToSpeechTextAsync(string title, string content, CancellationToken ct)
+    private async Task<string> ToSpeechTextAsync(string title, string content, SpeechKind kind, CancellationToken ct)
     {
         var lang = TargetLang;
-        var isChatReply = string.Equals(title, AppMessages.Localize("AlertTitleReply", "AI Secretary Reply"), StringComparison.Ordinal);
+        var isChatReply = kind == SpeechKind.ChatReply;
         var mode = ChatMode;
         bool fullTranslation = mode == "full" ||
             (mode == "smart" && isChatReply && IsShortPlainReply(content));
@@ -459,11 +459,11 @@ public sealed class TtsService : IDisposable
     {
         var combined = $"{title} {content}";
         bool isMail = combined.Contains("mail", StringComparison.OrdinalIgnoreCase) ||
-                      combined.Contains(AppMessages.Localize("TtsKeywordMail", "email"), StringComparison.OrdinalIgnoreCase);
+                      combined.Contains(_localizer.TextCached("TtsKeywordMail", "email"), StringComparison.OrdinalIgnoreCase);
         bool isSchedule = combined.Contains("schedule", StringComparison.OrdinalIgnoreCase) ||
                           combined.Contains("reminder", StringComparison.OrdinalIgnoreCase) ||
                           combined.Contains("meeting", StringComparison.OrdinalIgnoreCase) ||
-                          combined.Contains(AppMessages.Localize("TtsKeywordSchedule", "reminder"), StringComparison.OrdinalIgnoreCase);
+                          combined.Contains(_localizer.TextCached("TtsKeywordSchedule", "reminder"), StringComparison.OrdinalIgnoreCase);
 
         var kind = isMail ? "mail" : isSchedule ? "schedule" : "done";
         var mdFallback = _styles.GetActiveTtsFallbackPhrase(kind);
@@ -476,9 +476,9 @@ public sealed class TtsService : IDisposable
             if (isSchedule) return "You have an upcoming schedule reminder.";
             return "Done. Please check the screen.";
         }
-        if (isMail) return AppMessages.Localize("TtsFallbackMail", "You have a new email notification.");
-        if (isSchedule) return AppMessages.Localize("TtsFallbackSchedule", "You have an upcoming schedule reminder.");
-        return AppMessages.Localize("TtsFallbackDone", "Done. Please check the screen.");
+        if (isMail) return _localizer.TextCached("TtsFallbackMail", "You have a new email notification.");
+        if (isSchedule) return _localizer.TextCached("TtsFallbackSchedule", "You have an upcoming schedule reminder.");
+        return _localizer.TextCached("TtsFallbackDone", "Done. Please check the screen.");
     }
 
     private Dictionary<string, string> GetPronunciationMap()

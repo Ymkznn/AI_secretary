@@ -2,7 +2,6 @@ using System.Text.Json;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
 using AiSecretary.Desktop.Prompts;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 using AiSecretary.Desktop.Skills;
 
@@ -22,8 +21,8 @@ public sealed class MainAgent
     private readonly WorkerAgent _worker;
     private readonly StyleService _styles;
     private readonly TtsService _tts;
-    private readonly GuardService _guard;
     private readonly SkillRegistry _skillRegistry;
+    private readonly UiLocalizer _localizer;
     private readonly AppSettingsService _settings;
     private readonly ILogger<MainAgent> _logger;
 
@@ -35,8 +34,8 @@ public sealed class MainAgent
         WorkerAgent worker,
         StyleService styles,
         TtsService tts,
-        GuardService guard,
         SkillRegistry skillRegistry,
+        UiLocalizer localizer,
         AppSettingsService settings,
         ILogger<MainAgent> logger)
     {
@@ -47,8 +46,8 @@ public sealed class MainAgent
         _worker = worker;
         _styles = styles;
         _tts = tts;
-        _guard = guard;
         _skillRegistry = skillRegistry;
+        _localizer = localizer;
         _settings = settings;
         _logger = logger;
     }
@@ -81,7 +80,7 @@ public sealed class MainAgent
         Action<string>? onClosePlannerTask = null,
         string? preferredLogicalTaskId = null)
     {
-        onStageChanged?.Invoke("main", AppMessages.StageMainRouting);
+        onStageChanged?.Invoke("main", _localizer.TextCached("StageMainRouting", "MainAgent analyzing intent and routing..."));
         var mainSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Main", ct: ct);
 
         var recent = await _store.GetChatMessagesAsync(conversationId, 80, ct);
@@ -97,8 +96,7 @@ public sealed class MainAgent
             ? ""
             : $"\nPrevious stage handoff: {mainSession.HandoffJson}";
 
-        var enabledSpecs = _skillRegistry.GetMainAgentSpecs()
-            .Where(s => _guard.IsSkillEnabled(s.Name))
+        var enabledSpecs = _skillRegistry.GetEnabledMainAgentSpecs()
             .Select((s, idx) => $"{idx + 1}. {s.Spec.TrimEnd()}");
         var skillsBlock = enabledSpecs.Any()
             ? string.Join("\n\n", enabledSpecs)
@@ -156,7 +154,7 @@ public sealed class MainAgent
             if (!string.IsNullOrWhiteSpace(closeTaskId))
                 onClosePlannerTask?.Invoke(closeTaskId);
 
-            onStageChanged?.Invoke("main_done", AppMessages.StageMainDone);
+            onStageChanged?.Invoke("main_done", _localizer.TextCached("StageMainDone", "MainAgent replied directly"));
             if (choices.Count > 0)
                 onChoices?.Invoke(choices);
             if (!string.IsNullOrWhiteSpace(ttsText))
@@ -167,10 +165,12 @@ public sealed class MainAgent
 
         if (action == "run_skill" && !string.IsNullOrWhiteSpace(skill))
         {
-            var dispatchNote = !string.IsNullOrWhiteSpace(ack) ? ack : AppMessages.DispatchSkillAck(skill);
+            var dispatchNote = !string.IsNullOrWhiteSpace(ack)
+                ? ack
+                : await _localizer.TextAsync("DefaultDispatchAck", "Working on it...", Array.Empty<object?>(), ct);
             if (onDispatchBackground is not null)
             {
-                onStageChanged?.Invoke("worker", AppMessages.StageWorkerDispatch(skill, tier.ToString()));
+                onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerDispatch", "MainAgent dispatched Worker ({0}, {1})", skill, tier.ToString()));
                 if (!string.IsNullOrWhiteSpace(ttsText))
                     onDirectTtsText?.Invoke(ttsText);
                 await onReplyAsync(dispatchNote, new List<MailSourceRef>());
@@ -179,17 +179,17 @@ public sealed class MainAgent
                 {
                     var (handled, summary, sources) = await _worker.ExecuteSingleSkillAsync(
                         conversationId, userPrompt, skill, args, targetMailId, confirmAsync,
-                        s => { onStageChanged?.Invoke("worker", s); return Task.CompletedTask; },
+                        async s => { onStageChanged?.Invoke("worker", s); await onStatusAsync(s); },
                         tier, bgCt, bgDirectTtsText, bgChoices);
                     if (handled)
                     {
                         onSingleSkillFinished?.Invoke(taskId);
-                        onStageChanged?.Invoke("worker_done", AppMessages.StageWorkerDone(skill));
+                        onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
                         await bgReplyAsync(summary, sources);
                         return;
                     }
 
-                    onStageChanged?.Invoke("planner", AppMessages.StagePlannerPlanning(tier.ToString()));
+                    onStageChanged?.Invoke("planner", _localizer.TextCached("StagePlannerPlanning", "MainAgent -> Planner ({0})...", tier.ToString()));
                     var plannerTaskId = resolveLogicalTaskId is not null
                         ? resolveLogicalTaskId("call_planner", targetTaskId, effectiveGoal)
                         : taskId;
@@ -201,7 +201,7 @@ public sealed class MainAgent
                         userPrompt,
                         targetMailId,
                         confirmAsync,
-                        s => { onStageChanged?.Invoke("planner", s); return Task.CompletedTask; },
+                        async s => { onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
                         bgReplyAsync,
                         onStageChanged,
                         tier,
@@ -219,14 +219,14 @@ public sealed class MainAgent
             Func<string, Task> workerStatusAsync = s =>
                 string.Equals(s, dispatchNote, StringComparison.Ordinal)
                     ? onStatusAsync(s)
-                    : onStatusAsync(AppMessages.ProgressStatus(dispatchNote, s));
-            onStageChanged?.Invoke("worker", AppMessages.StageWorkerDispatch(skill, tier.ToString()));
+                    : onStatusAsync($"{dispatchNote} ({s})");
+            onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerDispatch", "MainAgent dispatched Worker ({0}, {1})", skill, tier.ToString()));
             var (handledSync, summarySync, sourcesSync) = await _worker.ExecuteSingleSkillAsync(
                 conversationId, userPrompt, skill, args, targetMailId, confirmAsync, workerStatusAsync, tier, ct, onDirectTtsText, onChoices);
             if (handledSync)
             {
                 onSingleSkillFinished?.Invoke(taskId);
-                onStageChanged?.Invoke("main_done", AppMessages.StageWorkerDone(skill));
+                onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
                 await onReplyAsync(summarySync, sourcesSync);
                 return;
             }
@@ -235,10 +235,12 @@ public sealed class MainAgent
         var logicalTaskId = resolveLogicalTaskId is not null
             ? resolveLogicalTaskId("call_planner", targetTaskId, effectiveGoal)
             : taskId;
-        var plannerNote = !string.IsNullOrWhiteSpace(ack) ? ack : AppMessages.DispatchPlannerAck(goal);
+        var plannerNote = !string.IsNullOrWhiteSpace(ack)
+            ? ack
+            : await _localizer.TextAsync("DefaultPlannerAck", "Planning the steps...", Array.Empty<object?>(), ct);
         if (onDispatchBackground is not null)
         {
-            onStageChanged?.Invoke("planner", AppMessages.StagePlannerPlanning(tier.ToString()));
+            onStageChanged?.Invoke("planner", _localizer.TextCached("StagePlannerPlanning", "MainAgent -> Planner ({0})...", tier.ToString()));
             if (!string.IsNullOrWhiteSpace(ttsText))
                 onDirectTtsText?.Invoke(ttsText);
             await onReplyAsync(plannerNote, new List<MailSourceRef>());
@@ -253,7 +255,7 @@ public sealed class MainAgent
                     userPrompt,
                     targetMailId,
                     confirmAsync,
-                    s => { onStageChanged?.Invoke("planner", s); return Task.CompletedTask; },
+                    async s => { onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
                     bgReplyAsync,
                     onStageChanged,
                     tier,
@@ -266,13 +268,13 @@ public sealed class MainAgent
             return;
         }
 
-        onStageChanged?.Invoke("planner", AppMessages.StagePlannerPlanning(tier.ToString()));
+        onStageChanged?.Invoke("planner", _localizer.TextCached("StagePlannerPlanning", "MainAgent -> Planner ({0})...", tier.ToString()));
         await onStatusAsync(plannerNote);
         SpeakDispatchAck(plannerNote, ttsText);
         Func<string, Task> plannerStatusAsync = s =>
             string.Equals(s, plannerNote, StringComparison.Ordinal)
                 ? onStatusAsync(s)
-                : onStatusAsync(AppMessages.ProgressStatus(plannerNote, s));
+                : onStatusAsync($"{plannerNote} ({s})");
         bool syncDone = true;
         await _planner.ExecuteGoalAsync(
             conversationId,
@@ -298,21 +300,23 @@ public sealed class MainAgent
     public async Task<(string? Reply, string? TtsText)> GenerateProactiveStyleLineAsync(
         string conversationId,
         IReadOnlyList<string> pinnedTitles,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        string? activeWindow = null)
     {
         var activeStylePrompt = _tts.GetActiveStylePrompt() ?? _styles.GetActiveStylePrompt();
         if (string.IsNullOrWhiteSpace(activeStylePrompt))
             return (null, null);
 
-        var recent = await _store.GetChatMessagesAsync(conversationId, 8, ct);
-        var history = BuildRecentHistory(recent, maxMessages: 4, perMessageMaxChars: 400, totalMaxChars: 1200);
+        var recent = await _store.GetChatMessagesAsync(conversationId, 20, ct);
+        var history = BuildRecentHistory(recent, maxMessages: 15, perMessageMaxChars: 400, totalMaxChars: 4500);
         var pinnedText = pinnedTitles.Count == 0 ? "(None)" : string.Join(", ", pinnedTitles);
         var ttsEnabled = _tts.IsEnabled && _tts.ChatMode != "notify_only";
         var sys = MainAgentPrompts.BuildProactiveSystemPrompt(activeStylePrompt, _tts.ChatMode == "full", _tts.TargetLang, GetReplyLanguage(), ttsEnabled);
         var user = MainAgentPrompts.BuildProactiveUserPrompt(
             DateTimeOffset.Now,
             pinnedText,
-            string.IsNullOrWhiteSpace(history) ? "(None)" : history);
+            string.IsNullOrWhiteSpace(history) ? "(None)" : history,
+            activeWindow);
 
         try
         {
@@ -348,7 +352,7 @@ public sealed class MainAgent
         if (!string.IsNullOrWhiteSpace(ttsText))
             _tts.EnqueueJapaneseSpeech(ttsText);
         else if (!string.IsNullOrWhiteSpace(ackText))
-            _tts.EnqueueSummarySpeech(AppMessages.StatusSpeechTitle, ackText);
+            _tts.EnqueueSummarySpeech(_localizer.TextCached("AlertTitleStatus", "AI Secretary Status"), ackText, kind: SpeechKind.Status);
     }
 
     /// <summary>解析路由模型輸出的 JSON 指令；若解析失敗則安全退回複雜 Planner 模式。</summary>
@@ -438,12 +442,18 @@ public sealed class MainAgent
             .TakeLast(maxMessages)
             .ToList();
 
-        if (!string.IsNullOrWhiteSpace(excludeTrailingUserPrompt) &&
-            eligible.Count > 0 &&
-            eligible[^1].Role == "user" &&
-            string.Equals(eligible[^1].Content.Trim(), excludeTrailingUserPrompt.Trim(), StringComparison.Ordinal))
+        if (!string.IsNullOrWhiteSpace(excludeTrailingUserPrompt) && eligible.Count > 0)
         {
-            eligible.RemoveAt(eligible.Count - 1);
+            var trimmedTarget = excludeTrailingUserPrompt.Trim();
+            for (int i = eligible.Count - 1; i >= Math.Max(0, eligible.Count - 6); i--)
+            {
+                if (eligible[i].Role == "user" &&
+                    string.Equals(eligible[i].Content.Trim(), trimmedTarget, StringComparison.Ordinal))
+                {
+                    eligible.RemoveAt(i);
+                    break;
+                }
+            }
         }
 
         var selected = new List<(string Role, string Content)>(eligible.Count);
@@ -451,9 +461,12 @@ public sealed class MainAgent
         for (int i = eligible.Count - 1; i >= 0; i--)
         {
             var m = eligible[i];
-            var role = m.Role == "assistant" ? "assistant" : "user";
+            var role = m.Role == "user" ? "user" : "assistant";
+            var rawContent = m.Role == "notification"
+                ? $"[System Notification] {m.Content}"
+                : m.Content;
             var content = AttachmentExtractor.AttachmentPattern.Replace(
-                m.Content,
+                rawContent,
                 match =>
                 {
                     var name = Path.GetFileName(match.Groups[1].Value.Trim());
@@ -528,7 +541,7 @@ public sealed class MainAgent
         for (int j = userIndex + 1; j < eligible.Count; j++)
         {
             if (eligible[j].Role == "assistant")
-                return eligible[j].Content.TrimStart().StartsWith(AppMessages.ErrorPrefix, StringComparison.Ordinal);
+                return eligible[j].Content.TrimStart().StartsWith("❌", StringComparison.Ordinal);
             if (eligible[j].Role == "user")
                 return false;
         }

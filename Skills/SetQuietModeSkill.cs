@@ -1,5 +1,4 @@
 using AiSecretary.Desktop.Agent;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -14,6 +13,7 @@ public sealed class SetQuietModeSkill : IBasicSkill
 
     public string Name => "set_quiet_mode";
     public string DisplayDescription => "Enable or disable Do-Not-Disturb quiet mode";
+    public string StatusText => "Updating quiet mode...";
     public string MainAgentSpec => """
             set_quiet_mode
                - Purpose: Enable or disable Do-Not-Disturb quiet mode.
@@ -28,7 +28,8 @@ public sealed class SetQuietModeSkill : IBasicSkill
         DateTimeOffset? until = DateTimeOffset.TryParse(untilRaw, out var parsedUntil) ? parsedUntil : null;
         var allowUrgent = !string.Equals(ctx.GetArg("allow_urgent"), "false", StringComparison.OrdinalIgnoreCase);
         var reason = ctx.GetArg("reason");
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Updating quiet mode..."));
+        var skillName = ctx.EffectiveName(Name);
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
         var (msg, upcoming) = await _skills.SetQuietModeAsync(until, allowUrgent, reason, ctx.Ct);
         if (upcoming.Count > 0)
         {
@@ -39,6 +40,6 @@ public sealed class SetQuietModeSkill : IBasicSkill
         {
             ctx.Observations.Add(msg);
         }
-        ctx.CompletedSteps.Add("set_quiet_mode");
+        ctx.CompletedSteps.Add(skillName);
     }
 }

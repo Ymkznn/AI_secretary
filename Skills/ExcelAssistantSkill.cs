@@ -1,7 +1,6 @@
 using System.Text.Json;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Skills;
@@ -26,6 +25,7 @@ public sealed class ExcelAssistantSkill : IBasicSkill
 
     public string Name => "excel_assistant";
     public string DisplayDescription => "Inspect, read, or write cells/formulas in Excel";
+    public string StatusText => "Processing Excel workbook...";
     public string MainAgentSpec => """
             excel_assistant
                - Purpose: Inspect active Excel workbook selection/headers/formulas or safely write cells/formulas (backup + confirmation required).
@@ -36,8 +36,9 @@ public sealed class ExcelAssistantSkill : IBasicSkill
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
+        var skillName = ctx.EffectiveName(Name);
         var action = (ctx.GetArg("action") ?? "inspect_selection").Trim().ToLowerInvariant();
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Processing Excel workbook..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
 
         if (action == "inspect_selection")
         {
@@ -48,20 +49,20 @@ public sealed class ExcelAssistantSkill : IBasicSkill
                 return;
             }
 
-            if (!await _skills.EnsureExternalPathAccessAsync(filePath, Name, ctx.ConfirmAsync))
+            if (!await _skills.EnsureExternalPathAccessAsync(filePath, skillName, ctx.ConfirmAsync, ctx.Ct))
             {
-                ctx.Observations.Add($"excel_assistant: user denied read permission for {filePath}.");
+                ctx.Observations.Add($"{skillName}: user denied read permission for {filePath}.");
                 return;
             }
 
             ctx.Observations.Add(summary);
-            ctx.CompletedSteps.Add("excel_assistant:inspect_selection");
+            ctx.CompletedSteps.Add($"{skillName}:inspect_selection");
             return;
         }
 
         if (action != "write_cells")
         {
-            ctx.Observations.Add($"excel_assistant: unsupported action '{action}'.");
+            ctx.Observations.Add($"{skillName}: unsupported action '{action}'.");
             return;
         }
 
@@ -76,7 +77,7 @@ public sealed class ExcelAssistantSkill : IBasicSkill
                 var val = item.TryGetProperty("value", out var vEl) ? vEl.GetString() ?? "" : "";
                 if (!string.IsNullOrWhiteSpace(cell))
                 {
-                    var fCheck = _guard.CheckExcelFormula(val);
+                    var fCheck = _guard.CheckExcelFormula(val, skillName);
                     if (!fCheck.Allowed)
                     {
                         ctx.Observations.Add($"excel_assistant: blocked unsafe formula: {fCheck.Reason}");
@@ -94,9 +95,13 @@ public sealed class ExcelAssistantSkill : IBasicSkill
         }
 
         var preview = string.Join("\n", writes.Take(10).Select(w => $"- {w.Cell} = {w.Value}"));
-        var approved = await ctx.ConfirmAsync(
-            "Excel Write Confirmation",
-            $"Write {writes.Count} cell(s) to the active Excel sheet (backup created automatically):\n\n{preview}");
+        var confirmTitle = await ctx.TextAsync("confirm_excel_write_title", "Excel Write Confirmation");
+        var confirmBody = await ctx.TextAsync(
+            "confirm_excel_write_body",
+            "Write {0} cell(s) to the active Excel sheet (backup created automatically):\n\n{1}",
+            writes.Count,
+            preview);
+        var approved = await ctx.ConfirmAsync(confirmTitle, confirmBody);
         if (!approved)
         {
             ctx.Observations.Add("excel_assistant: user declined write.");

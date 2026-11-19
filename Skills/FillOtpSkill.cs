@@ -1,5 +1,4 @@
 using AiSecretary.Desktop.Agent;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Skills;
@@ -26,6 +25,7 @@ public sealed class FillOtpSkill : IBasicSkill
 
     public string Name => "fill_otp";
     public string DisplayDescription => "Fill OTP verification code into active browser/app";
+    public string StatusText => "Filling verification code...";
     public string MainAgentSpec => """
             fill_otp
                - Purpose: Fill an OTP/verification code into the active browser verification page via Extension DOM (or UIA fallback), never auto-submitting.
@@ -51,21 +51,22 @@ public sealed class FillOtpSkill : IBasicSkill
         if (string.IsNullOrWhiteSpace(hint) || hint.Contains("{{", StringComparison.Ordinal))
             hint = ev?.Title ?? _skills.LastObservedOtpHint;
 
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Filling verification code..."));
+        var skillName = ctx.EffectiveName(Name);
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
         var extRes = await _browserBridge.RequestFillOtpAsync(code, TimeSpan.FromMilliseconds(1500), ctx.Ct);
         if (extRes is { Filled: true })
         {
             var title = string.IsNullOrWhiteSpace(extRes.Title) ? "browser tab" : extRes.Title.Trim();
-            ctx.Observations.Add($"fill_otp succeeded via Browser Extension ({extRes.Mode ?? "dom"}) on \"{title}\" (code={code}, not submitted).");
-            ctx.CompletedSteps.Add("fill_otp");
+            ctx.Observations.Add($"{skillName} succeeded via Browser Extension ({extRes.Mode ?? "dom"}) on \"{title}\" (code={code}, not submitted).");
+            ctx.CompletedSteps.Add(skillName);
             return;
         }
 
-        var (ok, msg) = _activity.TryFillOtpInExternalWindow(code, hint);
+        var (ok, msg) = await _activity.TryFillOtpInExternalWindowAsync(code, hint, ctx.Ct);
         ctx.Observations.Add(ok
-            ? $"fill_otp succeeded via UIA: {msg}"
-            : $"fill_otp failed: {msg}");
+            ? $"{skillName} succeeded via UIA: {msg}"
+            : $"{skillName} failed: {msg}");
         if (ok)
-            ctx.CompletedSteps.Add("fill_otp");
+            ctx.CompletedSteps.Add(skillName);
     }
 }

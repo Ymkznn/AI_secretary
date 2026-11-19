@@ -1,8 +1,8 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 using AiSecretary.Desktop.Skills;
 using Microsoft.Extensions.DependencyInjection;
@@ -33,8 +33,8 @@ public sealed class SkillRuntime
     private readonly AppLauncherService _appLauncher;
     private readonly ScreenCaptureService _screenCapture;
     private readonly SandboxService _sandbox;
-    private readonly GuardService _guard;
     private readonly SqliteStore _store;
+    private readonly UiLocalizer _localizer;
     private readonly IServiceProvider _services;
     private readonly ILogger<SkillRuntime> _logger;
 
@@ -64,8 +64,8 @@ public sealed class SkillRuntime
         AppLauncherService appLauncher,
         ScreenCaptureService screenCapture,
         SandboxService sandbox,
-        GuardService guard,
         SqliteStore store,
+        UiLocalizer localizer,
         IServiceProvider services,
         ILogger<SkillRuntime> logger)
     {
@@ -74,8 +74,8 @@ public sealed class SkillRuntime
         _appLauncher = appLauncher;
         _screenCapture = screenCapture;
         _sandbox = sandbox;
-        _guard = guard;
         _store = store;
+        _localizer = localizer;
         _services = services;
         _logger = logger;
     }
@@ -85,65 +85,36 @@ public sealed class SkillRuntime
         var registry = _services.GetRequiredService<SkillRegistry>();
         foreach (var skill in registry.All)
         {
-            var check = _guard.CheckSkillExecution(skill.Name);
-            _logger.LogInformation("Startup Skill Validation [{Skill}]: Allowed={Allowed}", skill.Name, check.Allowed);
+            _logger.LogInformation("Startup Skill Catalog [{Kind}:{Skill}]: Enabled={Enabled}", skill.Kind, skill.Name, skill.IsEnabled);
         }
     }
 
-    public IReadOnlyList<SkillMenuEntry> GetBuiltInSkills()
-        => _services.GetRequiredService<SkillRegistry>().GetMenuEntries(_guard.IsSkillEnabled);
+    public Task<IReadOnlyList<MailItem>> ReadInboxAsync(string? query = null, int? maxResults = null, CancellationToken ct = default)
+        => _mailBroker.FetchRecentMailsAsync(null, ct, query, maxResults);
 
-    public async Task<IReadOnlyList<MailItem>> ReadInboxAsync(string? query = null, int? maxResults = null, CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_mail");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _mailBroker.FetchRecentMailsAsync(null, ct, query, maxResults);
-    }
+    public Task<MailItem?> GetMailDetailAsync(string mailId, CancellationToken ct = default)
+        => _mailBroker.GetMailByIdAsync(mailId, ct);
 
-    public async Task<MailItem?> GetMailDetailAsync(string mailId, CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_mail");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _mailBroker.GetMailByIdAsync(mailId, ct);
-    }
+    public Task<IReadOnlyList<MailItem>> ReadGmailAsync(string? query = null, int? maxResults = null, CancellationToken ct = default)
+        => _gmail.ReadInboxAsync(query, maxResults, ct);
 
-    public async Task<IReadOnlyList<MailItem>> ReadGmailAsync(string? query = null, int? maxResults = null, CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_mail");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _gmail.ReadInboxAsync(query, maxResults, ct);
-    }
-
-    public async Task<MailItem?> GetGmailDetailAsync(string messageId, CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_mail");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _gmail.GetMailDetailAsync(messageId, ct);
-    }
+    public Task<MailItem?> GetGmailDetailAsync(string messageId, CancellationToken ct = default)
+        => _gmail.GetMailDetailAsync(messageId, ct);
 
     public async Task<string> SyncMailAsync(string conversationId, string? source = null, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_mail");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         if (SyncMailRequested is null)
-            return "sync_mail: service not initialized.";
+            return "mail sync service is not initialized.";
         return await SyncMailRequested(conversationId, source ?? "all", ct);
     }
 
     /// <summary>啟動指定的本機應用程式。</summary>
     public AppLaunchResult LaunchApp(string appName, string? arguments = null)
-    {
-        var check = _guard.CheckSkillExecution("launch_app");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return _appLauncher.Launch(appName, arguments);
-    }
+        => _appLauncher.Launch(appName, arguments);
 
     /// <summary>列出目前可視視窗，或擷取指定視窗／螢幕畫面。</summary>
     public (bool Ok, string Message, string? FilePath, IReadOnlyList<(string ProcessName, string Title)> Windows) InspectScreen(string mode = "capture", string? windowTitle = null)
     {
-        var check = _guard.CheckSkillExecution("inspect_screen");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-
         var wins = _screenCapture.ListOpenWindows();
         if (mode.Equals("list", StringComparison.OrdinalIgnoreCase))
             return (true, "Listed open windows.", null, wins);
@@ -155,14 +126,15 @@ public sealed class SkillRuntime
     public async Task<bool> EnsureExternalPathAccessAsync(
         string? filePath,
         string skillName,
-        Func<string, string, Task<bool>> confirmAsync)
+        Func<string, string, Task<bool>> confirmAsync,
+        CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(filePath) || !Path.IsPathRooted(filePath) || _sandbox.IsPathInsideSandbox(filePath))
             return true;
 
-        var title = Resources.AppMessages.Localize("path_perm_title", "External File Access");
-        var body = Resources.AppMessages.Localize($"path_perm_body:{skillName}", $"Allow {skillName} to access this file outside sandbox:");
-        var perm = await RequestPathPermissionAsync(title, body, filePath, confirmAsync);
+        var title = await _localizer.TextAsync("path_perm_title", "External File Access", Array.Empty<object?>(), ct);
+        var body = await _localizer.TextAsync($"path_perm_body:{skillName}", $"Allow {skillName} to access this file outside sandbox:", Array.Empty<object?>(), ct);
+        var perm = await RequestPathPermissionAsync(title, body, filePath, confirmAsync, ct);
         return perm != PathPermissionDecision.Deny;
     }
 
@@ -170,7 +142,8 @@ public sealed class SkillRuntime
         string title,
         string message,
         string targetPath,
-        Func<string, string, Task<bool>> fallbackConfirmAsync)
+        Func<string, string, Task<bool>> fallbackConfirmAsync,
+        CancellationToken ct = default)
     {
         if (_sandbox.IsPathInsideSandbox(targetPath))
             return PathPermissionDecision.AllowOnce;
@@ -187,25 +160,20 @@ public sealed class SkillRuntime
             return decision;
         }
 
-        var approved = await fallbackConfirmAsync(title, AppMessages.FallbackConfirmSuffix(message, targetPath));
+        var promptText = await _localizer.TextAsync("FallbackConfirmSuffix", "{0}\n{1}\n\nApprove?", new object?[] { message, targetPath }, ct);
+        var approved = await fallbackConfirmAsync(title, promptText);
         return approved ? PathPermissionDecision.AllowOnce : PathPermissionDecision.Deny;
     }
 
     /// <summary>立即將指定提醒釘選至對話框置頂欄。</summary>
     public void PinReminderNow(string title, string message, int reRemindMinutes = 15)
-    {
-        var check = _guard.CheckSkillExecution("manage_schedule");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        PinReminderRequested?.Invoke(title, message, reRemindMinutes);
-    }
+        => PinReminderRequested?.Invoke(title, message, reRemindMinutes);
 
     /// <summary>依關鍵字解除置頂提醒。</summary>
-    public async Task<string> DismissPinnedReminderAsync(string keyword)
+    public async Task<string> DismissPinnedReminderAsync(string keyword, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("dismiss_reminder");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         if (DismissPinnedReminderRequested is null)
-            return AppMessages.CannotDismissPinnedReminder;
+            return await _localizer.TextAsync("CannotDismissPinnedReminder", "Cannot dismiss pinned reminder right now.", Array.Empty<object?>(), ct);
         return await DismissPinnedReminderRequested.Invoke(keyword ?? "");
     }
 
@@ -225,9 +193,6 @@ public sealed class SkillRuntime
     {
         var hasRule = RecurrenceHelper.IsRecurring(recurrenceRule);
         var normRule = hasRule ? RecurrenceHelper.Normalize(recurrenceRule) : null;
-        var skillKey = intervalMinutes > 0 || hasRule || !string.IsNullOrWhiteSpace(skillName) ? "create_schedule" : "create_reminder";
-        var check = _guard.CheckSkillExecution(skillKey);
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
 
         var rec = new ReminderRecord(
             ReminderId: Guid.NewGuid().ToString("N"),
@@ -250,11 +215,7 @@ public sealed class SkillRuntime
     }
 
     public async Task<IReadOnlyList<ReminderRecord>> ListSchedulesAsync(CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_schedule");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _store.GetPendingRemindersAsync(ct);
-    }
+        => await _store.GetPendingRemindersAsync(ct);
 
     public async Task<ReminderRecord?> UpdateScheduleAsync(
         string idOrKeyword,
@@ -266,9 +227,6 @@ public sealed class SkillRuntime
         string? skillArgsJson = null,
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_schedule");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-
         var pending = await _store.GetPendingRemindersAsync(ct);
         var key = idOrKeyword?.Trim() ?? "";
         var target = pending.FirstOrDefault(r => r.ReminderId.Equals(key, StringComparison.OrdinalIgnoreCase))
@@ -293,9 +251,6 @@ public sealed class SkillRuntime
         List<string>? tags = null,
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_facts");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-
         var normalizedConfidence = string.Equals(confidence, "inferred", StringComparison.OrdinalIgnoreCase)
             ? "inferred"
             : "observed";
@@ -322,30 +277,19 @@ public sealed class SkillRuntime
         return fact;
     }
 
-    public async Task<List<FactSummaryItem>> SearchFactsAsync(
+    public Task<List<FactSummaryItem>> SearchFactsAsync(
         string conversationId,
         string? keyword = null,
         string? category = null,
         int limit = 10,
         CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_facts");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _store.ListFactsAsync(conversationId, keyword, category, limit, ct);
-    }
+        => _store.ListFactsAsync(conversationId, keyword, category, limit, ct);
 
-    public async Task<KnowledgeFactRecord?> GetFactDetailAsync(string factId, CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_facts");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _store.GetFactDetailAsync(factId, ct);
-    }
+    public Task<KnowledgeFactRecord?> GetFactDetailAsync(string factId, CancellationToken ct = default)
+        => _store.GetFactDetailAsync(factId, ct);
 
     public async Task<bool> DeleteScheduleAsync(string idOrKeyword, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_schedule");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-
         var pending = await _store.GetPendingRemindersAsync(ct);
         var key = idOrKeyword?.Trim() ?? "";
         var target = pending.FirstOrDefault(r => r.ReminderId.Equals(key, StringComparison.OrdinalIgnoreCase))
@@ -366,8 +310,6 @@ public sealed class SkillRuntime
         string conversationId = "",
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_facts");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         var ok = await _store.UpdateFactAsync(factId, summary, detail, category, evidence, ct);
         if (ok && !string.IsNullOrWhiteSpace(conversationId))
             FactModified?.Invoke(conversationId, factId);
@@ -376,8 +318,6 @@ public sealed class SkillRuntime
 
     public async Task<bool> DeleteFactAsync(string factId, string conversationId = "", CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_facts");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         var ok = await _store.DeleteFactAsync(factId, ct);
         if (ok && !string.IsNullOrWhiteSpace(conversationId))
             FactModified?.Invoke(conversationId, factId);
@@ -392,9 +332,6 @@ public sealed class SkillRuntime
         string? sourceFactId = null,
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_facts");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-
         var now = DateTimeOffset.UtcNow;
         var rec = new MemoryAnnotationRecord(
             AnnotationId: "ann-" + Guid.NewGuid().ToString("N")[..8],
@@ -409,52 +346,32 @@ public sealed class SkillRuntime
         return rec;
     }
 
-    public async Task<List<MemoryAnnotationRecord>> ListAnnotationsAsync(
+    public Task<List<MemoryAnnotationRecord>> ListAnnotationsAsync(
         string? targetType = null,
         string? targetId = null,
         CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_facts");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _store.GetMemoryAnnotationsAsync(targetType, targetId, sourceFactId: null, ct);
-    }
+        => _store.GetMemoryAnnotationsAsync(targetType, targetId, sourceFactId: null, ct);
 
-    public async Task<bool> UpdateAnnotationAsync(string annotationId, string note, CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_facts");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _store.UpdateMemoryAnnotationAsync(annotationId, note, ct);
-    }
+    public Task<bool> UpdateAnnotationAsync(string annotationId, string note, CancellationToken ct = default)
+        => _store.UpdateMemoryAnnotationAsync(annotationId, note, ct);
 
-    public async Task<bool> DeleteAnnotationAsync(string annotationId, CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_facts");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _store.DeleteMemoryAnnotationAsync(annotationId, ct);
-    }
+    public Task<bool> DeleteAnnotationAsync(string annotationId, CancellationToken ct = default)
+        => _store.DeleteMemoryAnnotationAsync(annotationId, ct);
 
-    public async Task<List<CalendarEventRecord>> ListCalendarEventsAsync(
+    public Task<List<CalendarEventRecord>> ListCalendarEventsAsync(
         string conversationId,
         DateTimeOffset? from = null,
         DateTimeOffset? to = null,
         CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_calendar");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _store.GetCalendarEventsAsync(conversationId, from, to, ct);
-    }
+        => _store.GetCalendarEventsAsync(conversationId, from, to, ct);
 
-    public async Task<List<CalendarEventRecord>> FindCalendarConflictsAsync(
+    public Task<List<CalendarEventRecord>> FindCalendarConflictsAsync(
         string conversationId,
         DateTimeOffset startAt,
         DateTimeOffset endAt,
         string? excludeEventId = null,
         CancellationToken ct = default)
-    {
-        var check = _guard.CheckSkillExecution("manage_calendar");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-        return await _store.FindConflictingEventsAsync(conversationId, startAt, endAt, excludeEventId, ct);
-    }
+        => _store.FindConflictingEventsAsync(conversationId, startAt, endAt, excludeEventId, ct);
 
     private async Task<int> ResolveDefaultMeetingRemindMinutesAsync(string conversationId, CancellationToken ct)
     {
@@ -488,9 +405,6 @@ public sealed class SkillRuntime
         int? remindMinutesBefore = null,
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_calendar");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-
         var conflicts = await _store.FindConflictingEventsAsync(conversationId, startAt, endAt, null, ct);
         if (!force && conflicts.Count > 0)
             return (null, conflicts, null);
@@ -523,11 +437,17 @@ public sealed class SkillRuntime
             var remindAt = startAt.AddMinutes(-effRemindMins);
             if (remindAt > DateTimeOffset.UtcNow || isRec)
             {
+                var leadTitle = await _localizer.TextAsync("CalendarLeadTitle", "{0} (Reminder)", new object?[] { ev.Title }, ct);
+                var leadMsg = await _localizer.TextAsync(
+                    "CalendarLeadMessage",
+                    "Starts at {0}: {1}",
+                    new object?[] { ev.StartAt.ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture), ev.Title },
+                    ct);
                 linkedReminder = new ReminderRecord(
                     ReminderId: Guid.NewGuid().ToString("N"),
                     ConversationId: conversationId,
-                    Title: AppMessages.CalendarLeadTitle(ev.Title),
-                    Message: AppMessages.CalendarLeadMessage(ev.StartAt, ev.Title),
+                    Title: leadTitle,
+                    Message: leadMsg,
                     RelatedMailId: null,
                     RemindAt: remindAt,
                     Status: "Pending",
@@ -561,9 +481,6 @@ public sealed class SkillRuntime
         IReadOnlyList<string>? overrideDates = null,
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_calendar");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-
         var all = await _store.GetCalendarEventsAsync(conversationId, null, null, ct);
         var key = idOrKeyword?.Trim() ?? "";
         var target = all.FirstOrDefault(e => e.EventId.Equals(key, StringComparison.OrdinalIgnoreCase))
@@ -604,8 +521,6 @@ public sealed class SkillRuntime
 
     public async Task<int> UpdateAllMeetingRemindLeadAsync(string conversationId, int remindMinutesBefore, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_calendar");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
         var count = await _store.UpdateAllLinkedRemindersLeadAsync(conversationId, Math.Max(0, remindMinutesBefore), ct);
         SchedulesChanged?.Invoke();
         return count;
@@ -617,9 +532,6 @@ public sealed class SkillRuntime
         string dateYmd,
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_calendar");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-
         var all = await _store.GetCalendarEventsAsync(conversationId, null, null, ct);
         var key = idOrKeyword?.Trim() ?? "";
         var target = all.FirstOrDefault(e => e.EventId.Equals(key, StringComparison.OrdinalIgnoreCase))
@@ -633,9 +545,6 @@ public sealed class SkillRuntime
 
     public async Task<CalendarEventRecord?> DeleteCalendarEventAsync(string conversationId, string idOrKeyword, CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("manage_calendar");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-
         var all = await _store.GetCalendarEventsAsync(conversationId, null, null, ct);
         var key = idOrKeyword?.Trim() ?? "";
         var target = all.FirstOrDefault(e => e.EventId.Equals(key, StringComparison.OrdinalIgnoreCase))
@@ -653,9 +562,6 @@ public sealed class SkillRuntime
         string? reason,
         CancellationToken ct = default)
     {
-        var check = _guard.CheckSkillExecution("set_quiet_mode");
-        if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
-
         var payload = until.HasValue
             ? JsonSerializer.Serialize(new { until = until.Value.ToString("O"), allow_urgent = allowUrgent, reason = reason ?? "" })
             : "";
@@ -663,11 +569,22 @@ public sealed class SkillRuntime
         QuietModeChanged?.Invoke(until, allowUrgent);
 
         if (!until.HasValue)
-            return (AppMessages.QuietModeDisabledReply, new List<ReminderRecord>());
+        {
+            var disabledMsg = await _localizer.TextAsync("QuietModeDisabledReply", "Quiet mode disabled; normal notifications resumed.", Array.Empty<object?>(), ct);
+            return (disabledMsg, new List<ReminderRecord>());
+        }
 
         var pending = await _store.GetPendingRemindersAsync(ct);
         var now = DateTimeOffset.UtcNow;
         var inWindow = pending.Where(r => r.IntervalMinutes == 0 && r.RemindAt >= now && r.RemindAt <= until.Value).ToList();
-        return (AppMessages.QuietModeEnabledReply(until.Value, allowUrgent), inWindow);
+        var urgentNote = allowUrgent
+            ? await _localizer.TextAsync("QuietModeUrgentNote", " (background mail and routine alerts muted; specific timed reminders still fire)", Array.Empty<object?>(), ct)
+            : await _localizer.TextAsync("QuietModeSilentNote", " (all notifications and reminders muted until quiet mode ends)", Array.Empty<object?>(), ct);
+        var enabledMsg = await _localizer.TextAsync(
+            "QuietModeEnabledReply",
+            "Quiet mode enabled until {0}{1}.",
+            new object?[] { until.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture), urgentNote },
+            ct);
+        return (enabledMsg, inWindow);
     }
 }

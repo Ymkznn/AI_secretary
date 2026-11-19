@@ -2,7 +2,6 @@ using System.Text.Json;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
 using AiSecretary.Desktop.Prompts;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 using AiSecretary.Desktop.Skills;
 
@@ -25,7 +24,6 @@ public sealed record TriageResult(bool Urgent, string Title, string Summary, int
 public sealed class PlannerAgent
 {
     private readonly SqliteStore _store;
-    private readonly CustomSkillService _customSkills;
     private readonly SandboxService _sandbox;
     private readonly GuardService _guard;
     private readonly IModelGateway _model;
@@ -35,12 +33,12 @@ public sealed class PlannerAgent
     private readonly SkillRegistry _skillRegistry;
     private readonly WorkerAgent _worker;
     private readonly WorkflowCacheService _workflowCache;
+    private readonly UiLocalizer _localizer;
     private readonly AppSettingsService _settings;
     private readonly ILogger<PlannerAgent> _logger;
 
     public PlannerAgent(
         SqliteStore store,
-        CustomSkillService customSkills,
         SandboxService sandbox,
         GuardService guard,
         IModelGateway model,
@@ -50,11 +48,11 @@ public sealed class PlannerAgent
         SkillRegistry skillRegistry,
         WorkerAgent worker,
         WorkflowCacheService workflowCache,
+        UiLocalizer localizer,
         AppSettingsService settings,
         ILogger<PlannerAgent> logger)
     {
         _store = store;
-        _customSkills = customSkills;
         _sandbox = sandbox;
         _guard = guard;
         _model = model;
@@ -64,6 +62,7 @@ public sealed class PlannerAgent
         _skillRegistry = skillRegistry;
         _worker = worker;
         _workflowCache = workflowCache;
+        _localizer = localizer;
         _settings = settings;
         _logger = logger;
     }
@@ -94,7 +93,7 @@ public sealed class PlannerAgent
     {
         var plannerSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Planner", ct: ct);
 
-        var customList = await _customSkills.ListAsync(ct);
+        var customList = _skillRegistry.GetCustom().Where(s => s.IsEnabled).ToList();
         var customSkillsPrompt = PlannerPrompts.FormatCustomSkillsPrompt(customList);
 
         var recent = await _store.GetChatMessagesAsync(conversationId, 80, ct);
@@ -106,8 +105,7 @@ public sealed class PlannerAgent
         var prefFacts = await _store.RecallRelevantUserPrefFactsAsync(conversationId, $"{goal} {userPrompt}", 5, ct);
         var prefContext = MainAgentPrompts.FormatPreferencesContext(prefFacts);
 
-        var enabledBuiltInBlock = string.Join("\n", _skillRegistry.GetPlannerSpecs()
-            .Where(s => _guard.IsSkillEnabled(s.Name))
+        var enabledBuiltInBlock = string.Join("\n", _skillRegistry.GetEnabledPlannerSpecs()
             .Select((s, idx) => $"{idx + 1}. {s.Spec}"));
 
         var replyLang = GetReplyLanguage();
@@ -136,7 +134,7 @@ public sealed class PlannerAgent
         if (predictedRec is not null && predictedSteps.Count > 0)
         {
             var predSteps = predictedSteps.Select(s => new PlannedStep(s.Skill, s.Args)).ToList();
-            onStageChanged?.Invoke("worker", AppMessages.StageWorkerPreparing(predSteps.Count));
+            onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerPreparing", "Worker preparing {0} step(s)...", predSteps.Count));
             var workerSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Worker", forceNewSession: true, ct: ct);
             var stepLimit = Math.Min(predSteps.Count, _guard.MaxWorkerStepsPerTask);
 
@@ -145,7 +143,7 @@ public sealed class PlannerAgent
                 ct.ThrowIfCancellationRequested();
                 var step = predSteps[i];
                 var skillName = step.Skill.Trim();
-                onStageChanged?.Invoke("worker", AppMessages.StageWorkerStep(skillName, i + 1, stepLimit));
+                onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerStep", "Worker running {0} ({1}/{2})...", skillName, i + 1, stepLimit));
                 await _worker.RunStepAsync(
                     conversationId, userPrompt, skillName, step.Args, targetMailId,
                     confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
@@ -194,7 +192,7 @@ public sealed class PlannerAgent
             {
                 if (!string.IsNullOrWhiteSpace(statusNote))
                     await onStatusAsync(statusNote);
-                onStageChanged?.Invoke("worker", AppMessages.StageWorkerPreparing(plannedSteps.Count));
+                onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerPreparing", "Worker preparing {0} step(s)...", plannedSteps.Count));
                 var workerSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Worker", forceNewSession: true, ct: ct);
                 var stepLimit = Math.Min(plannedSteps.Count, _guard.MaxWorkerStepsPerTask);
 
@@ -203,7 +201,7 @@ public sealed class PlannerAgent
                     ct.ThrowIfCancellationRequested();
                     var step = plannedSteps[i];
                     var skillName = step.Skill.Trim();
-                    onStageChanged?.Invoke("worker", AppMessages.StageWorkerStep(skillName, i + 1, stepLimit));
+                    onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerStep", "Worker running {0} ({1}/{2})...", skillName, i + 1, stepLimit));
 
                     await _worker.RunStepAsync(
                         conversationId, userPrompt, skillName, step.Args, targetMailId,
@@ -290,8 +288,12 @@ public sealed class PlannerAgent
 
         await _sessions.RecordTokensAsync(triageSession, resp.EstimatedTokens, ct: ct);
 
-        var title = AppMessages.DefaultTriageTitle;
-        var summary = AppMessages.DefaultTriageSummary(mail.SenderName, mail.Subject, mail.Snippet);
+        var title = await _localizer.TextAsync("DefaultTriageTitle", "Email Requiring Attention", Array.Empty<object?>(), ct);
+        var summary = await _localizer.TextAsync(
+            "DefaultTriageSummary",
+            "From {0} \"{1}\": {2}",
+            new object?[] { mail.SenderName, mail.Subject, mail.Snippet },
+            ct);
         var urgent = true;
         var reRemindMinutes = 15;
         List<NotificationButtonOption>? actions = null;

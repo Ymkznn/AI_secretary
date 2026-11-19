@@ -125,11 +125,35 @@ public sealed record CustomSkillRecord(
     string Command,
     DateTimeOffset CreatedAt);
 
+public sealed record SkillRecord(
+    string Name,
+    string Kind, // "basic" | "custom"
+    string? HandlerType,
+    string DisplayDescription,
+    string MainAgentSpec,
+    string PlannerSpec,
+    string? Command,
+    List<string> Aliases,
+    string? Capability,
+    bool IsSilentPoller,
+    bool IsEnabled,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt);
+
 public sealed record SkillMenuEntry(
     string Name,
     string Description,
     bool IsCustom,
-    bool IsEnabled = true);
+    bool IsEnabled = true,
+    string? Capability = null);
+
+public enum SpeechKind
+{
+    Notification,
+    ChatReply,
+    Report,
+    Status
+}
 
 public enum PinnedItemKind
 {

@@ -1,5 +1,4 @@
 using AiSecretary.Desktop.Agent;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -17,6 +16,8 @@ public sealed class ManageCustomSkillSkill : IBasicSkill
 
     public string Name => "manage_custom_skill";
     public string DisplayDescription => "Create and delete custom PowerShell skills (requires approval)";
+    public string StatusText => "Waiting for custom skill confirmation...";
+    public IReadOnlyList<string> LegacyAliases => new[] { "create_skill", "delete_skill" };
     public string MainAgentSpec => """
             manage_custom_skill
                - Purpose: Create or delete custom PowerShell/CLI skills (sandboxed by default; creation/execution requires user confirmation).
@@ -27,6 +28,7 @@ public sealed class ManageCustomSkillSkill : IBasicSkill
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
+        var skillName = ctx.EffectiveName(Name);
         var action = (ctx.GetArg("action") ?? "create").Trim().ToLowerInvariant();
         var name = ctx.GetArg("name") ?? "";
 
@@ -34,19 +36,19 @@ public sealed class ManageCustomSkillSkill : IBasicSkill
         {
             var desc = ctx.GetArg("description") ?? "";
             var cmd = ctx.GetArg("command") ?? "";
-            await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Waiting for custom skill confirmation..."));
+            await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
             var (ok, msg) = await _customSkills.CreateAsync(name, desc, cmd, ctx.ConfirmAsync, ctx.Ct);
             ctx.Observations.Add(msg);
-            if (ok) ctx.CompletedSteps.Add($"manage_custom_skill:create:{name}");
+            if (ok) ctx.CompletedSteps.Add($"{skillName}:create:{name}");
             return;
         }
 
         if (action == "delete")
         {
-            await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Waiting for custom skill confirmation..."));
+            await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
             var (ok, msg) = await _customSkills.DeleteAsync(name, ctx.ConfirmAsync, ctx.Ct);
             ctx.Observations.Add(msg);
-            if (ok) ctx.CompletedSteps.Add($"manage_custom_skill:delete:{name}");
+            if (ok) ctx.CompletedSteps.Add($"{skillName}:delete:{name}");
             return;
         }
 

@@ -4,7 +4,6 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Agent;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -24,6 +23,7 @@ public sealed class WebFetchSkill : IBasicSkill
 
     public string Name => "web_fetch";
     public string DisplayDescription => "Safely fetch plain text from public web pages";
+    public string StatusText => "Fetching web page...";
     public string MainAgentSpec => """
             web_fetch
                - Purpose: Safely fetch plain text from a public http/https URL (SSRF-protected, no PowerShell).
@@ -34,16 +34,17 @@ public sealed class WebFetchSkill : IBasicSkill
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
+        var skillName = ctx.EffectiveName(Name);
         var url = ctx.GetArg("url") ?? "";
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Fetching web page..."));
-        var res = await WebFetchAsync(url, ctx.Ct);
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
+        var res = await WebFetchAsync(url, ctx.Ct, skillName);
         ctx.Observations.Add(res);
-        ctx.CompletedSteps.Add("web_fetch");
+        ctx.CompletedSteps.Add(skillName);
     }
 
-    public async Task<string> WebFetchAsync(string url, CancellationToken ct = default)
+    public async Task<string> WebFetchAsync(string url, CancellationToken ct = default, string? skillName = null)
     {
-        var check = _guard.CheckSkillExecution("web_fetch");
+        var check = _guard.CheckSkillExecution(string.IsNullOrWhiteSpace(skillName) ? Name : skillName);
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
 
         if (!Uri.TryCreate(url?.Trim(), UriKind.Absolute, out var uri) ||

@@ -1,5 +1,4 @@
 using AiSecretary.Desktop.Agent;
-using AiSecretary.Desktop.Resources;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -14,6 +13,7 @@ public sealed class LaunchAppSkill : IBasicSkill
 
     public string Name => "launch_app";
     public string DisplayDescription => "Launch local Windows applications";
+    public string StatusText => "Launching application...";
     public string MainAgentSpec => """
             launch_app
                - Purpose: Launch a whitelisted local Windows application (Notepad, Calculator, Chrome, Edge, VS Code, Terminal, Office, etc.).
@@ -26,10 +26,11 @@ public sealed class LaunchAppSkill : IBasicSkill
     {
         var appName = ctx.GetArg("app_name") ?? "";
         var appArgs = ctx.GetArg("arguments");
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Launching application..."));
+        var skillName = ctx.EffectiveName(Name);
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
         var launchRes = _skills.LaunchApp(appName, appArgs);
         ctx.Observations.Add(launchRes.Message);
         if (launchRes.Success)
-            ctx.CompletedSteps.Add($"launch_app:{appName}");
+            ctx.CompletedSteps.Add($"{skillName}:{appName}");
     }
 }

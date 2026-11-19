@@ -1,7 +1,6 @@
 using System.Text.Json;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Skills;
@@ -20,6 +19,7 @@ public sealed class BrowserFormSkill : IBasicSkill
 
     public string Name => "browser_form";
     public string DisplayDescription => "Read form/DOM and prefill browser tab forms via Extension";
+    public string StatusText => "Interacting with browser form...";
     public string MainAgentSpec => """
             browser_form
                - Purpose: Read form fields, inspect up to the full page DOM (on-demand), or prefill fields in the active Chrome/Edge tab via Browser Extension (never auto-submits).
@@ -31,7 +31,8 @@ public sealed class BrowserFormSkill : IBasicSkill
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
         var action = (ctx.GetArg("action") ?? "read").Trim().ToLowerInvariant();
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Interacting with browser form..."));
+        var skillName = ctx.EffectiveName(Name);
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
 
         if (action == "read")
         {
@@ -105,9 +106,13 @@ public sealed class BrowserFormSkill : IBasicSkill
         }
 
         var preview = string.Join("\n", fills.Take(10).Select(f => $"- {f.FieldId} = {f.Value}"));
-        var approved = await ctx.ConfirmAsync(
-            "Browser Form Prefill",
-            $"Prefill {fills.Count} field(s) (will not auto-submit):\n\n{preview}");
+        var confirmTitle = await ctx.TextAsync("confirm_browser_fill_title", "Browser Form Prefill");
+        var confirmBody = await ctx.TextAsync(
+            "confirm_browser_fill_body",
+            "Prefill {0} field(s) (will not auto-submit):\n\n{1}",
+            fills.Count,
+            preview);
+        var approved = await ctx.ConfirmAsync(confirmTitle, confirmBody);
         if (!approved)
         {
             ctx.Observations.Add("browser_form: user declined prefill.");

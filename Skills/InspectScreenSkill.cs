@@ -1,5 +1,4 @@
 using AiSecretary.Desktop.Agent;
-using AiSecretary.Desktop.Resources;
 using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Skills;
@@ -17,6 +16,7 @@ public sealed class InspectScreenSkill : IBasicSkill
 
     public string Name => "inspect_screen";
     public string DisplayDescription => "Inspect active window UIA fields, list windows, or capture screen";
+    public string StatusText => "Inspecting screen...";
     public string MainAgentSpec => """
             inspect_screen
                - Purpose: Read UIA fields of the last external window (mode=uia, 0 screenshot), list open windows (list), or capture window screenshot (capture, requires user confirmation).
@@ -54,14 +54,16 @@ public sealed class InspectScreenSkill : IBasicSkill
 
         if (!mode.Equals("list", StringComparison.OrdinalIgnoreCase))
         {
-            var approved = await ctx.ConfirmAsync("Screen Capture Confirmation", "Allow capturing the active window/screen for AI inspection?");
+            var confirmTitle = await ctx.TextAsync("confirm_screen_capture_title", "Screen Capture Confirmation");
+            var confirmBody = await ctx.TextAsync("confirm_screen_capture_body", "Allow capturing the active window/screen for AI inspection?");
+            var approved = await ctx.ConfirmAsync(confirmTitle, confirmBody);
             if (!approved)
             {
                 ctx.Observations.Add("User denied screen capture.");
                 return;
             }
         }
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Inspecting screen..."));
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         var (ok, msg, filePath, wins) = _skills.InspectScreen(mode, titleKw);
         var winListText = wins.Count == 0
             ? "(none)"

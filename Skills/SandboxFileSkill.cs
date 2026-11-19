@@ -1,6 +1,6 @@
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Resources;
+using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -12,16 +12,19 @@ public sealed class SandboxFileSkill : IBasicSkill
     private readonly GuardService _guard;
     private readonly SandboxService _sandbox;
     private readonly SkillRuntime _skills;
+    private readonly UiLocalizer _localizer;
 
-    public SandboxFileSkill(GuardService guard, SandboxService sandbox, SkillRuntime skills)
+    public SandboxFileSkill(GuardService guard, SandboxService sandbox, SkillRuntime skills, UiLocalizer localizer)
     {
         _guard = guard;
         _sandbox = sandbox;
         _skills = skills;
+        _localizer = localizer;
     }
 
     public string Name => "sandbox_file";
     public string DisplayDescription => "Read, write, list, or delete sandbox files";
+    public string StatusText => "Accessing sandbox files...";
     public string MainAgentSpec => """
             sandbox_file
                - Purpose: Read, write, list, or delete files inside the authorized sandbox directory.
@@ -32,13 +35,14 @@ public sealed class SandboxFileSkill : IBasicSkill
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
+        var skillName = ctx.EffectiveName(Name);
         var action = ctx.GetArg("action") ?? "list";
         var path = ctx.GetArg("path");
         var content = ctx.GetArg("content");
-        await ctx.OnStatusAsync(AppMessages.Localize($"skill_status:{Name}", "Accessing sandbox files..."));
-        var res = await SandboxFileAsync(action, path, content, ctx.ConfirmAsync, ctx.Ct);
+        await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
+        var res = await SandboxFileAsync(action, path, content, ctx.ConfirmAsync, ctx.Ct, skillName);
         ctx.Observations.Add(res);
-        ctx.CompletedSteps.Add($"sandbox_file:{action}");
+        ctx.CompletedSteps.Add($"{skillName}:{action}");
     }
 
     public async Task<string> SandboxFileAsync(
@@ -46,9 +50,10 @@ public sealed class SandboxFileSkill : IBasicSkill
         string? relativeOrFullPath,
         string? content,
         Func<string, string, Task<bool>> confirmAsync,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        string? skillName = null)
     {
-        var check = _guard.CheckSkillExecution("sandbox_file");
+        var check = _guard.CheckSkillExecution(string.IsNullOrWhiteSpace(skillName) ? Name : skillName);
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
 
         var act = (action ?? "list").Trim().ToLowerInvariant();
@@ -63,14 +68,16 @@ public sealed class SandboxFileSkill : IBasicSkill
             fileName.Equals("gmail_credentials.json", StringComparison.OrdinalIgnoreCase) ||
             fileName.EndsWith(".db", StringComparison.OrdinalIgnoreCase))
         {
-            throw new UnauthorizedAccessException("Security policy forbids accessing credential or database files via sandbox_file.");
+            return "Security policy forbids accessing credential or database files via sandbox_file.";
         }
 
         if (!_sandbox.IsPathInsideSandbox(resolved))
         {
+            var outsideTitle = await _localizer.TextAsync("SandboxOutsideTitle", "Outside-Sandbox Path Permission", Array.Empty<object?>(), ct);
+            var outsideMsg = await _localizer.TextAsync("SandboxOutsideMessage", "Assistant requests access outside trusted folders for '{0}'. Choose an option:", new object?[] { act }, ct);
             var decision = await _skills.RequestPathPermissionAsync(
-                AppMessages.SandboxOutsideTitle,
-                AppMessages.SandboxOutsideMessage(act),
+                outsideTitle,
+                outsideMsg,
                 resolved,
                 confirmAsync);
             if (decision == PathPermissionDecision.Deny)
