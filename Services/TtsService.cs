@@ -75,7 +75,8 @@ public sealed class TtsService : IDisposable
         {
             if (!_cachedStyleLangs.TryGetValue(_voiceProfile, out var profLang))
             {
-                var path = GetActiveProfileSettings()?.StylePromptPath;
+                var path = GetActiveProfileSettings()?.StylePromptPath
+                           ?? FindVoiceAsset(GetWeightGroup(_voiceProfile), "*.md");
                 profLang = !string.IsNullOrWhiteSpace(path) ? StyleService.ParseTtsLanguageFromMd(path) : null;
                 _cachedStyleLangs[_voiceProfile] = profLang;
             }
@@ -91,13 +92,46 @@ public sealed class TtsService : IDisposable
 
     public IReadOnlyList<(string Key, string DisplayName)> GetAvailableVoiceProfiles()
     {
-        var profiles = _settings.Current.Tts.Profiles;
-        if (profiles.Count == 0)
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in _settings.Current.Tts.Profiles)
+            result[kv.Key] = string.IsNullOrWhiteSpace(kv.Value.DisplayName) ? kv.Key : kv.Value.DisplayName!;
+
+        foreach (var root in new[]
+        {
+            Path.Combine(AppPaths.UserDataRoot, "tts", "voices"),
+            Path.Combine(AppContext.BaseDirectory, "tts", "voices")
+        })
+        {
+            if (!Directory.Exists(root)) continue;
+            foreach (var dir in Directory.GetDirectories(root))
+            {
+                var key = Path.GetFileName(dir).ToLowerInvariant();
+                if (result.ContainsKey(key)) continue;
+
+                var displayName = key;
+                var mdFile = Directory.GetFiles(dir, "*.md").FirstOrDefault();
+                if (mdFile is not null)
+                {
+                    try
+                    {
+                        var firstLine = File.ReadLines(mdFile, Encoding.UTF8).FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim();
+                        if (!string.IsNullOrWhiteSpace(firstLine) && firstLine.StartsWith('#'))
+                        {
+                            var clean = firstLine.TrimStart('#', ' ').Split('（', '(')[0].Trim();
+                            if (!string.IsNullOrWhiteSpace(clean))
+                                displayName = clean;
+                        }
+                    }
+                    catch { }
+                }
+                result[key] = displayName;
+            }
+        }
+
+        if (result.Count == 0)
             return new[] { ("default", "預設語音") };
 
-        return profiles
-            .Select(kv => (kv.Key, string.IsNullOrWhiteSpace(kv.Value.DisplayName) ? kv.Key : kv.Value.DisplayName!))
-            .ToList();
+        return result.Select(kv => (kv.Key, kv.Value)).ToList();
     }
 
     public string GetTestPhrase()
@@ -126,7 +160,8 @@ public sealed class TtsService : IDisposable
         if (_cachedStylePrompts.TryGetValue(_voiceProfile, out var cached))
             return cached;
 
-        var path = GetActiveProfileSettings()?.StylePromptPath;
+        var path = GetActiveProfileSettings()?.StylePromptPath
+                   ?? FindVoiceAsset(GetWeightGroup(_voiceProfile), "*.md");
         var loaded = !string.IsNullOrWhiteSpace(path) ? LoadStylePromptFromMd(path) : null;
         _cachedStylePrompts[_voiceProfile] = loaded;
         return loaded;
