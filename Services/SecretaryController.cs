@@ -949,6 +949,12 @@ public sealed class SecretaryController : IDisposable
                     if (run.WorkerState == "Running") run.WorkerState = "Done";
                     run.CurrentStep = _localizer.TextCached("StepCompleted", "Completed");
                     AgentsChanged?.Invoke();
+
+                    if (activePlannerTaskIdThisTurn is null && turnLastChoices is { Count: > 0 })
+                    {
+                        _latestChoicesLogicalTaskId = "chat-choice";
+                        UpsertPinnedConfirmation("chat-choice", run.Goal, pendingText, turnLastChoices);
+                    }
                 }
                 else
                 {
@@ -1072,7 +1078,15 @@ public sealed class SecretaryController : IDisposable
                                 {
                                     _latestChoicesMsgId = reportMsg.Id;
                                     _latestChoices = bgChoices.ToList();
-                                    _latestChoicesLogicalTaskId = activePlannerTaskIdThisTurn;
+                                    if (activePlannerTaskIdThisTurn is null)
+                                    {
+                                        _latestChoicesLogicalTaskId = "chat-choice";
+                                        UpsertPinnedConfirmation("chat-choice", run.Goal, bgReportText, bgChoices);
+                                    }
+                                    else
+                                    {
+                                        _latestChoicesLogicalTaskId = activePlannerTaskIdThisTurn;
+                                    }
                                 }
 
                                 await _store.UpsertChatMessageAsync(reportMsg, CancellationToken.None);
