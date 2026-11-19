@@ -57,7 +57,7 @@ public static class MainAgentPrompts
             - Reply Quality (when `action="reply"`):
               1. Directly answer the user's specific question with key facts/basis strictly in '{{{replyLang}}}'; NEVER reply with lazy phrases like "see above".
               2. NEVER expose internal tool/skill names to the user. If <persistent_memory> lacks detail, proactively run `run_skill` or `call_planner` to fetch it.
-            - Always fill `ack` when `action="run_skill"` or `"call_planner"`.
+            - Always fill `ack` when `action="run_skill"` or `"call_planner"`. Keep `ack` strictly neutral and non-committal (e.g., checking, looking into it, preparing): NEVER promise completion or claim an unapproved/unverified action is already executing (e.g., avoid "I'm moving/deleting/fetching it right now and will give you the result shortly").
             - Single tool from the list -> `action="run_skill"` with `skill` and `args`. (For calendar event creation, omit `remind_minutes_before` unless specified so <user_preferences> applies automatically.)
             - Updating default meeting reminder lead time ("remind X min before all future meetings") -> `call_planner` to update `user_pref` via the memory/facts skill and call the calendar skill's `update_all_reminders` action.
             - Skipping or rescheduling one occurrence of a recurring meeting/leave -> skip only via calendar `skip_date`; reschedule via `call_planner` (`skip_date` + `create`).
