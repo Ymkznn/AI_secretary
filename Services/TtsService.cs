@@ -238,10 +238,14 @@ public sealed class TtsService : IDisposable
                 };
                 psi.Environment["PYTHONUTF8"] = "1";
                 psi.Environment["PYTHONIOENCODING"] = "utf-8";
+                // Cap OpenMP/MKL threads so PyTorch inference doesn't spike all CPU cores while gaming.
+                psi.Environment.TryAdd("OMP_NUM_THREADS", "2");
+                psi.Environment.TryAdd("MKL_NUM_THREADS", "2");
 
                 _serverProcess = Process.Start(psi);
                 if (_serverProcess is not null)
                 {
+                    try { _serverProcess.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
                     _loadedWeightGroup = group;
                     _pendingWeightReload = false;
                     _weightsInitialized = true;
