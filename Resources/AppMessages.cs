@@ -55,21 +55,11 @@ public static class AppMessages
             foreach (var kv in saved)
                 dict[kv.Key] = kv.Value;
 
-            // Pre-warm missing EnglishBase templates in the background.
+            // Pre-warm missing EnglishBase templates in batches so startup populates UiLocaleCache fast.
             var missing = EnglishBase.Value.Where(kv => !dict.ContainsKey(kv.Key)).ToList();
             if (missing.Count > 0)
             {
-                _ = Task.Run(async () =>
-                {
-                    using var gate = new SemaphoreSlim(3);
-                    var tasks = missing.Select(async kv =>
-                    {
-                        await gate.WaitAsync();
-                        try { await TranslateAndCacheAsync(lang, kv.Key, kv.Value, CancellationToken.None); }
-                        finally { gate.Release(); }
-                    });
-                    await Task.WhenAll(tasks);
-                });
+                _ = Task.Run(() => PreWarmBatchAsync(lang, missing));
             }
         }
     }
@@ -167,6 +157,63 @@ public static class AppMessages
         {
             // Offline / unconfigured LLM: safely keep English base fallback.
             return null;
+        }
+    }
+
+    private static async Task PreWarmBatchAsync(string targetLang, List<KeyValuePair<string, string>> missing)
+    {
+        if (_model is null || _store is null) return;
+        var dict = LocaleCache.GetOrAdd(targetLang, _ => new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+        var sys = SystemAutomationPrompts.BuildUiBatchTranslateSystemPrompt(targetLang);
+
+        foreach (var chunk in missing.Chunk(30))
+        {
+            try
+            {
+                var inputObj = chunk.ToDictionary(kv => kv.Key, kv => kv.Value);
+                var payload = JsonSerializer.Serialize(inputObj);
+                var resp = await _model.CompleteAsync(new[]
+                {
+                    new ModelMessage("system", sys),
+                    new ModelMessage("user", payload)
+                }, ModelTier.Simple);
+
+                var raw = (resp.Content ?? "").Trim();
+                if (raw.StartsWith("```", StringComparison.Ordinal))
+                {
+                    var nl = raw.IndexOf('\n');
+                    if (nl >= 0) raw = raw[(nl + 1)..];
+                    var end = raw.LastIndexOf("```", StringComparison.Ordinal);
+                    if (end >= 0) raw = raw[..end];
+                    raw = raw.Trim();
+                }
+
+                var translatedMap = JsonSerializer.Deserialize<Dictionary<string, string>>(raw);
+                if (translatedMap is not null)
+                {
+                    foreach (var kv in chunk)
+                    {
+                        if (translatedMap.TryGetValue(kv.Key, out var tr) &&
+                            !string.IsNullOrWhiteSpace(tr) &&
+                            HasSamePlaceholders(kv.Value, tr))
+                        {
+                            dict[kv.Key] = tr;
+                            await _store.UpsertUiLocaleCacheAsync(targetLang, kv.Key, tr, CancellationToken.None);
+                        }
+                    }
+                    continue;
+                }
+            }
+            catch
+            {
+                // Batch failed; fall back to individual translations for this chunk.
+            }
+
+            foreach (var kv in chunk)
+            {
+                if (!dict.ContainsKey(kv.Key))
+                    await TranslateAndCacheAsync(targetLang, kv.Key, kv.Value, CancellationToken.None);
+            }
         }
     }
 

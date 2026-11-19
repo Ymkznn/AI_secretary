@@ -11,6 +11,11 @@ public static class SystemAutomationPrompts
         => $"Translate the UI template into '{targetLanguage}'. " +
            "Preserve ALL format placeholders like {0}, {1}, {2} and newlines verbatim. Output ONLY the translated string.";
 
+    public static string BuildUiBatchTranslateSystemPrompt(string targetLanguage)
+        => $"Translate every JSON string value in the input object into '{targetLanguage}'. " +
+           "Keep ALL JSON keys unchanged, preserve ALL format placeholders like {0}, {1}, {2} and escape sequences verbatim. " +
+           "Output ONLY a valid JSON object with the exact same keys (no markdown fences).";
+
     public static string BuildWindowClassifierSystemPrompt()
         => "Classify the user's current window into exact JSON: {\"intent\": \"otp_wait\" | \"form_fill\" | \"media_or_idle\"}. " +
            "Use \"otp_wait\" for login/2FA/verification code entry pages in ANY language. " +
