@@ -26,6 +26,7 @@ public sealed class MainAgent
     private readonly AppSettingsService _settings;
     private readonly ActivityMonitorService _activity;
     private readonly WorkflowCacheService _workflowCache;
+    private readonly MemoryReflectionAgent _memoryReflection;
     private readonly ILogger<MainAgent> _logger;
 
     public MainAgent(
@@ -41,6 +42,7 @@ public sealed class MainAgent
         AppSettingsService settings,
         ActivityMonitorService activity,
         WorkflowCacheService workflowCache,
+        MemoryReflectionAgent memoryReflection,
         ILogger<MainAgent> logger)
     {
         _store = store;
@@ -55,6 +57,7 @@ public sealed class MainAgent
         _settings = settings;
         _activity = activity;
         _workflowCache = workflowCache;
+        _memoryReflection = memoryReflection;
         _logger = logger;
     }
 
@@ -261,6 +264,7 @@ public sealed class MainAgent
                         onSingleSkillFinished?.Invoke(taskId);
                         onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
                         await bgReplyAsync(summary, sources);
+                        _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, new[] { skill }, new[] { summary }, summary);
                         return;
                     }
 
@@ -304,6 +308,7 @@ public sealed class MainAgent
                 onSingleSkillFinished?.Invoke(taskId);
                 onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
                 await onReplyAsync(summarySync, sourcesSync);
+                _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, new[] { skill }, new[] { summarySync }, summarySync);
                 return;
             }
         }

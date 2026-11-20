@@ -33,6 +33,7 @@ public sealed class PlannerAgent
     private readonly SkillRegistry _skillRegistry;
     private readonly WorkerAgent _worker;
     private readonly WorkflowCacheService _workflowCache;
+    private readonly MemoryReflectionAgent _memoryReflection;
     private readonly UiLocalizer _localizer;
     private readonly AppSettingsService _settings;
     private readonly ActivityMonitorService _activity;
@@ -49,6 +50,7 @@ public sealed class PlannerAgent
         SkillRegistry skillRegistry,
         WorkerAgent worker,
         WorkflowCacheService workflowCache,
+        MemoryReflectionAgent memoryReflection,
         UiLocalizer localizer,
         AppSettingsService settings,
         ActivityMonitorService activity,
@@ -64,6 +66,7 @@ public sealed class PlannerAgent
         _skillRegistry = skillRegistry;
         _worker = worker;
         _workflowCache = workflowCache;
+        _memoryReflection = memoryReflection;
         _localizer = localizer;
         _settings = settings;
         _activity = activity;
@@ -333,6 +336,7 @@ public sealed class PlannerAgent
             onDirectTtsText?.Invoke(finalTtsText);
         await onReplyAsync(cleanFinal, sources);
         onTaskCompleted?.Invoke(isTaskDone);
+        _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, completedSteps, observations, cleanFinal);
 
         await _sessions.CompleteTaskSessionAsync(
             plannerSession,

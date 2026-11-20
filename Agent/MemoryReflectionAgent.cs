@@ -1,0 +1,179 @@
+using System.Text.Json;
+using AiSecretary.Desktop.Data;
+using AiSecretary.Desktop.Models;
+using AiSecretary.Desktop.Prompts;
+using Microsoft.Extensions.Logging;
+
+namespace AiSecretary.Desktop.Agent;
+
+/// <summary>
+/// Dedicated background reflection agent that inspects completed AI decisions (executed skills + observations)
+/// against existing long-term memory, and autonomously records new reusable environment discoveries or
+/// updates/deletes outdated or contradicted facts.
+/// </summary>
+public sealed class MemoryReflectionAgent : IDisposable
+{
+    private readonly SqliteStore _store;
+    private readonly IModelGateway _model;
+    private readonly SkillRuntime _skills;
+    private readonly GuardService _guard;
+    private readonly ILogger<MemoryReflectionAgent> _logger;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+
+    public MemoryReflectionAgent(
+        SqliteStore store,
+        IModelGateway model,
+        SkillRuntime skills,
+        GuardService guard,
+        ILogger<MemoryReflectionAgent> logger)
+    {
+        _store = store;
+        _model = model;
+        _skills = skills;
+        _guard = guard;
+        _logger = logger;
+    }
+
+    public void EnqueueDecisionReflection(
+        string conversationId,
+        string userPrompt,
+        IReadOnlyList<string> completedSteps,
+        IReadOnlyList<string> observations,
+        string finalReply)
+    {
+        if (completedSteps.Count == 0 || !_guard.IsSkillEnabled("manage_facts"))
+            return;
+
+        // Avoid recursive reflection on pure manage_facts-only turns.
+        if (completedSteps.All(s => s.StartsWith("manage_facts", StringComparison.OrdinalIgnoreCase)))
+            return;
+
+        var stepsCopy = completedSteps.Take(10).ToList();
+        var obsCopy = observations.Take(8)
+            .Select(o => o.Length > 800 ? o[..800] + "…" : o)
+            .ToList();
+        var replySnippet = finalReply.Length > 600 ? finalReply[..600] + "…" : finalReply;
+
+        _ = Task.Run(() => ReflectAsync(conversationId, userPrompt, stepsCopy, obsCopy, replySnippet, CancellationToken.None));
+    }
+
+    private async Task ReflectAsync(
+        string conversationId,
+        string userPrompt,
+        IReadOnlyList<string> completedSteps,
+        IReadOnlyList<string> observations,
+        string finalReply,
+        CancellationToken ct)
+    {
+        if (!await _gate.WaitAsync(0, ct))
+            return;
+
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
+
+            var recalled = await _store.RecallRelevantFactsAsync(conversationId, userPrompt, 6, timeoutCts.Token);
+            var existingBlock = recalled.Count == 0
+                ? "(none)"
+                : string.Join("\n", recalled.Select(f => $"- fact_id={f.FactId} | category={f.Category} | summary={f.Summary}"));
+
+            var sys = SystemAutomationPrompts.BuildMemoryReflectionSystemPrompt();
+            var user = SystemAutomationPrompts.BuildMemoryReflectionUserPrompt(
+                userPrompt, completedSteps, observations, finalReply, existingBlock);
+
+            var resp = await _model.CompleteAsync(new[]
+            {
+                new ModelMessage("system", sys),
+                new ModelMessage("user", user)
+            }, ModelTier.Simple, timeoutCts.Token);
+
+            await ApplyReflectionOpsAsync(conversationId, resp.Content, timeoutCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "[MemoryReflectionAgent] reflection skipped");
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private async Task ApplyReflectionOpsAsync(string conversationId, string? raw, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return;
+
+        var cleaned = raw.Trim();
+        if (cleaned.StartsWith("```", StringComparison.Ordinal))
+        {
+            var nl = cleaned.IndexOf('\n');
+            if (nl >= 0) cleaned = cleaned[(nl + 1)..];
+            var end = cleaned.LastIndexOf("```", StringComparison.Ordinal);
+            if (end >= 0) cleaned = cleaned[..end];
+            cleaned = cleaned.Trim();
+        }
+        var objStart = cleaned.IndexOf('{');
+        var objEnd = cleaned.LastIndexOf('}');
+        if (objStart >= 0 && objEnd > objStart)
+            cleaned = cleaned[objStart..(objEnd + 1)];
+
+        using var doc = JsonDocument.Parse(cleaned);
+        if (!doc.RootElement.TryGetProperty("ops", out var opsEl) || opsEl.ValueKind != JsonValueKind.Array)
+            return;
+
+        int applied = 0;
+        foreach (var item in opsEl.EnumerateArray())
+        {
+            if (applied >= 2 || item.ValueKind != JsonValueKind.Object) break;
+            var op = item.TryGetProperty("op", out var oEl) ? oEl.GetString()?.Trim().ToLowerInvariant() : null;
+            var factId = item.TryGetProperty("fact_id", out var fEl) ? fEl.GetString()?.Trim() : null;
+            var category = item.TryGetProperty("category", out var cEl) ? cEl.GetString()?.Trim() : null;
+            var summary = item.TryGetProperty("summary", out var sEl) ? sEl.GetString()?.Trim() : null;
+            var detail = item.TryGetProperty("detail", out var dEl) ? dEl.GetString()?.Trim() : null;
+            var evidence = item.TryGetProperty("evidence", out var eEl) ? eEl.GetString()?.Trim() : null;
+
+            switch (op)
+            {
+                case "record":
+                    if (string.IsNullOrWhiteSpace(summary) || string.IsNullOrWhiteSpace(detail)) continue;
+                    await _skills.RecordFactAsync(
+                        conversationId: conversationId,
+                        summary: summary,
+                        detail: detail,
+                        category: string.IsNullOrWhiteSpace(category) ? "general" : category,
+                        evidence: evidence,
+                        confidence: "observed",
+                        tags: null,
+                        ct: ct);
+                    applied++;
+                    break;
+                case "update":
+                    if (string.IsNullOrWhiteSpace(factId)) continue;
+                    await _skills.UpdateFactAsync(
+                        factId: factId,
+                        summary: summary,
+                        detail: detail,
+                        category: category,
+                        evidence: evidence,
+                        conversationId: conversationId,
+                        ct: ct);
+                    applied++;
+                    break;
+                case "delete":
+                    if (string.IsNullOrWhiteSpace(factId)) continue;
+                    await _skills.DeleteFactAsync(factId, conversationId, ct);
+                    applied++;
+                    break;
+            }
+        }
+
+        if (applied > 0)
+            _logger.LogInformation("[MemoryReflectionAgent] Applied {Count} memory update(s).", applied);
+    }
+
+    public void Dispose() => _gate.Dispose();
+}

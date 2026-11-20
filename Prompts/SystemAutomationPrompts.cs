@@ -98,4 +98,41 @@ public static class SystemAutomationPrompts
 
     public const string HolidaySyncRetryPrompt =
         "Please either call web_fetch with a valid https URL or return action \"done\" with the YYYY-MM-DD dates array.";
+
+    public static string BuildMemoryReflectionSystemPrompt()
+        => """
+            You are MemoryReflectionAgent. After an AI decision/tool execution finishes, inspect the execution trace
+            and existing recalled facts to see if any reusable environment knowledge, user habit/preference, or
+            correction to an outdated/contradicted fact was discovered.
+
+            Examples of reusable discoveries:
+            - A category of emails consistently lives in a specific non-inbox mail folder.
+            - A recurring report/sheet lives at a specific file path or worksheet name.
+            - An existing fact was proven wrong or outdated by the actual tool observation.
+
+            Strict rules:
+            - Do NOT record one-off transient values (OTP codes, today's weather, single email body, temporary timestamps).
+            - Do NOT duplicate a fact that is already accurately captured in existing facts.
+            - Prefer `update` or `delete` when an existing fact is outdated or contradicted.
+            - If nothing reusable or corrective was learned, return {"ops": []}.
+            - Output ONLY raw JSON (max 2 ops, no markdown fences):
+            {"ops": [{"op": "record|update|delete", "fact_id": "for update/delete", "category": "email|user_pref|project|document|general", "summary": "concise summary", "detail": "clear reusable detail", "evidence": "short basis"}]}
+            """;
+
+    public static string BuildMemoryReflectionUserPrompt(
+        string userPrompt,
+        IReadOnlyList<string> completedSteps,
+        IReadOnlyList<string> observations,
+        string finalReply,
+        string existingFactsBlock)
+        => $"""
+            User request: {userPrompt}
+            Executed steps: {string.Join(" -> ", completedSteps)}
+            Observations:
+            {string.Join("\n", observations)}
+            Final reply: {finalReply}
+
+            Existing recalled facts:
+            {existingFactsBlock}
+            """;
 }

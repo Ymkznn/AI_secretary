@@ -108,6 +108,7 @@ public partial class App : System.Windows.Application
         sc.AddSingleton<WorkerAgent>();
         sc.AddSingleton<PlannerAgent>();
         sc.AddSingleton<HolidaySyncAgent>();
+        sc.AddSingleton<MemoryReflectionAgent>();
         sc.AddSingleton<MainAgent>();
         sc.AddSingleton<MailSyncService>();
         sc.AddSingleton<SecretaryController>();
