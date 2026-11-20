@@ -27,7 +27,8 @@ public sealed record BrowserFormField(
     string Label,
     string ControlType,
     string? CurrentValue,
-    IReadOnlyList<string>? Options);
+    IReadOnlyList<string>? Options,
+    bool IsFocused = false);
 
 public sealed record BrowserFormContext(
     string Url,

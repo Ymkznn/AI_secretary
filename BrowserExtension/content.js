@@ -1,27 +1,69 @@
 (() => {
+  function cleanSnippet(t, max = 80) {
+    return String(t || '').replace(/\s+/g, ' ').trim().slice(0, max);
+  }
+
+  function findRowSectionTitle(tr) {
+    let prev = tr.previousElementSibling;
+    for (let steps = 0; prev && steps < 4; steps++, prev = prev.previousElementSibling) {
+      const cells = Array.from(prev.querySelectorAll('th, td')).filter(c => !c.querySelector('input, textarea, select'));
+      if (cells.length === 0) continue;
+      const text = cleanSnippet(cells.map(c => c.innerText || '').join(' ').trim(), 60);
+      if (text && text.length >= 2) return text;
+    }
+    const table = tr.closest('table');
+    if (table) {
+      const caption = cleanSnippet(table.querySelector('caption')?.innerText, 60);
+      if (caption) return caption;
+    }
+    return '';
+  }
+
   function findLabel(el, doc) {
     const ownerDoc = doc || el.ownerDocument || document;
-    if (el.getAttribute('aria-label')) return el.getAttribute('aria-label').trim();
+    if (el.getAttribute('aria-label')) return cleanSnippet(el.getAttribute('aria-label'));
+    const labelledBy = el.getAttribute('aria-labelledby');
+    if (labelledBy) {
+      const txt = labelledBy.split(/\s+/).map(id => ownerDoc.getElementById(id)?.innerText?.trim()).filter(Boolean).join(' ');
+      if (txt) return cleanSnippet(txt);
+    }
     if (el.id) {
       const lbl = ownerDoc.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-      if (lbl && lbl.innerText) return lbl.innerText.trim();
+      if (lbl && lbl.innerText) return cleanSnippet(lbl.innerText);
     }
     const parentLabel = el.closest('label');
-    if (parentLabel && parentLabel.innerText) return parentLabel.innerText.trim();
+    if (parentLabel && parentLabel.innerText) return cleanSnippet(parentLabel.innerText);
     const gformItem = el.closest('[role="listitem"]');
     if (gformItem) {
       const heading = gformItem.querySelector('[role="heading"], .M7eMe');
-      if (heading && heading.innerText) return heading.innerText.trim();
+      if (heading && heading.innerText) return cleanSnippet(heading.innerText);
     }
     const tr = el.closest('tr');
     if (tr) {
+      const ownTd = el.closest('td, th');
       const th = tr.querySelector('th, td:first-child');
-      if (th && th !== el.closest('td') && th.innerText) {
-        const t = th.innerText.trim();
-        if (t && t.length <= 60) return t;
+      let rowLabel = '';
+      if (th && th !== ownTd && th.innerText) {
+        const t = cleanSnippet(th.innerText, 60);
+        if (t) rowLabel = t;
       }
+      if (!rowLabel && ownTd?.previousElementSibling) {
+        const prevTxt = cleanSnippet(ownTd.previousElementSibling.innerText, 60);
+        if (prevTxt) rowLabel = prevTxt;
+      }
+      // If the row label is missing or looks like a repeated generic column header (e.g. "同仁備註"), prepend preceding row title.
+      if (!rowLabel || rowLabel.length <= 8) {
+        const sec = findRowSectionTitle(tr);
+        if (sec && sec !== rowLabel) {
+          return rowLabel ? cleanSnippet(`${sec} - ${rowLabel}`, 100) : sec;
+        }
+      }
+      if (rowLabel) return rowLabel;
     }
-    return (el.placeholder || el.title || el.name || el.id || '').trim();
+    const fieldset = el.closest('fieldset');
+    const legend = fieldset?.querySelector('legend')?.innerText;
+    if (legend) return cleanSnippet(legend);
+    return cleanSnippet(el.placeholder || el.title || el.name || el.id || '');
   }
 
   function queryAllDeep(root, selector, visitedDocs = new Set()) {
@@ -58,9 +100,49 @@
     return results;
   }
 
+  function isTrackableEditable(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    const isEditableDiv = tag !== 'input' && tag !== 'textarea' && tag !== 'select' && el.isContentEditable;
+    if (tag !== 'input' && tag !== 'textarea' && tag !== 'select' && !isEditableDiv) return false;
+    const type = isEditableDiv ? 'contenteditable' : (el.type || tag).toLowerCase();
+    if (type === 'password' || type === 'hidden' || type === 'submit' || type === 'button' || type === 'image' || type === 'reset') return false;
+    return !el.disabled && !el.readOnly;
+  }
+
+  function getDeepActiveElement(doc = document) {
+    let cur = doc?.activeElement || null;
+    while (cur) {
+      if (cur.shadowRoot?.activeElement) {
+        cur = cur.shadowRoot.activeElement;
+        continue;
+      }
+      const tag = (cur.tagName || '').toUpperCase();
+      if ((tag === 'IFRAME' || tag === 'FRAME') && cur.contentDocument?.activeElement) {
+        cur = cur.contentDocument.activeElement;
+        continue;
+      }
+      break;
+    }
+    return cur;
+  }
+
+  function getFocusedEditableInfo() {
+    const active = getDeepActiveElement(document);
+    if (isTrackableEditable(active)) {
+      return { el: active, at: Date.now() };
+    }
+    const last = window.__aiSecLastFocused;
+    if (last?.el && last.el.isConnected && isTrackableEditable(last.el)) {
+      return { el: last.el, at: last.at || 1 };
+    }
+    return { el: null, at: 0 };
+  }
+
   function extractFormFields(framePrefix = '') {
     const fields = [];
     const elements = queryAllDeep(document, 'input, textarea, select, [contenteditable="true"]');
+    const focusInfo = getFocusedEditableInfo();
     let idx = 0;
     const prefix = framePrefix ? `${framePrefix}_` : '';
     for (const el of elements) {
@@ -81,13 +163,16 @@
 
       const currentVal = isEditableDiv ? (el.innerText || '').trim() : (el.value || '');
 
+      const isFocused = el === focusInfo.el;
       fields.push({
         fieldId: fid,
         name: el.name || el.id || '',
         label: findLabel(el, el.ownerDocument),
         controlType: type,
         currentValue: currentVal,
-        options
+        options,
+        isFocused,
+        focusedAt: isFocused ? focusInfo.at : 0
       });
     }
     return { url: location.href, title: document.title, fields };
@@ -348,6 +433,19 @@
     applyFills,
     fillOtp
   };
+
+  if (!window.__aiSecretaryFocusTrackerInstalled) {
+    window.__aiSecretaryFocusTrackerInstalled = true;
+    const recordFocus = (ev) => {
+      const path = typeof ev.composedPath === 'function' ? ev.composedPath() : [ev.target];
+      const target = path.find(n => isTrackableEditable(n));
+      if (target) {
+        window.__aiSecLastFocused = { el: target, at: Date.now() };
+      }
+    };
+    document.addEventListener('focusin', recordFocus, true);
+    document.addEventListener('pointerdown', recordFocus, true);
+  }
 
   if (!window.__aiSecretaryFormHelperInstalled) {
     window.__aiSecretaryFormHelperInstalled = true;

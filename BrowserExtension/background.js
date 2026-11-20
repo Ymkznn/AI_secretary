@@ -98,7 +98,21 @@ async function extractAllFramesForm(tab) {
     }
   }
 
-  return { url: topUrl, title: topTitle, fields: mergedFields };
+  let bestIdx = -1;
+  let bestAt = 0;
+  for (let i = 0; i < mergedFields.length; i++) {
+    const at = Number(mergedFields[i].focusedAt || 0);
+    if (mergedFields[i].isFocused && at >= bestAt) {
+      bestAt = at;
+      bestIdx = i;
+    }
+  }
+  const finalFields = mergedFields.map((f, i) => {
+    const { focusedAt, ...rest } = f;
+    return { ...rest, isFocused: i === bestIdx };
+  });
+
+  return { url: topUrl, title: topTitle, fields: finalFields };
 }
 
 async function handleExtract(requestId) {

@@ -120,6 +120,13 @@ public sealed class WorkflowOptimizerAgent
                 : _cache.CurrentPromoteMinCounter;
             var note = root.TryGetProperty("note", out var nt) ? nt.GetString() ?? "AI tuned" : "AI tuned";
 
+            // Prevent a cold-start / 0%-hit death spiral from locking the threshold too high.
+            if (stats.Hits == 0 && stats.Predictions < 20)
+            {
+                threshold = Math.Min(threshold, 0.72);
+                promote = Math.Min(promote, 2);
+            }
+
             var disableIds = new List<string>();
             if (root.TryGetProperty("disable_ids", out var da) && da.ValueKind == JsonValueKind.Array)
             {

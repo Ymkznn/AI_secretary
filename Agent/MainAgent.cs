@@ -24,6 +24,8 @@ public sealed class MainAgent
     private readonly SkillRegistry _skillRegistry;
     private readonly UiLocalizer _localizer;
     private readonly AppSettingsService _settings;
+    private readonly ActivityMonitorService _activity;
+    private readonly WorkflowCacheService _workflowCache;
     private readonly ILogger<MainAgent> _logger;
 
     public MainAgent(
@@ -37,6 +39,8 @@ public sealed class MainAgent
         SkillRegistry skillRegistry,
         UiLocalizer localizer,
         AppSettingsService settings,
+        ActivityMonitorService activity,
+        WorkflowCacheService workflowCache,
         ILogger<MainAgent> logger)
     {
         _store = store;
@@ -49,6 +53,8 @@ public sealed class MainAgent
         _skillRegistry = skillRegistry;
         _localizer = localizer;
         _settings = settings;
+        _activity = activity;
+        _workflowCache = workflowCache;
         _logger = logger;
     }
 
@@ -113,6 +119,7 @@ public sealed class MainAgent
             ttsEnabled);
 
         var activeTasksContext = MainAgentPrompts.FormatActiveTasksContext(activePlannerTasks);
+        var activeWindowContext = ActivityMonitorService.FormatActiveWindowState(_activity.GetLastExternalTarget());
 
         var dynamicUserPrompt = MainAgentPrompts.BuildUserContextPrompt(
             DateTimeOffset.Now,
@@ -121,7 +128,74 @@ public sealed class MainAgent
             prefContext,
             factsContext,
             userPrompt,
-            activeTasksContext);
+            activeTasksContext,
+            activeWindowContext);
+
+        // Fast path: 2-bit branch prediction for repeated read-only single-step intents (skips MainAgent routing LLM).
+        if (string.IsNullOrWhiteSpace(targetMailId) &&
+            string.IsNullOrWhiteSpace(preferredLogicalTaskId) &&
+            (activePlannerTasks is null || activePlannerTasks.Count == 0) &&
+            !AttachmentExtractor.AttachmentPattern.IsMatch(userPrompt))
+        {
+            var (predWf, predStep) = await _workflowCache.TryPredictSingleStepAsync(conversationId, userPrompt, ct);
+            if (predWf is not null && predStep is not null)
+            {
+                var predSkill = predStep.Skill;
+                var predArgs = predStep.Args;
+                var predAck = await _localizer.TextAsync("DefaultDispatchAck", "Working on it...", Array.Empty<object?>(), ct);
+
+                if (onDispatchBackground is not null)
+                {
+                    onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerDispatch", "MainAgent dispatched Worker ({0}, {1})", predSkill, "Predicted"));
+                    await onReplyAsync(predAck, new List<MailSourceRef>());
+
+                    onDispatchBackground(async (bgCt, bgReplyAsync, bgDirectTtsText, bgChoices) =>
+                    {
+                        var (handled, summary, sources) = await _worker.ExecuteSingleSkillAsync(
+                            conversationId, userPrompt, predSkill, predArgs, targetMailId, confirmAsync,
+                            async s => { onStageChanged?.Invoke("worker", s); await onStatusAsync(s); },
+                            ModelTier.Simple, bgCt, bgDirectTtsText, bgChoices);
+                        if (handled)
+                        {
+                            await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: true, estimatedTokensSaved: 350, bgCt);
+                            onSingleSkillFinished?.Invoke(taskId);
+                            onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", predSkill));
+                            await bgReplyAsync(summary, sources);
+                            return;
+                        }
+
+                        await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: false, estimatedTokensSaved: 0, bgCt);
+                        onStageChanged?.Invoke("planner", _localizer.TextCached("StagePlannerPlanning", "MainAgent -> Planner ({0})...", "Simple"));
+                        var plannerTaskId = resolveLogicalTaskId is not null
+                            ? resolveLogicalTaskId("call_planner", null, userPrompt)
+                            : taskId;
+                        bool isDone = true;
+                        await _planner.ExecuteGoalAsync(
+                            conversationId, plannerTaskId, userPrompt, userPrompt, targetMailId, confirmAsync,
+                            async s => { onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
+                            bgReplyAsync, onStageChanged, ModelTier.Simple, bgCt, bgDirectTtsText, bgChoices, done => isDone = done);
+                        onPlannerTaskFinished?.Invoke(plannerTaskId, isDone);
+                    });
+                    return;
+                }
+
+                await onStatusAsync(predAck);
+                onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerDispatch", "MainAgent dispatched Worker ({0}, {1})", predSkill, "Predicted"));
+                var (handledSyncPred, summarySyncPred, sourcesSyncPred) = await _worker.ExecuteSingleSkillAsync(
+                    conversationId, userPrompt, predSkill, predArgs, targetMailId, confirmAsync,
+                    s => onStatusAsync(s), ModelTier.Simple, ct, onDirectTtsText, onChoices);
+                if (handledSyncPred)
+                {
+                    await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: true, estimatedTokensSaved: 350, ct);
+                    onSingleSkillFinished?.Invoke(taskId);
+                    onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", predSkill));
+                    await onReplyAsync(summarySyncPred, sourcesSyncPred);
+                    return;
+                }
+
+                await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: false, estimatedTokensSaved: 0, ct);
+            }
+        }
 
         var routeMessages = new List<ModelMessage>(2 + historyMessages.Count)
         {
@@ -183,6 +257,7 @@ public sealed class MainAgent
                         tier, bgCt, bgDirectTtsText, bgChoices);
                     if (handled)
                     {
+                        await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, bgCt);
                         onSingleSkillFinished?.Invoke(taskId);
                         onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
                         await bgReplyAsync(summary, sources);
@@ -225,6 +300,7 @@ public sealed class MainAgent
                 conversationId, userPrompt, skill, args, targetMailId, confirmAsync, workerStatusAsync, tier, ct, onDirectTtsText, onChoices);
             if (handledSync)
             {
+                await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, ct);
                 onSingleSkillFinished?.Invoke(taskId);
                 onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
                 await onReplyAsync(summarySync, sourcesSync);

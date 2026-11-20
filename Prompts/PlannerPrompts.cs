@@ -62,8 +62,14 @@ Output pure JSON only (write `title`, `summary`, and button `label`s strictly in
         string factsContext,
         string customSkillsPrompt,
         string goal,
-        string userPrompt)
-        => $$$"""
+        string userPrompt,
+        string activeWindowContext = "")
+    {
+        var activeWindowBlock = string.IsNullOrWhiteSpace(activeWindowContext)
+            ? ""
+            : $"\n<active_window>\n{activeWindowContext}\n</active_window>\n";
+
+        return $$$"""
             now: {{{now:yyyy-MM-dd HH:mm:ss zzz}}}
             sandbox_root: {{{sandboxRootPath}}}
             {{{(string.IsNullOrWhiteSpace(targetMailId) ? "" : $"target_mail_id: {targetMailId}")}}}
@@ -80,10 +86,11 @@ Output pure JSON only (write `title`, `summary`, and button `label`s strictly in
 
             custom_skills:
             {{{customSkillsPrompt}}}
-
+            {{{activeWindowBlock}}}
             goal: {{{goal}}}
             user_prompt: {{{userPrompt}}}
             """;
+    }
 
     /// <summary>組裝最終回覆彙整階段的 System Prompt（供 Planner 與單步 Worker 共用）。</summary>
     public static string BuildFinalReplySystemPrompt(

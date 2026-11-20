@@ -51,10 +51,19 @@ public sealed class BrowserFormSkill : IBasicSkill
                 return;
             }
 
-            var lines = form.Fields.Take(40).Select(f =>
+            var focused = form.Fields.FirstOrDefault(f => f.IsFocused);
+            var shown = form.Fields.Take(40).ToList();
+            if (focused is not null && !shown.Any(f => f.FieldId == focused.FieldId))
+                shown.Add(focused);
+
+            var lines = shown.Select(f =>
                 $"- field_id={f.FieldId} | label={f.Label} | type={f.ControlType} | current={f.CurrentValue ?? ""}" +
-                (f.Options is { Count: > 0 } ? $" | options=[{string.Join(", ", f.Options.Take(10))}]" : ""));
-            ctx.Observations.Add($"browser_form: \"{form.Title}\" ({form.Url})\nfields:\n" + string.Join("\n", lines));
+                (f.Options is { Count: > 0 } ? $" | options=[{string.Join(", ", f.Options.Take(10))}]" : "") +
+                (f.IsFocused ? " | [FOCUSED]" : ""));
+            var focusHeader = focused is not null
+                ? $"\nfocused_field: {focused.FieldId} | label={focused.Label}"
+                : "";
+            ctx.Observations.Add($"browser_form: \"{form.Title}\" ({form.Url}){focusHeader}\nfields:\n" + string.Join("\n", lines));
             ctx.CompletedSteps.Add("browser_form:read");
             return;
         }

@@ -35,6 +35,7 @@ public sealed class PlannerAgent
     private readonly WorkflowCacheService _workflowCache;
     private readonly UiLocalizer _localizer;
     private readonly AppSettingsService _settings;
+    private readonly ActivityMonitorService _activity;
     private readonly ILogger<PlannerAgent> _logger;
 
     public PlannerAgent(
@@ -50,6 +51,7 @@ public sealed class PlannerAgent
         WorkflowCacheService workflowCache,
         UiLocalizer localizer,
         AppSettingsService settings,
+        ActivityMonitorService activity,
         ILogger<PlannerAgent> logger)
     {
         _store = store;
@@ -64,6 +66,7 @@ public sealed class PlannerAgent
         _workflowCache = workflowCache;
         _localizer = localizer;
         _settings = settings;
+        _activity = activity;
         _logger = logger;
     }
 
@@ -112,6 +115,7 @@ public sealed class PlannerAgent
         var plannerSysPrompt = PlannerPrompts.BuildPlannerSystemPrompt(enabledBuiltInBlock, replyLang);
 
         var nowLocal = DateTimeOffset.Now;
+        var activeWindowContext = ActivityMonitorService.FormatActiveWindowState(_activity.GetLastExternalTarget());
         var plannerPrompt = PlannerPrompts.BuildPlannerUserPrompt(
             nowLocal,
             _sandbox.RootPath,
@@ -120,7 +124,8 @@ public sealed class PlannerAgent
             factsContext,
             customSkillsPrompt,
             goal,
-            userPrompt);
+            userPrompt,
+            activeWindowContext);
 
         var sources = new List<MailSourceRef>();
         var observations = new List<string>();

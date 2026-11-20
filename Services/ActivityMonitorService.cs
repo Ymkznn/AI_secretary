@@ -70,6 +70,7 @@ public sealed class ActivityMonitorService : IDisposable
     public Func<string, string, IReadOnlyList<string>, CancellationToken, Task<string>>? SemanticClassifyAsync { get; set; }
 
     private readonly ConcurrentDictionary<string, string> _intentCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _pageHitCooldowns = new(StringComparer.OrdinalIgnoreCase);
 
     public bool ProactiveMonitoringEnabled { get; set; } = true;
 
@@ -84,6 +85,20 @@ public sealed class ActivityMonitorService : IDisposable
     {
         if (_loopTask is not null) return;
         _loopTask = Task.Run(() => MonitorLoopAsync(_cts.Token));
+    }
+
+    public static bool IsBrowserProcess(string? processName)
+        => !string.IsNullOrWhiteSpace(processName) && BrowserProcesses.Contains(processName.Trim());
+
+    public static string FormatActiveWindowState(ExternalWindowTarget? target)
+    {
+        if (target is null)
+            return "(none)";
+        var isBrowser = IsBrowserProcess(target.ProcessName);
+        var labels = target.FormFieldLabels is { Count: > 0 }
+            ? string.Join(", ", target.FormFieldLabels.Take(10))
+            : "(not scanned)";
+        return $"process: {target.ProcessName} | title: {target.Title} | is_browser: {isBrowser} | input_count: {target.VisibleInputCount} | uia_labels: {labels}";
     }
 
     public ExternalWindowTarget? GetLastExternalTarget()
@@ -197,6 +212,17 @@ public sealed class ActivityMonitorService : IDisposable
         if (isHighConf && predictedIntent is not null)
         {
             _intentCache[target.Title] = predictedIntent;
+            // Record a telemetry hit whenever a non-OTP high-confidence cache entry skips an LLM call
+            // (otp_wait is separately validated when an OTP email arrives or the burst expires).
+            if (!string.Equals(predictedIntent, "otp_wait", StringComparison.OrdinalIgnoreCase))
+            {
+                var now = DateTimeOffset.UtcNow;
+                if (!_pageHitCooldowns.TryGetValue(patternKey, out var lastHit) || (now - lastHit) >= TimeSpan.FromSeconds(30))
+                {
+                    _pageHitCooldowns[patternKey] = now;
+                    _ = _pagePredictor.RecordOutcomeAsync(patternKey, hit: true, estimatedTokensSaved: 90, CancellationToken.None);
+                }
+            }
             return (patternKey, predictedIntent);
         }
 

@@ -326,6 +326,7 @@ public sealed class SecretaryController : IDisposable
         }
 
         await _workflowCache.LoadTuningAsync(_appCts.Token);
+        await _workflowCache.MigrateAndCleanLegacyCachesAsync(ConversationId, _appCts.Token);
         _activity.SemanticClassifyAsync = (proc, title, fields, token) =>
             _planner.ClassifyWindowIntentAsync(proc, title, fields, token);
         _activity.VerificationPageEntered += (_, patternKey) =>

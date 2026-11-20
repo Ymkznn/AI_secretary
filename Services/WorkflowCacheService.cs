@@ -15,9 +15,9 @@ public sealed class WorkflowCacheService
 {
     private readonly SqliteStore _store;
     private readonly GuardService _guard;
-    private volatile float _overlapThreshold = 0.70f;
+    private volatile float _overlapThreshold = 0.65f;
     private volatile int _promoteMinCounter = 2;
-    private string _lastOptimizationNote = "Initial baseline (threshold=0.70, promote=2)";
+    private string _lastOptimizationNote = "Initial baseline (threshold=0.65, promote=2)";
 
     public double CurrentOverlapThreshold => _overlapThreshold;
     public int CurrentPromoteMinCounter => _promoteMinCounter;
@@ -31,6 +31,23 @@ public sealed class WorkflowCacheService
 
     public async Task LoadTuningAsync(CancellationToken ct = default)
     {
+        var resetDone = await _store.GetSyncValueAsync("workflow_tuning_v2_reset", ct);
+        if (resetDone != "1")
+        {
+            _overlapThreshold = 0.65f;
+            _promoteMinCounter = 2;
+            _lastOptimizationNote = "Reset baseline after hit-accounting & 2-gram migration (threshold=0.65, promote=2)";
+            var resetJson = JsonSerializer.Serialize(new
+            {
+                overlap_threshold = 0.65,
+                promote_min_counter = 2,
+                note = _lastOptimizationNote
+            });
+            await _store.SetSyncValueAsync("workflow_predictor_tuning", resetJson, ct);
+            await _store.SetSyncValueAsync("workflow_tuning_v2_reset", "1", ct);
+            return;
+        }
+
         var raw = await _store.GetSyncValueAsync("workflow_predictor_tuning", ct);
         if (string.IsNullOrWhiteSpace(raw)) return;
         try
@@ -44,6 +61,37 @@ public sealed class WorkflowCacheService
                 _lastOptimizationNote = nt.GetString()!;
         }
         catch { }
+    }
+
+    public async Task MigrateAndCleanLegacyCachesAsync(string conversationId, CancellationToken ct = default)
+    {
+        var cleaned = await _store.GetSyncValueAsync("workflow_cache_v2_cleaned", ct);
+        if (cleaned == "1") return;
+
+        var all = await _store.GetWorkflowCachesAsync(conversationId, ct);
+        foreach (var w in all)
+        {
+            var steps = ParseSteps(w.StepsJson);
+            bool isEvent = w.GoalSignature.Contains("event:", StringComparison.OrdinalIgnoreCase);
+            bool isSingle = w.GoalSignature.StartsWith("single:", StringComparison.OrdinalIgnoreCase);
+
+            if (steps.Count == 0 ||
+                HasNonReusableMutatingSteps(steps) ||
+                (!isEvent && HasNonReplayableArgs(steps)))
+            {
+                await _store.DeleteWorkflowCacheAsync(w.WorkflowId, ct);
+                continue;
+            }
+
+            var rawSig = isSingle ? w.GoalSignature["single:".Length..] : w.GoalSignature;
+            var recomputed = (isSingle ? "single:" : "") + BuildSignature(rawSig);
+            if (!string.Equals(recomputed, w.GoalSignature, StringComparison.Ordinal))
+            {
+                await _store.UpsertWorkflowCacheAsync(w with { GoalSignature = recomputed }, ct);
+            }
+        }
+
+        await _store.SetSyncValueAsync("workflow_cache_v2_cleaned", "1", ct);
     }
 
     public async Task ApplyTuningAsync(
@@ -110,7 +158,8 @@ public sealed class WorkflowCacheService
         var minCounter = _promoteMinCounter;
         foreach (var w in all)
         {
-            if (w.Status == "Disabled" || w.PredictorCounter < minCounter)
+            if (w.Status == "Disabled" || w.PredictorCounter < minCounter ||
+                w.GoalSignature.StartsWith("single:", StringComparison.OrdinalIgnoreCase))
                 continue;
 
             var sigTokens = Tokenize(w.GoalSignature);
@@ -130,6 +179,97 @@ public sealed class WorkflowCacheService
             return (null, new List<CachedWorkflowStep>());
 
         return (best, steps);
+    }
+
+    public async Task<(WorkflowCacheRecord? Record, CachedWorkflowStep? Step)> TryPredictSingleStepAsync(
+        string conversationId,
+        string userPrompt,
+        CancellationToken ct = default)
+    {
+        var queryTokens = Tokenize(BuildSignature(userPrompt));
+        if (queryTokens.Count == 0) return (null, null);
+
+        var all = await _store.GetWorkflowCachesAsync(conversationId, ct);
+        WorkflowCacheRecord? best = null;
+        double bestScore = 0.0;
+
+        var threshold = _overlapThreshold;
+        var minCounter = _promoteMinCounter;
+        foreach (var w in all)
+        {
+            if (w.Status == "Disabled" || w.PredictorCounter < minCounter ||
+                !w.GoalSignature.StartsWith("single:", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var sigTokens = Tokenize(w.GoalSignature["single:".Length..]);
+            var score = ComputeOverlap(queryTokens, sigTokens);
+            if (score >= threshold && score > bestScore)
+            {
+                best = w;
+                bestScore = score;
+            }
+        }
+
+        if (best is null) return (null, null);
+
+        var steps = ParseSteps(best.StepsJson);
+        if (steps.Count != 1) return (null, null);
+        var step = steps[0];
+        if (!_guard.IsSkillEnabled(step.Skill) || !IsReplayableSingleSkill(step.Skill, step.Args))
+            return (null, null);
+
+        return (best, step);
+    }
+
+    public async Task RecordObservedSingleSkillAsync(
+        string conversationId,
+        string userPrompt,
+        string skill,
+        JsonElement args,
+        CancellationToken ct = default)
+    {
+        if (!IsReplayableSingleSkill(skill, args)) return;
+
+        var sigCore = BuildSignature(userPrompt);
+        if (string.IsNullOrWhiteSpace(sigCore)) return;
+        var sig = "single:" + sigCore;
+
+        var step = new CachedWorkflowStep(skill, args.Clone());
+        var stepsJson = JsonSerializer.Serialize(new[] { step });
+        var existing = await _store.GetWorkflowCachesAsync(conversationId, ct);
+        var queryTokens = Tokenize(sigCore);
+        var match = existing.FirstOrDefault(w =>
+            w.GoalSignature.StartsWith("single:", StringComparison.OrdinalIgnoreCase) &&
+            ComputeOverlap(queryTokens, Tokenize(w.GoalSignature["single:".Length..])) >= 0.75);
+
+        if (match is not null)
+        {
+            var prevSteps = ParseSteps(match.StepsJson);
+            bool sameSkill = prevSteps.Count == 1 && string.Equals(prevSteps[0].Skill, skill, StringComparison.OrdinalIgnoreCase);
+            int nextCounter = sameSkill ? Math.Min(3, match.PredictorCounter + 1) : 1;
+            await _store.UpsertWorkflowCacheAsync(match with
+            {
+                StepsJson = stepsJson,
+                PredictorCounter = nextCounter,
+                HitCount = sameSkill ? match.HitCount + 1 : match.HitCount,
+                Status = nextCounter >= 2 ? "Hot" : "Cold",
+                LastUsedAt = DateTimeOffset.UtcNow
+            }, ct);
+        }
+        else
+        {
+            await _store.UpsertWorkflowCacheAsync(new WorkflowCacheRecord(
+                WorkflowId: Guid.NewGuid().ToString("N")[..12],
+                ConversationId: conversationId,
+                GoalSignature: sig,
+                StepsJson: stepsJson,
+                PredictorCounter: 1,
+                HitCount: 1,
+                MissCount: 0,
+                Status: "Cold",
+                LastUsedAt: DateTimeOffset.UtcNow,
+                CreatedAt: DateTimeOffset.UtcNow), ct);
+        }
     }
 
     public async Task RecordPredictionOutcomeAsync(
@@ -179,9 +319,10 @@ public sealed class WorkflowCacheService
         IReadOnlyList<KnowledgeFactRecord>? sourcePrefs = null)
     {
         if (steps.Count < 2) return;
-        // Plans that create/delete/update/fill with one-off hardcoded arguments (ids, text, values) cannot be replayed
+        // Plans that create/delete/update/fill or contain one-off hardcoded entity args cannot be replayed
         // for a different request; caching them only produces mispredictions that cost an extra LLM round.
-        if (HasNonReusableMutatingSteps(steps)) return;
+        bool isEvent = goal.StartsWith("event:", StringComparison.OrdinalIgnoreCase);
+        if (HasNonReusableMutatingSteps(steps) || (!isEvent && HasNonReplayableArgs(steps))) return;
 
         var sig = BuildSignature($"{goal} {userPrompt}");
         if (string.IsNullOrWhiteSpace(sig)) return;
@@ -261,6 +402,44 @@ public sealed class WorkflowCacheService
         "create", "add", "delete", "remove", "update", "edit", "fill", "write", "append", "execute", "run",
         "send", "reply", "forward", "move", "rename", "dismiss", "cancel", "update_interval", "update_slide_text"
     };
+
+    private static readonly HashSet<string> NonReplayableArgKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "mail_id", "fact_id", "event_id", "watcher_id", "reminder_id", "file_path", "path",
+        "source_dir", "destination_dir", "url", "code", "command", "content", "body", "text", "query", "keyword"
+    };
+
+    private static readonly HashSet<string> ReplayableSingleSkills = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "manage_mail", "manage_schedule", "manage_calendar", "manage_watcher", "browser_form", "inspect_screen"
+    };
+
+    internal static bool HasNonReplayableArgs(IReadOnlyList<CachedWorkflowStep> steps)
+    {
+        foreach (var step in steps)
+        {
+            if (step.Args.ValueKind != JsonValueKind.Object) continue;
+            foreach (var prop in step.Args.EnumerateObject())
+            {
+                if (NonReplayableArgKeys.Contains(prop.Name) &&
+                    prop.Value.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(prop.Value.GetString()))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    internal static bool IsReplayableSingleSkill(string skill, JsonElement args)
+    {
+        if (!ReplayableSingleSkills.Contains(skill)) return false;
+        var list = new[] { new CachedWorkflowStep(skill, args) };
+        if (HasNonReusableMutatingSteps(list) || HasNonReplayableArgs(list))
+            return false;
+        return true;
+    }
 
     internal static bool HasNonReusableMutatingSteps(IReadOnlyList<CachedWorkflowStep> steps)
     {
