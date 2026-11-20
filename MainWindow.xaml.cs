@@ -513,8 +513,24 @@ public partial class MainWindow : Window
     private void RenderNotificationActions(
         NotificationActionPayload n,
         string? pinnedId,
-        Action<string, bool, Func<Task>> addAction)
+        Action<string, bool, Func<Task>> addAction,
+        bool includeDismiss = false)
     {
+        int addedCount = 0;
+        void AddTracked(string label, bool isPrimary, Func<Task> handler)
+        {
+            addedCount++;
+            addAction(label, isPrimary, handler);
+        }
+
+        async Task DismissNotificationPinnedAsync()
+        {
+            if (pinnedId is not null)
+                await _controller.DismissPinnedReminderAsync(pinnedId);
+            else
+                await DismissPinnedForNotificationAsync(n);
+        }
+
         if (n.Actions is { Count: > 0 })
         {
             foreach (var btn in n.Actions)
@@ -525,14 +541,11 @@ public partial class MainWindow : Window
                         if (!string.IsNullOrWhiteSpace(btn.Prompt))
                         {
                             var code = btn.Prompt;
-                            addAction(btn.Label, btn.IsPrimary, async () =>
+                            AddTracked(btn.Label, btn.IsPrimary, async () =>
                             {
                                 if (TrySetClipboardText(code))
                                 {
-                                    if (pinnedId is not null)
-                                        await _controller.DismissPinnedReminderAsync(pinnedId);
-                                    else
-                                        await DismissPinnedForNotificationAsync(n);
+                                    await DismissNotificationPinnedAsync();
                                     OutputStatusText.Text = await _controller.LocalizeAsync("OtpCopiedStatus", "Copied code {0}!", code);
                                 }
                             });
@@ -543,19 +556,14 @@ public partial class MainWindow : Window
                         {
                             var code = btn.Prompt;
                             var titleHint = n.Title;
-                            addAction(btn.Label, btn.IsPrimary, async () =>
+                            AddTracked(btn.Label, btn.IsPrimary, async () =>
                             {
                                 TrySetClipboardText(code);
                                 try
                                 {
                                     var (ok, msg) = await _controller.FillOtpInExternalWindowAsync(code, titleHint);
                                     if (ok)
-                                    {
-                                        if (pinnedId is not null)
-                                            await _controller.DismissPinnedReminderAsync(pinnedId);
-                                        else
-                                            await DismissPinnedForNotificationAsync(n);
-                                    }
+                                        await DismissNotificationPinnedAsync();
                                     OutputStatusText.Text = msg;
                                 }
                                 catch (Exception ex)
@@ -566,23 +574,20 @@ public partial class MainWindow : Window
                         }
                         break;
                     case "view_mail":
-                        addAction(btn.Label, btn.IsPrimary, () => ShowMailDialogAsync(n.MailId));
+                        AddTracked(btn.Label, btn.IsPrimary, () => ShowMailDialogAsync(n.MailId));
                         break;
                     case "draft_reply":
-                        addAction(btn.Label, btn.IsPrimary, async () =>
+                        AddTracked(btn.Label, btn.IsPrimary, async () =>
                         {
-                            if (pinnedId is not null)
-                                await _controller.DismissPinnedReminderAsync(pinnedId);
+                            await DismissNotificationPinnedAsync();
                             await _controller.DraftReplyFromNotificationAsync(n);
                         });
                         break;
                     case "snooze":
                         if (n.Status == "Unread" || pinnedId is not null)
                         {
-                            addAction(btn.Label, btn.IsPrimary, async () =>
+                            AddTracked(btn.Label, btn.IsPrimary, async () =>
                             {
-                                if (pinnedId is not null)
-                                    await _controller.DismissPinnedReminderAsync(pinnedId);
                                 await _controller.SnoozeNotificationAsync(n.NotificationId);
                             });
                         }
@@ -591,16 +596,51 @@ public partial class MainWindow : Window
                         if (!string.IsNullOrWhiteSpace(btn.Prompt))
                         {
                             var p = btn.Prompt;
-                            addAction(btn.Label, btn.IsPrimary, async () =>
+                            AddTracked(btn.Label, btn.IsPrimary, async () =>
                             {
-                                if (pinnedId is not null)
-                                    await _controller.DismissPinnedReminderAsync(pinnedId);
+                                await DismissNotificationPinnedAsync();
                                 await _controller.SendUserPromptAsync(p, n.MailId);
                             });
                         }
                         break;
                 }
             }
+        }
+
+        if (includeDismiss && pinnedId is not null)
+        {
+            var dismissId = pinnedId;
+            AddTracked("已知（結束）", addedCount == 0, () => _controller.DismissPinnedReminderAsync(dismissId));
+        }
+    }
+
+    private void RenderConfirmationChoices(
+        IReadOnlyList<string> choices,
+        string? logicalTaskId,
+        string? pinnedId,
+        bool firstIsPrimary,
+        Action<string, bool, Func<Task>> addAction)
+    {
+        for (int i = 0; i < choices.Count; i++)
+        {
+            var chosenText = choices[i];
+            addAction(chosenText, i == 0 && firstIsPrimary, async () =>
+            {
+                _controller.ClearChoices();
+                CollapsePinnedToPill(force: true);
+                await _controller.SendUserPromptAsync(chosenText, replyToLogicalTaskId: logicalTaskId);
+            });
+        }
+
+        var resolvedPinnedId = pinnedId ?? (!string.IsNullOrWhiteSpace(logicalTaskId) ? $"confirm:{logicalTaskId}" : null);
+        if (resolvedPinnedId is not null)
+        {
+            var dismissId = resolvedPinnedId;
+            addAction("放棄", false, async () =>
+            {
+                CollapsePinnedToPill(force: true);
+                await _controller.DismissPinnedReminderAsync(dismissId);
+            });
         }
     }
 
@@ -737,10 +777,7 @@ public partial class MainWindow : Window
                         var b = MakeActionButton(label, isPrimary);
                         b.Click += async (_, _) => await handler();
                         actions.Children.Add(b);
-                    });
-                    var dismissBtn = MakeActionButton("已知（結束）", actions.Children.Count == 0);
-                    dismissBtn.Click += async (_, _) => await _controller.DismissPinnedReminderAsync(id);
-                    actions.Children.Add(dismissBtn);
+                    }, includeDismiss: true);
                     stack.Children.Add(actions);
                 }
                 else if (item.Kind == PinnedItemKind.Confirmation)
@@ -749,22 +786,12 @@ public partial class MainWindow : Window
                     var choices = item.Choices is { Count: > 0 }
                         ? item.Choices
                         : new[] { "繼續處理" };
-                    var logicalTaskId = item.LogicalTaskId;
-                    for (int i = 0; i < choices.Count; i++)
+                    RenderConfirmationChoices(choices, item.LogicalTaskId, id, firstIsPrimary: true, (label, isPrimary, handler) =>
                     {
-                        var chosenText = choices[i];
-                        var choiceBtn = MakeActionButton(chosenText, i == 0);
-                        choiceBtn.Click += async (_, _) =>
-                        {
-                            _controller.ClearChoices();
-                            CollapsePinnedToPill(force: true);
-                            await _controller.SendUserPromptAsync(chosenText, replyToLogicalTaskId: logicalTaskId);
-                        };
-                        actions.Children.Add(choiceBtn);
-                    }
-                    var dismissBtn = MakeActionButton("放棄", false);
-                    dismissBtn.Click += async (_, _) => await _controller.DismissPinnedReminderAsync(id);
-                    actions.Children.Add(dismissBtn);
+                        var b = MakeActionButton(label, isPrimary);
+                        b.Click += async (_, _) => await handler();
+                        actions.Children.Add(b);
+                    });
                     stack.Children.Add(actions);
                 }
                 else
@@ -1586,7 +1613,15 @@ public partial class MainWindow : Window
             OutputRichText.Visibility = Visibility.Visible;
             OutputRichText.Document = MarkdownRenderer.Render(_currentOutputMarkdown, _isDark);
 
-            RenderNotificationActions(n, pinnedId: null, AddAction);
+            var activePinned = _controller.FindPinnedForNotification(n);
+            if (activePinned is not null)
+            {
+                RenderNotificationActions(n, pinnedId: activePinned.Id, AddAction, includeDismiss: true);
+            }
+            else if (!string.IsNullOrWhiteSpace(n.MailId))
+            {
+                AddAction("查看信件", false, () => ShowMailDialogAsync(n.MailId));
+            }
             if (OutputActionsPanel.Children.Count > 0)
                 OutputActionsPanel.Visibility = Visibility.Visible;
         }
@@ -1619,17 +1654,16 @@ public partial class MainWindow : Window
             {
                 var choices = _controller.GetChoicesForMessage(latest.Id);
                 var choiceLogicalTaskId = _controller.GetChoicesLogicalTaskIdForMessage(latest.Id);
-                for (int i = 0; i < choices.Count; i++)
-                {
-                    var chosenText = choices[i];
-                    AddAction(chosenText, i == 0 && latest.Sources.Count == 0, async () =>
-                    {
-                        _controller.ClearChoices();
-                        await _controller.SendUserPromptAsync(chosenText, replyToLogicalTaskId: choiceLogicalTaskId);
-                    });
-                }
                 if (choices.Count > 0)
+                {
+                    RenderConfirmationChoices(
+                        choices,
+                        choiceLogicalTaskId,
+                        pinnedId: null,
+                        firstIsPrimary: latest.Sources.Count == 0,
+                        AddAction);
                     OutputActionsPanel.Visibility = Visibility.Visible;
+                }
             }
         }
 

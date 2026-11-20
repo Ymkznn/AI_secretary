@@ -325,11 +325,37 @@ public sealed class SecretaryController : IDisposable
             ? _latestChoicesLogicalTaskId
             : null;
 
-    public void ClearChoices()
+    public void ClearChoices(bool removePinnedChatChoice = true)
     {
+        var prevLogicalId = _latestChoicesLogicalTaskId;
         _latestChoicesMsgId = null;
         _latestChoices = new List<string>();
         _latestChoicesLogicalTaskId = null;
+
+        if (removePinnedChatChoice &&
+            (string.Equals(prevLogicalId, "chat-choice", StringComparison.Ordinal) ||
+             HasPinnedConfirmation("chat-choice")))
+        {
+            RemovePinnedConfirmation("chat-choice");
+        }
+    }
+
+    public PinnedReminderItem? FindPinnedForNotification(NotificationActionPayload n)
+    {
+        lock (_pinnedLock)
+        {
+            return _pinnedReminders.FirstOrDefault(p =>
+                p.MailNotification is not null &&
+                (string.Equals(p.MailNotification.NotificationId, n.NotificationId, StringComparison.Ordinal) ||
+                 (!string.IsNullOrEmpty(n.MailId) && string.Equals(p.MailNotification.MailId, n.MailId, StringComparison.Ordinal))));
+        }
+    }
+
+    private bool HasPinnedConfirmation(string logicalTaskId)
+    {
+        var id = $"confirm:{logicalTaskId}";
+        lock (_pinnedLock)
+            return _pinnedReminders.Any(p => string.Equals(p.Id, id, StringComparison.Ordinal));
     }
 
     public IReadOnlyList<string> GetTrustedPaths() => _sandbox.GetTrustedPaths();
@@ -725,7 +751,7 @@ public sealed class SecretaryController : IDisposable
             TaskId = taskId,
             CreatedAt = DateTimeOffset.UtcNow.AddMilliseconds(5)
         };
-        ClearChoices();
+        ClearChoices(removePinnedChatChoice: true);
         if (!string.IsNullOrWhiteSpace(replyToLogicalTaskId))
             RemovePinnedConfirmation(replyToLogicalTaskId);
         await _store.UpsertChatMessageAsync(assistantMsg);
@@ -1176,12 +1202,20 @@ public sealed class SecretaryController : IDisposable
     public void ClosePlannerTask(string logicalId)
     {
         if (string.IsNullOrWhiteSpace(logicalId)) return;
+        bool clearedChoices = false;
+        if (string.Equals(_latestChoicesLogicalTaskId, logicalId, StringComparison.Ordinal))
+        {
+            ClearChoices(removePinnedChatChoice: false);
+            clearedChoices = true;
+        }
         if (_activePlannerTasks.TryGetValue(logicalId, out var state) && Volatile.Read(ref state.RunningCount) <= 0)
         {
             _activePlannerTasks.TryRemove(logicalId, out _);
             _guard.ClearTaskApprovals(logicalId);
             RemovePinnedConfirmation(logicalId);
         }
+        if (clearedChoices)
+            StateChanged?.Invoke();
     }
 
     private void CleanupExpiredPlannerTasks()
@@ -1234,6 +1268,26 @@ public sealed class SecretaryController : IDisposable
 
     public async Task SnoozeNotificationAsync(string notificationId)
     {
+        bool removedAny = false;
+        lock (_pinnedLock)
+        {
+            for (int i = _pinnedReminders.Count - 1; i >= 0; i--)
+            {
+                var p = _pinnedReminders[i];
+                if (p.MailNotification is not null &&
+                    string.Equals(p.MailNotification.NotificationId, notificationId, StringComparison.Ordinal))
+                {
+                    _pinnedNextRemindAt.TryRemove(p.Id, out _);
+                    _pinnedReminders.RemoveAt(i);
+                    removedAny = true;
+                }
+            }
+        }
+        if (removedAny)
+        {
+            await SavePinnedRemindersAsync();
+            PinnedRemindersChanged?.Invoke();
+        }
         await _store.UpdateNotificationStatusAsync(notificationId, "Snoozed", DateTimeOffset.UtcNow.AddMinutes(15));
         StateChanged?.Invoke();
     }
@@ -1348,10 +1402,21 @@ public sealed class SecretaryController : IDisposable
         {
             await _store.UpdateNotificationStatusAsync(removed.MailNotification.NotificationId, "Handled", null);
         }
-        else if (removed?.Kind == PinnedItemKind.Confirmation && !string.IsNullOrWhiteSpace(removed.LogicalTaskId))
+        else if (removed?.Kind == PinnedItemKind.Confirmation)
         {
-            ClosePlannerTask(removed.LogicalTaskId);
+            if (string.Equals(_latestChoicesLogicalTaskId, removed.LogicalTaskId, StringComparison.Ordinal) ||
+                string.Equals(id, "confirm:chat-choice", StringComparison.Ordinal))
+            {
+                ClearChoices(removePinnedChatChoice: false);
+            }
+            if (!string.IsNullOrWhiteSpace(removed.LogicalTaskId) &&
+                !string.Equals(removed.LogicalTaskId, "chat-choice", StringComparison.Ordinal))
+            {
+                ClosePlannerTask(removed.LogicalTaskId);
+            }
         }
+
+        StateChanged?.Invoke();
     }
 
     private List<PinnedReminderItem> MatchPinnedRemindersLocked(string rawKeyword)
