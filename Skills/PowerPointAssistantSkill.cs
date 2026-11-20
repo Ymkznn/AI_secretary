@@ -26,28 +26,38 @@ public sealed class PowerPointAssistantSkill : IBasicSkill
     public string StatusText => "Processing PowerPoint deck...";
     public string MainAgentSpec => """
             powerpoint_assistant
-               - Purpose: Inspect active PowerPoint slide/outline/notes or safely update slide text/notes (backup + confirmation required).
-               - Args: {"action": "inspect_slide|inspect_outline|update_slide_text", "slide_index": 1, "shape_index": 2, "text": "...", "notes": "..."}
+               - Purpose: Inspect PowerPoint slide/outline/notes/tables (for active window or a specific `file_path` .pptx) or safely update slide text/notes (backup + confirmation required).
+               - Args: {"action": "inspect_slide|inspect_outline|update_slide_text", "file_path": "optional .pptx path", "slide_index": 1, "shape_index": 2, "text": "...", "notes": "..."}
             
         """;
-    public string PlannerSpec => """powerpoint_assistant: Inspect or safely update active PowerPoint slide/outline/notes. args: {"action":"inspect_slide|inspect_outline|update_slide_text","slide_index":1,"shape_index":2,"text":"...","notes":"..."}""";
+    public string PlannerSpec => """powerpoint_assistant: Inspect or safely update PowerPoint slide/outline/notes/tables (active window or `file_path`). args: {"action":"inspect_slide|inspect_outline|update_slide_text","file_path":"optional .pptx path","slide_index":1,"shape_index":2,"text":"...","notes":"..."}""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
         var skillName = ctx.EffectiveName(Name);
         var action = (ctx.GetArg("action") ?? "inspect_slide").Trim().ToLowerInvariant();
+        var targetPath = ctx.GetArg("file_path") ?? ctx.GetArg("path");
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
 
         if (action is "inspect_slide" or "inspect_outline")
         {
-            var (ok, filePath, summary) = await _office.InspectPowerPointAsync(action == "inspect_outline", ctx.Ct);
+            if (!string.IsNullOrWhiteSpace(targetPath))
+            {
+                if (!await _skills.EnsureExternalPathAccessAsync(targetPath, skillName, ctx.ConfirmAsync, ctx.Ct))
+                {
+                    ctx.Observations.Add($"powerpoint_assistant: user denied read permission for {targetPath}.");
+                    return;
+                }
+            }
+
+            var (ok, filePath, summary) = await _office.InspectPowerPointAsync(action == "inspect_outline" || !string.IsNullOrWhiteSpace(targetPath), ctx.Ct, targetPath);
             if (!ok)
             {
                 ctx.Observations.Add(summary);
                 return;
             }
 
-            if (!await _skills.EnsureExternalPathAccessAsync(filePath, skillName, ctx.ConfirmAsync, ctx.Ct))
+            if (string.IsNullOrWhiteSpace(targetPath) && !await _skills.EnsureExternalPathAccessAsync(filePath, skillName, ctx.ConfirmAsync, ctx.Ct))
             {
                 ctx.Observations.Add($"powerpoint_assistant: user denied read permission for {filePath}.");
                 return;

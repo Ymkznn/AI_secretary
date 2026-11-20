@@ -202,6 +202,7 @@ public sealed class SecretaryController : IDisposable
         _skills.PinReminderRequested += (title, message, mins) =>
             AddPinnedReminder(new PinnedReminderItem(Guid.NewGuid().ToString("N"), title, message, null, null, mins));
         _skills.DismissPinnedReminderRequested += DismissPinnedByKeywordAsync;
+        _skills.UpdatePinnedReRemindRequested += UpdatePinnedReRemindByKeywordAsync;
         _skills.PublishNotificationHandler = PersistNotificationAsync;
         _skills.UserPrefChanged += convId =>
             _ = _workflowCache.InvalidateEventWorkflowsAsync(convId, CancellationToken.None);
@@ -1385,19 +1386,33 @@ public sealed class SecretaryController : IDisposable
         }
     }
 
+    private List<PinnedReminderItem> MatchPinnedRemindersLocked(string rawKeyword)
+    {
+        var kw = rawKeyword?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(kw) || string.Equals(kw, "all", StringComparison.OrdinalIgnoreCase) || kw == "全部")
+            return _pinnedReminders.ToList();
+
+        var parts = kw
+            .Split(new[] { ',', ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return _pinnedReminders.Where(p =>
+            parts.Any(part =>
+                p.Id.Equals(part, StringComparison.OrdinalIgnoreCase) ||
+                p.Title.Contains(part, StringComparison.OrdinalIgnoreCase) ||
+                p.Summary.Contains(part, StringComparison.OrdinalIgnoreCase))).ToList();
+    }
+
     private async Task<string> DismissPinnedByKeywordAsync(string keyword)
     {
         var kw = keyword?.Trim() ?? "";
         List<PinnedReminderItem> targets;
         lock (_pinnedLock)
         {
-            if (string.Equals(kw, "all", StringComparison.OrdinalIgnoreCase) || kw == "全部")
-                targets = _pinnedReminders.ToList();
-            else
-                targets = _pinnedReminders.Where(p =>
-                    p.Id.Equals(kw, StringComparison.OrdinalIgnoreCase) ||
-                    p.Title.Contains(kw, StringComparison.OrdinalIgnoreCase) ||
-                    p.Summary.Contains(kw, StringComparison.OrdinalIgnoreCase)).ToList();
+            targets = string.IsNullOrWhiteSpace(kw)
+                ? new List<PinnedReminderItem>()
+                : MatchPinnedRemindersLocked(kw);
         }
 
         if (targets.Count == 0)
@@ -1410,6 +1425,57 @@ public sealed class SecretaryController : IDisposable
 
         var names = string.Join("、", targets.Select(t => $"「{t.Title}」"));
         return await _localizer.TextAsync("PinnedDismissed", "Dismissed pinned reminder(s): {0}.", new object?[] { names }, _appCts.Token);
+    }
+
+    private async Task<string> UpdatePinnedReRemindByKeywordAsync(string keyword, int? reRemindMinutes)
+    {
+        var kw = keyword?.Trim() ?? "";
+        if (reRemindMinutes is null)
+        {
+            List<PinnedReminderItem> all;
+            lock (_pinnedLock)
+                all = _pinnedReminders.ToList();
+            if (all.Count == 0)
+                return "dismiss_reminder: no pinned reminders currently active.";
+
+            var lines = all.Select(p =>
+            {
+                var nextText = _pinnedNextRemindAt.TryGetValue(p.Id, out var nextAt)
+                    ? nextAt.ToLocalTime().ToString("HH:mm")
+                    : "none";
+                return $"- id={p.Id} | kind={p.Kind} | title=\"{p.Title}\" | re_remind_minutes={p.ReRemindMinutes}m | next_re_remind={nextText}";
+            });
+            return $"dismiss_reminder: {all.Count} pinned reminder(s):\n" + string.Join("\n", lines);
+        }
+
+        int newMins = Math.Clamp(reRemindMinutes.Value, 0, 1440);
+        var updatedTitles = new List<string>();
+        var now = DateTimeOffset.UtcNow;
+
+        lock (_pinnedLock)
+        {
+            var targets = MatchPinnedRemindersLocked(kw);
+            if (targets.Count == 0)
+                return $"dismiss_reminder: no pinned reminder matching '{kw}'.";
+
+            foreach (var t in targets)
+            {
+                var idx = _pinnedReminders.FindIndex(p => p.Id == t.Id);
+                if (idx < 0) continue;
+                _pinnedReminders[idx] = t with { ReRemindMinutes = newMins };
+                if (newMins > 0)
+                    _pinnedNextRemindAt[t.Id] = now.AddMinutes(newMins);
+                else
+                    _pinnedNextRemindAt.TryRemove(t.Id, out _);
+                updatedTitles.Add($"\"{t.Title}\"");
+            }
+        }
+
+        await SavePinnedRemindersAsync();
+        PinnedRemindersChanged?.Invoke();
+        return newMins > 0
+            ? $"dismiss_reminder: updated re_remind_minutes to {newMins}m (next re-remind at {now.AddMinutes(newMins).ToLocalTime():HH:mm}) for {updatedTitles.Count} pinned reminder(s): {string.Join(", ", updatedTitles)}."
+            : $"dismiss_reminder: disabled periodic re-reminding (re_remind_minutes=0, card remains pinned) for {updatedTitles.Count} pinned reminder(s): {string.Join(", ", updatedTitles)}.";
     }
 
     private async Task SavePinnedRemindersAsync()

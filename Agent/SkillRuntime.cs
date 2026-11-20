@@ -40,6 +40,7 @@ public sealed class SkillRuntime
 
     public event Action<string, string, int>? PinReminderRequested;
     public event Func<string, Task<string>>? DismissPinnedReminderRequested;
+    public event Func<string, int?, Task<string>>? UpdatePinnedReRemindRequested;
     public event Action? SchedulesChanged;
     public event Action<DateTimeOffset?, bool>? QuietModeChanged;
     public event Action<string>? TrustedPathAdded;
@@ -175,6 +176,14 @@ public sealed class SkillRuntime
         if (DismissPinnedReminderRequested is null)
             return await _localizer.TextAsync("CannotDismissPinnedReminder", "Cannot dismiss pinned reminder right now.", Array.Empty<object?>(), ct);
         return await DismissPinnedReminderRequested.Invoke(keyword ?? "");
+    }
+
+    /// <summary>列出或修改現有置頂提醒的再提醒間隔（分鐘，0 代表停用重複提醒但保留置頂卡）。</summary>
+    public async Task<string> UpdatePinnedReRemindAsync(string keyword, int? reRemindMinutes, CancellationToken ct = default)
+    {
+        if (UpdatePinnedReRemindRequested is null)
+            return "Cannot update pinned reminder interval right now.";
+        return await UpdatePinnedReRemindRequested.Invoke(keyword ?? "", reRemindMinutes);
     }
 
     public async Task<ReminderRecord> CreateReminderAsync(

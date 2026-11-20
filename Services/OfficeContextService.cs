@@ -127,20 +127,66 @@ public sealed class OfficeContextService
             }
         }, ct);
 
-    public Task<(bool Ok, string? FilePath, string Summary)> InspectPowerPointAsync(bool allSlides, CancellationToken ct = default)
+    public Task<(bool Ok, string? FilePath, string Summary)> InspectPowerPointAsync(bool allSlides, CancellationToken ct = default, string? targetFilePath = null)
         => RunStaAsync(() =>
         {
+            if (!string.IsNullOrWhiteSpace(targetFilePath) && File.Exists(targetFilePath) &&
+                Path.GetExtension(targetFilePath).Equals(".pptx", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var extracted = AttachmentExtractor.ExtractPptxText(targetFilePath);
+                    if (!string.IsNullOrWhiteSpace(extracted))
+                        return (true, Path.GetFullPath(targetFilePath), extracted);
+                }
+                catch { }
+            }
+
             dynamic? ppt = TryGetActiveComObject("PowerPoint.Application");
             if (ppt is null)
                 return (false, (string?)null, "No open PowerPoint window detected.");
 
             try
             {
-                dynamic? pres = ppt.ActivePresentation;
+                dynamic? pres = null;
+                if (!string.IsNullOrWhiteSpace(targetFilePath))
+                {
+                    var targetName = Path.GetFileName(targetFilePath.Trim());
+                    int presCount = (int)ppt.Presentations.Count;
+                    for (int p = 1; p <= presCount; p++)
+                    {
+                        try
+                        {
+                            dynamic candidate = ppt.Presentations[p];
+                            string cFull = SafeString(() => (string)candidate.FullName);
+                            string cName = SafeString(() => (string)candidate.Name);
+                            if (cFull.Equals(targetFilePath, StringComparison.OrdinalIgnoreCase) ||
+                                cName.Equals(targetName, StringComparison.OrdinalIgnoreCase) ||
+                                cName.Contains(targetName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                pres = candidate;
+                                break;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                pres ??= ppt.ActivePresentation;
                 if (pres is null)
                     return (false, (string?)null, "No active PowerPoint presentation.");
 
                 string fullName = SafeString(() => (string)pres.FullName);
+                if (File.Exists(fullName) && Path.GetExtension(fullName).Equals(".pptx", StringComparison.OrdinalIgnoreCase) && allSlides)
+                {
+                    try
+                    {
+                        var openXmlSummary = AttachmentExtractor.ExtractPptxText(fullName);
+                        if (!string.IsNullOrWhiteSpace(openXmlSummary))
+                            return (true, fullName, openXmlSummary);
+                    }
+                    catch { }
+                }
+
                 int total = (int)pres.Slides.Count;
                 int currentIdx = 1;
                 try { currentIdx = (int)ppt.ActiveWindow.View.Slide.SlideIndex; } catch { }
@@ -161,11 +207,7 @@ public sealed class OfficeContextService
                         try
                         {
                             dynamic shape = slide.Shapes[s];
-                            if ((int)shape.HasTextFrame != 0 && (int)shape.TextFrame.HasText != 0)
-                            {
-                                string txt = SafeString(() => (string)shape.TextFrame.TextRange.Text).Replace("\r", " / ");
-                                sb.AppendLine($"  [Shape {s}] {txt}");
-                            }
+                            AppendComShapeText(sb, shape, $"Shape {s}");
                         }
                         catch { }
                     }
@@ -190,6 +232,58 @@ public sealed class OfficeContextService
                 return (false, (string?)null, $"Failed to read PowerPoint: {ex.Message}");
             }
         }, ct);
+
+    private static void AppendComShapeText(StringBuilder sb, dynamic shape, string label)
+    {
+        try
+        {
+            if ((int)shape.HasTextFrame != 0 && (int)shape.TextFrame.HasText != 0)
+            {
+                string txt = SafeString(() => (string)shape.TextFrame.TextRange.Text).Replace("\r", " / ").Replace("\v", " / ");
+                if (!string.IsNullOrWhiteSpace(txt))
+                    sb.AppendLine($"  [{label}] {txt}");
+            }
+        }
+        catch { }
+
+        try
+        {
+            if ((int)shape.HasTable != 0)
+            {
+                dynamic tbl = shape.Table;
+                int rows = (int)tbl.Rows.Count;
+                int cols = (int)tbl.Columns.Count;
+                sb.AppendLine($"  [{label} Table ({rows}x{cols})]");
+                for (int r = 1; r <= rows; r++)
+                {
+                    var cells = new List<string>();
+                    for (int c = 1; c <= cols; c++)
+                    {
+                        string cellTxt = SafeString(() => (string)tbl.Cell(r, c).Shape.TextFrame.TextRange.Text)
+                            .Replace("\r", " ").Replace("\n", " ").Replace("\v", " ").Trim();
+                        cells.Add(cellTxt);
+                    }
+                    if (cells.Any(x => !string.IsNullOrWhiteSpace(x)))
+                        sb.AppendLine($"    | {string.Join(" | ", cells)} |");
+                }
+            }
+        }
+        catch { }
+
+        try
+        {
+            // msoGroup == 6
+            if ((int)shape.Type == 6)
+            {
+                int gCount = (int)shape.GroupItems.Count;
+                for (int g = 1; g <= gCount; g++)
+                {
+                    AppendComShapeText(sb, shape.GroupItems[g], $"{label}.{g}");
+                }
+            }
+        }
+        catch { }
+    }
 
     public Task<(bool Ok, string? FilePath, string Message)> UpdatePowerPointSlideAsync(
         int slideIndex,

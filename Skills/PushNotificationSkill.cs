@@ -52,7 +52,7 @@ public sealed class PushNotificationSkill : IBasicSkill
             summary = ev?.Summary ?? ctx.UserPrompt;
 
         var reRemind = int.TryParse(ctx.GetArg("re_remind_minutes"), out var mins)
-            ? Math.Clamp(mins, 1, 1440)
+            ? Math.Clamp(mins, 0, 1440)
             : (ev?.ReRemindMinutes ?? 15);
 
         var includeFillArg = ctx.GetArg("include_fill_button");
@@ -71,7 +71,7 @@ public sealed class PushNotificationSkill : IBasicSkill
         if (ev is not null)
             ev.Published = true;
 
-        ctx.Observations.Add($"push_notification: published \"{title}\" (include_fill_button={includeFill}).");
+        ctx.Observations.Add($"push_notification: published \"{title}\" (re_remind_minutes={reRemind}m, include_fill_button={includeFill}).");
         ctx.CompletedSteps.Add("push_notification");
     }
 }
