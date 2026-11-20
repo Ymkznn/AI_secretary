@@ -1522,9 +1522,11 @@ public partial class MainWindow : Window
         OutputActionsPanel.Visibility = Visibility.Collapsed;
 
         var streamingAssistant = messages.LastOrDefault(m => m.Role == "assistant" && m.IsStreaming);
-        var latest = (_controller.HasRunningTasks && streamingAssistant is not null)
+        var latest = (_controller.IsMainTurnActive && streamingAssistant is not null)
             ? streamingAssistant
-            : messages.LastOrDefault(m => m.Role is "assistant" or "notification");
+            : _controller.HasRunningTasks
+                ? (messages.LastOrDefault(m => m.Role == "assistant") ?? messages.LastOrDefault(m => m.Role is "assistant" or "notification"))
+                : messages.LastOrDefault(m => m.Role is "assistant" or "notification");
         if (latest is null)
         {
             _hasOutputContent = false;
@@ -1536,7 +1538,7 @@ public partial class MainWindow : Window
         }
 
         _hasOutputContent = true;
-        _isReplying = latest.IsStreaming && _controller.HasRunningTasks;
+        _isReplying = _controller.IsMainTurnActive && latest.IsStreaming;
         UpdateSendButtonState();
 
         if (latest.IsStreaming && !string.IsNullOrWhiteSpace(latest.StatusText))

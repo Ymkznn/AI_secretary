@@ -71,7 +71,7 @@ public sealed class FoundryModelGateway : IModelGateway
                 resp = await _http.SendAsync(req, ct);
                 respBody = await resp.Content.ReadAsStringAsync(ct);
             }
-            catch (HttpRequestException ex) when (attempt < maxRetries && IsTransientNetworkError(ex))
+            catch (Exception ex) when (attempt < maxRetries && IsTransientNetworkError(ex, ct))
             {
                 resp?.Dispose();
                 var delayMs = Math.Min(1500 * (attempt + 1), 6000);
@@ -79,6 +79,11 @@ public sealed class FoundryModelGateway : IModelGateway
                     delayMs, attempt + 1, maxRetries);
                 await Task.Delay(delayMs, ct);
                 continue;
+            }
+            catch (HttpRequestException ex) when (ex.InnerException is not null)
+            {
+                resp?.Dispose();
+                throw new HttpRequestException($"{ex.Message} ({ex.InnerException.Message})", ex);
             }
             using var _ = resp;
 
@@ -91,7 +96,7 @@ public sealed class FoundryModelGateway : IModelGateway
                 continue;
             }
 
-            if (resp.StatusCode is HttpStatusCode.TooManyRequests or (HttpStatusCode)529 && attempt < maxRetries)
+            if (resp.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout or (HttpStatusCode)529 && attempt < maxRetries)
             {
                 var delay = GetRetryDelay(resp, attempt);
                 _logger.LogWarning("LLM API {Status}, retrying in {Delay}ms (attempt {Attempt}/{Max})",
@@ -170,9 +175,13 @@ public sealed class FoundryModelGateway : IModelGateway
         }
     }
 
-    private static bool IsTransientNetworkError(HttpRequestException ex)
-        => ex.HttpRequestError is HttpRequestError.NameResolutionError or HttpRequestError.ConnectionError
-           || ex.InnerException is System.Net.Sockets.SocketException;
+    private static bool IsTransientNetworkError(Exception ex, CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested) return false;
+        if (ex is HttpRequestException hre)
+            return hre.StatusCode is null;
+        return ex is IOException or System.Net.Sockets.SocketException;
+    }
 
     private static TimeSpan GetRetryDelay(HttpResponseMessage resp, int attempt)
     {

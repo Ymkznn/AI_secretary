@@ -75,7 +75,7 @@ public partial class ChatHistoryWindow : Window
 
     private void UpdateSendStopButton()
     {
-        if (_controller.HasRunningTasks)
+        if (_controller.IsMainTurnActive)
         {
             SendStopBtn.Content = "停止";
             SendStopBtn.Background = Brush("#DC2626");
@@ -87,7 +87,9 @@ public partial class ChatHistoryWindow : Window
             SendStopBtn.Content = "傳送";
             SendStopBtn.Background = Brush("#06C755");
             SendStopBtn.Foreground = Brushes.White;
-            HeaderSubtitle.Text = "即時同步桌面寵物對話";
+            HeaderSubtitle.Text = _controller.HasRunningTasks
+                ? "背景任務執行中（可繼續對話）"
+                : "即時同步桌面寵物對話";
         }
         SendStopBtn.BorderThickness = new Thickness(0);
     }
@@ -250,14 +252,22 @@ public partial class ChatHistoryWindow : Window
 
     private async Task SubmitOrStopAsync()
     {
-        if (_controller.HasRunningTasks)
+        var text = ChatInputBox.Text.Trim();
+        if (text.Equals("/kill magent", StringComparison.OrdinalIgnoreCase))
+        {
+            ChatInputBox.Text = string.Empty;
+            await _controller.KillMainAgentAsync();
+            UpdateSendStopButton();
+            return;
+        }
+
+        if (_controller.IsMainTurnActive)
         {
             _controller.StopAllTasks();
             UpdateSendStopButton();
             return;
         }
 
-        var text = ChatInputBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(text)) return;
 
         ChatInputBox.Text = string.Empty;

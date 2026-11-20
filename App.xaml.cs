@@ -37,17 +37,21 @@ public partial class App : System.Windows.Application
         sc.AddLogging(b => b.AddConsole());
 
         sc.AddHttpClient("EwsClient")
-            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+            .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
             {
-                UseDefaultCredentials = true,
+                Credentials = System.Net.CredentialCache.DefaultCredentials,
                 PreAuthenticate = true,
-                DefaultProxyCredentials = System.Net.CredentialCache.DefaultCredentials
+                DefaultProxyCredentials = System.Net.CredentialCache.DefaultCredentials,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30)
             });
 
         sc.AddHttpClient(Microsoft.Extensions.Options.Options.DefaultName)
-            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+            .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
             {
-                DefaultProxyCredentials = System.Net.CredentialCache.DefaultCredentials
+                DefaultProxyCredentials = System.Net.CredentialCache.DefaultCredentials,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30)
             });
 
         foreach (var adapterType in typeof(ILlmProviderAdapter).Assembly.GetTypes()
@@ -56,10 +60,16 @@ public partial class App : System.Windows.Application
             sc.AddSingleton(typeof(ILlmProviderAdapter), adapterType);
         }
 
-        sc.AddHttpClient<IModelGateway, FoundryModelGateway>()
-            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+        sc.AddHttpClient<IModelGateway, FoundryModelGateway>(client =>
             {
-                DefaultProxyCredentials = System.Net.CredentialCache.DefaultCredentials
+                client.Timeout = TimeSpan.FromSeconds(120);
+            })
+            .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+            {
+                DefaultProxyCredentials = System.Net.CredentialCache.DefaultCredentials,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30),
+                ConnectTimeout = TimeSpan.FromSeconds(20)
             });
         sc.AddHttpClient("TtsClient")
             .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler

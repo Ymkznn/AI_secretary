@@ -246,8 +246,24 @@ public sealed class ApiServerHost : IAsyncDisposable
                 SingleReader = true
             });
             _sseClients[clientId] = ch;
+            using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var timer = new PeriodicTimer(TimeSpan.FromSeconds(15));
+                    while (await timer.WaitForNextTickAsync(pingCts.Token))
+                    {
+                        ch.Writer.TryWrite("event: ping\ndata: {}\n\n");
+                    }
+                }
+                catch (OperationCanceledException) { }
+            }, pingCts.Token);
+
             try
             {
+                await ctx.Response.WriteAsync("event: ping\ndata: {}\n\n", ctx.RequestAborted);
+                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
                 await foreach (var payload in ch.Reader.ReadAllAsync(ctx.RequestAborted))
                 {
                     await ctx.Response.WriteAsync(payload, ctx.RequestAborted);
@@ -257,6 +273,7 @@ public sealed class ApiServerHost : IAsyncDisposable
             catch (OperationCanceledException) { }
             finally
             {
+                pingCts.Cancel();
                 _sseClients.TryRemove(clientId, out _);
             }
         });

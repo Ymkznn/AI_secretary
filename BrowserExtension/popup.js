@@ -16,9 +16,27 @@ scanBtn.addEventListener('click', async () => {
 
   try {
     const tab = await getActiveTab();
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
-    const formCtx = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_FORM' });
-    if (!formCtx || !formCtx.fields || formCtx.fields.length === 0) {
+    await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ['content.js'] });
+    const frameResults = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      func: () => {
+        const isTop = window === window.top;
+        const prefix = isTop ? 'top' : (window.name || 'sub');
+        return window.__aiSecretaryHelper
+          ? { isTop, data: window.__aiSecretaryHelper.extractFormFields(prefix) }
+          : null;
+      }
+    });
+
+    const mergedFields = [];
+    for (const item of frameResults || []) {
+      for (const f of item?.result?.data?.fields || []) {
+        mergedFields.push(f);
+      }
+    }
+
+    const formCtx = { url: tab.url || '', title: tab.title || '', fields: mergedFields };
+    if (formCtx.fields.length === 0) {
       statusEl.textContent = '此頁面未偵測到可填寫的表單欄位。';
       return;
     }
@@ -49,8 +67,13 @@ scanBtn.addEventListener('click', async () => {
 applyBtn.addEventListener('click', async () => {
   try {
     const tab = await getActiveTab();
-    const res = await chrome.tabs.sendMessage(tab.id, { type: 'APPLY_FILLS', fills: lastFills });
-    statusEl.textContent = `已安全預填 ${res?.applied || 0} 個欄位（未自動送出，請手動確認後提交）。`;
+    const frameResults = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      args: [lastFills],
+      func: (fillsList) => window.__aiSecretaryHelper ? window.__aiSecretaryHelper.applyFills(fillsList) : 0
+    });
+    const applied = (frameResults || []).reduce((acc, r) => acc + (r?.result || 0), 0);
+    statusEl.textContent = `已安全預填 ${applied} 個欄位（未自動送出，請手動確認後提交）。`;
   } catch (err) {
     statusEl.textContent = `套用失敗：${err.message}`;
   }

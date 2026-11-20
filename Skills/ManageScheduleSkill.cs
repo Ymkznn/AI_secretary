@@ -127,12 +127,43 @@ public sealed class ManageScheduleSkill : IBasicSkill
 
     private async Task DeleteAsync(SkillExecutionContext ctx)
     {
-        var id = ctx.GetArg("id") ?? ctx.GetArg("keyword") ?? ctx.GetArg("title") ?? "";
+        var raw = ctx.GetArg("id") ?? ctx.GetArg("ids") ?? ctx.GetArg("keyword") ?? ctx.GetArg("title") ?? "";
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
-        var ok = await _skills.DeleteScheduleAsync(id, ctx.Ct);
-        ctx.Observations.Add(ok
-            ? $"manage_schedule: deleted '{id}'."
-            : $"manage_schedule: schedule '{id}' not found.");
-        if (ok) ctx.CompletedSteps.Add($"manage_schedule:delete:{id}");
+
+        var targets = raw
+            .Split(new[] { ',', ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (targets.Count <= 1)
+        {
+            var id = targets.FirstOrDefault() ?? raw.Trim();
+            var ok = await _skills.DeleteScheduleAsync(id, ctx.Ct);
+            ctx.Observations.Add(ok
+                ? $"manage_schedule: deleted '{id}'."
+                : $"manage_schedule: schedule '{id}' not found.");
+            if (ok) ctx.CompletedSteps.Add($"manage_schedule:delete:{id}");
+            return;
+        }
+
+        var deleted = new List<string>();
+        var notFound = new List<string>();
+        foreach (var id in targets)
+        {
+            if (await _skills.DeleteScheduleAsync(id, ctx.Ct))
+            {
+                deleted.Add(id);
+                ctx.CompletedSteps.Add($"manage_schedule:delete:{id}");
+            }
+            else
+            {
+                notFound.Add(id);
+            }
+        }
+
+        var msg = $"manage_schedule: deleted {deleted.Count}/{targets.Count} schedule(s) [{string.Join(", ", deleted)}].";
+        if (notFound.Count > 0)
+            msg += $" Not found: [{string.Join(", ", notFound)}].";
+        ctx.Observations.Add(msg);
     }
 }

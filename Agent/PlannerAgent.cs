@@ -246,6 +246,44 @@ public sealed class PlannerAgent
                     new SessionHandoff(goal, completedSteps, new List<string>(), new List<string>(), sources.Select(s => s.MailId).ToList()),
                     ct);
 
+                // Autonomous 1-round continuation: if round 1 only performed read/list discovery (or hit stepLimit)
+                // and did not fail/decline, let Planner inspect observations and output follow-up action steps (or steps: [] if done).
+                bool wasDeclinedOrDenied = observations.Any(o =>
+                    o.Contains("declined", StringComparison.OrdinalIgnoreCase) ||
+                    o.Contains("denied", StringComparison.OrdinalIgnoreCase));
+                bool hadReadOrHitLimit = plannedSteps.Count > stepLimit ||
+                    completedSteps.Any(s =>
+                        s.EndsWith(":list", StringComparison.OrdinalIgnoreCase) ||
+                        s.EndsWith(":read", StringComparison.OrdinalIgnoreCase) ||
+                        s.EndsWith(":read_dom", StringComparison.OrdinalIgnoreCase) ||
+                        s.EndsWith(":scan", StringComparison.OrdinalIgnoreCase));
+
+                if (!wasDeclinedOrDenied && hadReadOrHitLimit && completedSteps.Count > 0)
+                {
+                    planMessages.Add(new("assistant", planResp.Content));
+                    planMessages.Add(new("user", $"Round 1 observations:\n{string.Join("\n\n", observations)}\n\nIf the goal (`{goal}`) requires follow-up execution steps based on the observations above (e.g. deleting/updating the discovered items — note: `manage_schedule` delete supports comma-separated IDs in `id`), output the remaining JSON steps (`{{\"status_note\":\"...\",\"steps\":[...]}}`). If the goal is already satisfied or requires user confirmation first, output `{{\"status_note\":\"\",\"steps\":[]}}`."));
+
+                    var followResp = await _model.CompleteAsync(planMessages, tier, ct);
+                    await _sessions.RecordTokensAsync(plannerSession, followResp.EstimatedTokens, ct: ct);
+                    var (followSteps, followNote) = ParsePlanWithStatus(followResp.Content);
+                    if (followSteps.Count > 0)
+                    {
+                        if (!string.IsNullOrWhiteSpace(followNote))
+                            await onStatusAsync(followNote);
+                        var followLimit = Math.Min(followSteps.Count, _guard.MaxWorkerStepsPerTask);
+                        for (int i = 0; i < followLimit; i++)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            var step = followSteps[i];
+                            var skillName = step.Skill.Trim();
+                            onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerStep", "Worker running {0} ({1}/{2})...", skillName, i + 1, followLimit));
+                            await _worker.RunStepAsync(
+                                conversationId, userPrompt, skillName, step.Args, targetMailId,
+                                confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
+                        }
+                    }
+                }
+
                 if (plannedSteps.Count >= 2 && completedSteps.Count == stepLimit)
                 {
                     await _workflowCache.RecordObservedPlanAsync(

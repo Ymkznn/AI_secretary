@@ -110,7 +110,7 @@ Output pure JSON only (write `title`, `summary`, and button `label`s strictly in
         }
 
         var taskStatusHint = includeTaskStatus
-            ? "\n- Append `[TASK_STATUS: waiting]` (if still awaiting user confirmation/input/next step, especially when `[CHOICES: ...]` is present) or `[TASK_STATUS: done]` (if the task goal is completely finished) on a new line at the end (stripped automatically)."
+            ? "\n- Append `[TASK_STATUS: waiting]` ONLY when you are explicitly asking the user a question and have also appended `[CHOICES: ...]`; otherwise append `[TASK_STATUS: done]` on a new line at the end (stripped automatically)."
             : "";
 
         return $"""

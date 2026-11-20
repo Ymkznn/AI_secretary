@@ -44,6 +44,7 @@ public sealed class SecretaryController : IDisposable
     private readonly ConcurrentDictionary<string, DateTimeOffset> _pinnedNextRemindAt = new();
     private readonly object _pinnedLock = new();
     private readonly SemaphoreSlim _mainTurnGate = new(1, 1);
+    private int _mainTurnActiveCount;
     private DateTimeOffset? _dndUntil;
     private bool _dndAllowUrgent = true;
     private DateTimeOffset _otpBurstUntilUtc = DateTimeOffset.MinValue;
@@ -603,6 +604,7 @@ public sealed class SecretaryController : IDisposable
         => _agentRuns.Values.OrderByDescending(r => r.StartedAt).Take(10).ToList();
 
     public bool HasRunningTasks => !_runningTasks.IsEmpty;
+    public bool IsMainTurnActive => Volatile.Read(ref _mainTurnActiveCount) > 0;
 
     public async Task<(string Model, string Endpoint, long InputTokens, long OutputTokens, long CacheTokens)> GetModelAndUsageInfoAsync()
     {
@@ -721,6 +723,7 @@ public sealed class SecretaryController : IDisposable
         var appCt = _appCts.Token;
         var linked = CancellationTokenSource.CreateLinkedTokenSource(appCt);
         _runningTasks[taskId] = linked;
+        Interlocked.Increment(ref _mainTurnActiveCount);
 
         var run = new ActiveAgentRun
         {
@@ -775,17 +778,8 @@ public sealed class SecretaryController : IDisposable
                 if (pendingSources is not null)
                     assistantMsg.Sources = pendingSources;
 
-                if (dispatchedWork is null)
-                {
-                    assistantMsg.IsStreaming = false;
-                    assistantMsg.StatusText = null;
-                }
-                else
-                {
-                    // Keep IsStreaming = true while background Worker/Planner is executing so notifications never hijack the bubble
-                    assistantMsg.IsStreaming = true;
-                    assistantMsg.StatusText = run.CurrentStep;
-                }
+                assistantMsg.IsStreaming = false;
+                assistantMsg.StatusText = null;
 
                 await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
                 StateChanged?.Invoke();
@@ -830,9 +824,12 @@ public sealed class SecretaryController : IDisposable
                     confirmAsync: (title, msg) => _interaction.RequestConfirmationAsync(title, msg, linked.Token),
                     onStatusAsync: async status =>
                     {
-                        assistantMsg.StatusText = status;
-                        await _store.UpsertChatMessageAsync(assistantMsg, linked.Token);
-                        StateChanged?.Invoke();
+                        if (assistantMsg.IsStreaming)
+                        {
+                            assistantMsg.StatusText = status;
+                            await _store.UpsertChatMessageAsync(assistantMsg, linked.Token);
+                            StateChanged?.Invoke();
+                        }
                     },
                     onReplyAsync: (text, sources) =>
                     {
@@ -932,9 +929,15 @@ public sealed class SecretaryController : IDisposable
                                 _guard.ClearTaskApprovals(logicalId);
                                 RemovePinnedConfirmation(logicalId);
                             }
-                            else if (!isCompleted && remaining <= 0)
+                            else if (!isCompleted && remaining <= 0 && turnLastChoices is { Count: > 0 })
                             {
                                 UpsertPinnedConfirmation(logicalId, state.Goal, turnLastSummary, turnLastChoices);
+                            }
+                            else if (!isCompleted && remaining <= 0)
+                            {
+                                _activePlannerTasks.TryRemove(logicalId, out _);
+                                _guard.ClearTaskApprovals(logicalId);
+                                RemovePinnedConfirmation(logicalId);
                             }
                         }
                     },
@@ -1009,6 +1012,9 @@ public sealed class SecretaryController : IDisposable
             }
             finally
             {
+                if (Interlocked.Decrement(ref _mainTurnActiveCount) < 0)
+                    Interlocked.Exchange(ref _mainTurnActiveCount, 0);
+
                 if (turnGateAcquired)
                     _mainTurnGate.Release();
 
@@ -1018,6 +1024,10 @@ public sealed class SecretaryController : IDisposable
                     _runningTasks.TryRemove(taskId, out _);
                     linked.Dispose();
                     AgentsChanged?.Invoke();
+                    StateChanged?.Invoke();
+                }
+                else
+                {
                     StateChanged?.Invoke();
                 }
             }
