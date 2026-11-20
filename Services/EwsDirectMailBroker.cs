@@ -13,7 +13,9 @@ namespace AiSecretary.Desktop.Services;
 
 public interface IMailBroker
 {
-    Task<IReadOnlyList<MailItem>> FetchRecentMailsAsync(DateTimeOffset? since, CancellationToken ct = default, string? query = null, int? maxResults = null);
+    bool IsConfigured { get; }
+    Task<IReadOnlyList<MailItem>> FetchRecentMailsAsync(DateTimeOffset? since, CancellationToken ct = default, string? query = null, int? maxResults = null, string? folder = null);
+    Task<IReadOnlyList<string>> ListFoldersAsync(CancellationToken ct = default);
     Task<MailItem?> GetMailByIdAsync(string mailId, CancellationToken ct = default);
 }
 
@@ -27,6 +29,9 @@ public sealed class EwsDirectMailBroker : IMailBroker
     private readonly GuardService _guard;
     private readonly string _ewsUrl;
     private readonly int _maxEntries;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _folderIdsByName = new(StringComparer.OrdinalIgnoreCase);
+
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(_ewsUrl);
 
     public EwsDirectMailBroker(IHttpClientFactory httpFactory, IConfiguration config, GuardService guard)
     {
@@ -36,21 +41,104 @@ public sealed class EwsDirectMailBroker : IMailBroker
         _maxEntries = config.GetValue<int>("Ews:MaxEntries", 20);
     }
 
-    public async Task<IReadOnlyList<MailItem>> FetchRecentMailsAsync(DateTimeOffset? since, CancellationToken ct = default, string? query = null, int? maxResults = null)
+    public async Task<IReadOnlyList<string>> ListFoldersAsync(CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(_ewsUrl))
+            throw new InvalidOperationException("EWS URL is not configured (set Ews:Url in appsettings.json).");
+
+        var soap = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <soap:Envelope
+              xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+              xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
+              xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+              <soap:Header>
+                <t:RequestServerVersion Version="Exchange2013" />
+              </soap:Header>
+              <soap:Body>
+                <m:FindFolder Traversal="Deep">
+                  <m:FolderShape>
+                    <t:BaseShape>Default</t:BaseShape>
+                  </m:FolderShape>
+                  <m:IndexedPageFolderView MaxEntriesReturned="100" Offset="0" BasePoint="Beginning" />
+                  <m:ParentFolderIds>
+                    <t:DistinguishedFolderId Id="msgfolderroot" />
+                  </m:ParentFolderIds>
+                </m:FindFolder>
+              </soap:Body>
+            </soap:Envelope>
+            """;
+
+        var xml = await SendSoapAsync("FindFolder", soap, ct);
+        var names = new List<string>();
+        foreach (var f in xml.Descendants(TNs + "Folder"))
+        {
+            var id = f.Element(TNs + "FolderId")?.Attribute("Id")?.Value;
+            var name = f.Element(TNs + "DisplayName")?.Value?.Trim();
+            if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(name))
+            {
+                _folderIdsByName[name] = id;
+                var total = f.Element(TNs + "TotalCount")?.Value;
+                var unread = f.Element(TNs + "UnreadCount")?.Value;
+                names.Add(!string.IsNullOrWhiteSpace(unread) && unread != "0"
+                    ? $"{name} (unread={unread}, total={total})"
+                    : $"{name} (total={total ?? "?"})");
+            }
+        }
+        return names;
+    }
+
+    private async Task<string> ResolveFolderIdXmlAsync(string? folder, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(folder))
+            return """<t:DistinguishedFolderId Id="inbox" />""";
+
+        var key = folder.Trim();
+        var distinguished = key.ToLowerInvariant() switch
+        {
+            "inbox" or "收件匣" or "收件夾" => "inbox",
+            "sent" or "sentitems" or "sent items" or "寄件備份" => "sentitems",
+            "drafts" or "draft" or "草稿" => "drafts",
+            "deleted" or "deleteditems" or "deleted items" or "trash" or "刪除的郵件" => "deleteditems",
+            "junk" or "junkemail" or "spam" or "垃圾郵件" => "junkemail",
+            "archive" or "封存" => "archive",
+            _ => null
+        };
+        if (distinguished is not null)
+            return $"""<t:DistinguishedFolderId Id="{distinguished}" />""";
+
+        if (!_folderIdsByName.TryGetValue(key, out var folderId))
+        {
+            await ListFoldersAsync(ct);
+            if (!_folderIdsByName.TryGetValue(key, out folderId))
+            {
+                var partial = _folderIdsByName.FirstOrDefault(kv => kv.Key.Contains(key, StringComparison.OrdinalIgnoreCase));
+                folderId = partial.Value;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(folderId))
+            throw new InvalidOperationException($"Mail folder '{key}' not found. Call manage_mail(action=\"list_folders\") to see available folders.");
+
+        return $"""<t:FolderId Id="{SecurityElement.Escape(folderId)}" />""";
+    }
+
+    public async Task<IReadOnlyList<MailItem>> FetchRecentMailsAsync(DateTimeOffset? since, CancellationToken ct = default, string? query = null, int? maxResults = null, string? folder = null)
     {
         if (string.IsNullOrWhiteSpace(_ewsUrl))
             throw new InvalidOperationException("EWS URL is not configured (set Ews:Url in appsettings.json).");
 
         var targetCount = Math.Clamp(maxResults ?? _maxEntries, 1, 100);
         var cleanQuery = string.IsNullOrWhiteSpace(query) ? null : query.Trim();
+        var folderXml = await ResolveFolderIdXmlAsync(folder, ct);
         var list = new List<MailItem>();
 
         if (cleanQuery is not null)
         {
-            // 1) Try server-side Exchange Search (<m:QueryString>) across the entire inbox
+            // 1) Try server-side Exchange Search (<m:QueryString>) across the target folder
             try
             {
-                var xml = await SendSoapAsync("FindItem", BuildFindItemSoap(targetCount, 0, cleanQuery), ct);
+                var xml = await SendSoapAsync("FindItem", BuildFindItemSoap(targetCount, 0, cleanQuery, folderXml), ct);
                 await AppendMatchedMessagesAsync(xml, since, null, targetCount, list, ct);
                 return list;
             }
@@ -61,7 +149,7 @@ public sealed class EwsDirectMailBroker : IMailBroker
                 const int maxScan = 500;
                 for (int offset = 0; offset < maxScan && list.Count < targetCount; offset += pageSize)
                 {
-                    var xml = await SendSoapAsync("FindItem", BuildFindItemSoap(pageSize, offset, null), ct);
+                    var xml = await SendSoapAsync("FindItem", BuildFindItemSoap(pageSize, offset, null, folderXml), ct);
                     int fetchedInPage = await AppendMatchedMessagesAsync(xml, since, cleanQuery, targetCount, list, ct);
                     if (fetchedInPage < pageSize) break;
                 }
@@ -69,7 +157,7 @@ public sealed class EwsDirectMailBroker : IMailBroker
             }
         }
 
-        var recentXml = await SendSoapAsync("FindItem", BuildFindItemSoap(targetCount, 0, null), ct);
+        var recentXml = await SendSoapAsync("FindItem", BuildFindItemSoap(targetCount, 0, null, folderXml), ct);
         await AppendMatchedMessagesAsync(recentXml, since, null, targetCount, list, ct);
         return list;
     }
@@ -123,7 +211,7 @@ public sealed class EwsDirectMailBroker : IMailBroker
         return rawCount;
     }
 
-    private static string BuildFindItemSoap(int maxEntries, int offset, string? queryString)
+    private static string BuildFindItemSoap(int maxEntries, int offset, string? queryString, string folderIdXml)
     {
         var queryXml = string.IsNullOrWhiteSpace(queryString)
             ? ""
@@ -158,7 +246,7 @@ public sealed class EwsDirectMailBroker : IMailBroker
                     </t:FieldOrder>
                   </m:SortOrder>
                   <m:ParentFolderIds>
-                    <t:DistinguishedFolderId Id="inbox" />
+                    {folderIdXml}
                   </m:ParentFolderIds>{queryXml}
                 </m:FindItem>
               </soap:Body>

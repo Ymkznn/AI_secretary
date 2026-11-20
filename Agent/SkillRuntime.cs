@@ -92,8 +92,14 @@ public sealed class SkillRuntime
         }
     }
 
-    public Task<IReadOnlyList<MailItem>> ReadInboxAsync(string? query = null, int? maxResults = null, CancellationToken ct = default)
-        => _mailBroker.FetchRecentMailsAsync(null, ct, query, maxResults);
+    public bool IsOutlookConfigured => _mailBroker.IsConfigured;
+    public bool IsGmailAuthorized => _gmail.IsAuthorized;
+
+    public Task<IReadOnlyList<MailItem>> ReadInboxAsync(string? query = null, int? maxResults = null, CancellationToken ct = default, string? folder = null)
+        => _mailBroker.FetchRecentMailsAsync(null, ct, query, maxResults, folder);
+
+    public Task<IReadOnlyList<string>> ListMailFoldersAsync(CancellationToken ct = default)
+        => _mailBroker.ListFoldersAsync(ct);
 
     public Task<MailItem?> GetMailDetailAsync(string mailId, CancellationToken ct = default)
         => _mailBroker.GetMailByIdAsync(mailId, ct);

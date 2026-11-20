@@ -25,10 +25,10 @@ public sealed class PushNotificationSkill : IBasicSkill
     public string MainAgentSpec => """
             push_notification
                - Purpose: Publish a desktop notification card and pinned reminder.
-               - Args: {"title": "optional in event workflows", "summary": "optional in event workflows", "include_fill_button": true, "re_remind_minutes": 15}
+               - Args: {"title": "notification title", "summary": "notification body", "re_remind_minutes": 15}
             
         """;
-    public string PlannerSpec => """push_notification: Publish desktop notification card & pinned reminder. args: {"title":"optional","summary":"optional","include_fill_button":true,"re_remind_minutes":15}""";
+    public string PlannerSpec => """push_notification: Publish desktop notification card & pinned reminder. args: {"title":"...","summary":"...","re_remind_minutes":15}""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
@@ -55,23 +55,15 @@ public sealed class PushNotificationSkill : IBasicSkill
             ? Math.Clamp(mins, 0, 1440)
             : (ev?.ReRemindMinutes ?? 15);
 
-        var includeFillArg = ctx.GetArg("include_fill_button");
-        var includeFill = !string.Equals(includeFillArg, "false", StringComparison.OrdinalIgnoreCase);
-
         var actions = ev?.Actions is not null
             ? new List<NotificationButtonOption>(ev.Actions)
             : new List<NotificationButtonOption>();
-
-        if (!includeFill)
-        {
-            actions.RemoveAll(a => a.Type == "fill_otp");
-        }
 
         await _skills.PublishNotificationHandler(convId, eventId, mail, title, summary, reRemind, actions, ctx.Ct);
         if (ev is not null)
             ev.Published = true;
 
-        ctx.Observations.Add($"push_notification: published \"{title}\" (re_remind_minutes={reRemind}m, include_fill_button={includeFill}).");
+        ctx.Observations.Add($"push_notification: published \"{title}\" (re_remind_minutes={reRemind}m).");
         ctx.CompletedSteps.Add("push_notification");
     }
 }

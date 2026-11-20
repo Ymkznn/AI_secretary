@@ -28,17 +28,51 @@ public sealed class ExcelAssistantSkill : IBasicSkill
     public string StatusText => "Processing Excel workbook...";
     public string MainAgentSpec => """
             excel_assistant
-               - Purpose: Inspect active Excel workbook selection/headers/formulas or safely write cells/formulas (backup + confirmation required).
-               - Args: {"action": "inspect_selection|write_cells", "writes": [{"cell": "F2", "value": "..."}]}
+               - Purpose: List sheets, read any sheet/range (active Excel or `file_path`), inspect active selection/formulas, or safely write cells/formulas (backup + confirmation required).
+               - Args: {"action": "inspect_selection|list_sheets|read_range|write_cells", "file_path": "optional .xlsx path", "sheet_name": "optional sheet name", "range": "optional e.g. A1:H30", "writes": [{"cell": "F2", "value": "..."}]}
             
         """;
-    public string PlannerSpec => """excel_assistant: Inspect active Excel selection or safely write cells/formulas. args: {"action":"inspect_selection|write_cells","writes":[{"cell":"F2","value":"..."}]}""";
+    public string PlannerSpec => """excel_assistant: List sheets, read range (active or `file_path`), inspect selection, or safely write cells/formulas. args: {"action":"inspect_selection|list_sheets|read_range|write_cells","file_path":"optional","sheet_name":"optional","range":"optional","writes":[{"cell":"F2","value":"..."}]}""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
         var skillName = ctx.EffectiveName(Name);
         var action = (ctx.GetArg("action") ?? "inspect_selection").Trim().ToLowerInvariant();
+        var targetPath = ctx.GetArg("file_path");
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
+
+        if (!string.IsNullOrWhiteSpace(targetPath))
+        {
+            if (!await _skills.EnsureExternalPathAccessAsync(targetPath, skillName, ctx.ConfirmAsync, ctx.Ct))
+            {
+                ctx.Observations.Add($"{skillName}: user denied read permission for {targetPath}.");
+                return;
+            }
+        }
+
+        if (action is "list_sheets" or "read_range")
+        {
+            var sheetName = ctx.GetArg("sheet_name");
+            var range = ctx.GetArg("range");
+            var (ok, filePath, summary) = await _office.ReadExcelWorkbookAsync(
+                targetPath, sheetName, range, listSheetsOnly: action == "list_sheets", ctx.Ct);
+            if (!ok)
+            {
+                ctx.Observations.Add(summary);
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(targetPath) &&
+                !await _skills.EnsureExternalPathAccessAsync(filePath, skillName, ctx.ConfirmAsync, ctx.Ct))
+            {
+                ctx.Observations.Add($"{skillName}: user denied read permission for {filePath}.");
+                return;
+            }
+
+            ctx.Observations.Add(summary);
+            ctx.CompletedSteps.Add($"{skillName}:{action}");
+            return;
+        }
 
         if (action == "inspect_selection")
         {

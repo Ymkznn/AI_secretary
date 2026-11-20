@@ -80,6 +80,150 @@ public sealed class OfficeContextService
             }
         }, ct);
 
+    public Task<(bool Ok, string? FilePath, string Summary)> ReadExcelWorkbookAsync(
+        string? filePath,
+        string? sheetName,
+        string? rangeAddress,
+        bool listSheetsOnly,
+        CancellationToken ct = default)
+        => RunStaAsync(() =>
+        {
+            dynamic? excel = null;
+            dynamic? wb = null;
+            bool openedByUs = false;
+            bool createdApp = false;
+
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(filePath))
+                {
+                    if (!File.Exists(filePath))
+                        return (false, (string?)null, $"Excel file not found: {filePath}");
+
+                    excel = TryGetActiveComObject("Excel.Application");
+                    if (excel is null)
+                    {
+                        var t = Type.GetTypeFromProgID("Excel.Application");
+                        if (t is null) return (false, (string?)null, "Microsoft Excel is not installed on this machine.");
+                        excel = Activator.CreateInstance(t);
+                        if (excel is null) return (false, (string?)null, "Failed to start Excel COM instance.");
+                        excel.Visible = false;
+                        excel.DisplayAlerts = false;
+                        createdApp = true;
+                    }
+
+                    var fullTarget = Path.GetFullPath(filePath);
+                    try
+                    {
+                        foreach (dynamic openWb in excel.Workbooks)
+                        {
+                            if (string.Equals(SafeString(() => (string)openWb.FullName), fullTarget, StringComparison.OrdinalIgnoreCase))
+                            {
+                                wb = openWb;
+                                break;
+                            }
+                        }
+                    }
+                    catch { }
+
+                    if (wb is null)
+                    {
+                        wb = excel.Workbooks.Open(fullTarget, ReadOnly: true);
+                        openedByUs = true;
+                    }
+                }
+                else
+                {
+                    excel = TryGetActiveComObject("Excel.Application");
+                    if (excel is null)
+                        return (false, (string?)null, "No open Excel window detected (or pass file_path to open a .xlsx file).");
+                    wb = excel.ActiveWorkbook;
+                }
+
+                if (wb is null)
+                    return (false, (string?)null, "No active Excel workbook.");
+
+                string fullName = SafeString(() => (string)wb.FullName);
+                var sb = new StringBuilder();
+                sb.AppendLine($"Workbook: {fullName}");
+
+                var sheetNames = new List<string>();
+                int count = (int)wb.Worksheets.Count;
+                for (int i = 1; i <= count; i++)
+                {
+                    dynamic s = wb.Worksheets[i];
+                    sheetNames.Add(SafeString(() => (string)s.Name));
+                }
+                sb.AppendLine($"Sheets ({sheetNames.Count}): {string.Join(", ", sheetNames)}");
+
+                if (listSheetsOnly)
+                    return (true, fullName, sb.ToString());
+
+                dynamic? ws = null;
+                if (!string.IsNullOrWhiteSpace(sheetName))
+                {
+                    for (int i = 1; i <= count; i++)
+                    {
+                        dynamic s = wb.Worksheets[i];
+                        if (string.Equals(SafeString(() => (string)s.Name), sheetName.Trim(), StringComparison.OrdinalIgnoreCase))
+                        {
+                            ws = s;
+                            break;
+                        }
+                    }
+                    if (ws is null)
+                        return (false, fullName, $"Worksheet '{sheetName}' not found. Available sheets: {string.Join(", ", sheetNames)}");
+                }
+                else
+                {
+                    ws = wb.ActiveSheet ?? wb.Worksheets[1];
+                }
+
+                string activeSheetName = SafeString(() => (string)ws.Name);
+                dynamic targetRange = !string.IsNullOrWhiteSpace(rangeAddress)
+                    ? ws.Range[rangeAddress.Trim()]
+                    : ws.UsedRange;
+
+                int startRow = (int)targetRange.Row;
+                int startCol = (int)targetRange.Column;
+                int rowCount = Math.Min((int)targetRange.Rows.Count, 60);
+                int colCount = Math.Min((int)targetRange.Columns.Count, 20);
+                sb.AppendLine($"Sheet: {activeSheetName} (showing {rowCount}x{colCount} from R{startRow}C{startCol})");
+
+                for (int r = 0; r < rowCount; r++)
+                {
+                    var vals = new List<string>(colCount);
+                    bool any = false;
+                    for (int c = 0; c < colCount; c++)
+                    {
+                        string v = SafeString(() => Convert.ToString(ws.Cells[startRow + r, startCol + c].Text) ?? "");
+                        if (!string.IsNullOrEmpty(v)) any = true;
+                        vals.Add(v.Replace('\n', ' ').Replace('\r', ' '));
+                    }
+                    if (!any && r > 0) continue;
+                    sb.AppendLine($"  Row {startRow + r}: {string.Join(" | ", vals)}");
+                }
+
+                return (true, fullName, sb.ToString());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Excel read failed");
+                return (false, (string?)null, $"Failed to read Excel: {ex.Message}");
+            }
+            finally
+            {
+                if (openedByUs && wb is not null)
+                {
+                    try { wb.Close(false); } catch { }
+                }
+                if (createdApp && excel is not null)
+                {
+                    try { excel.Quit(); } catch { }
+                }
+            }
+        }, ct);
+
     public Task<(bool Ok, string? FilePath, string Message)> WriteExcelCellsAsync(
         IReadOnlyList<(string CellAddress, string ValueOrFormula)> writes,
         CancellationToken ct = default)

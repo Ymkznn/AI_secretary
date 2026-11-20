@@ -50,7 +50,7 @@ public sealed class MailSyncService
         int gmailCount = 0;
         var notes = new List<string>();
 
-        if (mode is "all" or "ews")
+        if ((mode is "all" or "ews" or "outlook") && (_mailBroker.IsConfigured || mode != "all"))
         {
             try
             {
@@ -63,7 +63,7 @@ public sealed class MailSyncService
             }
         }
 
-        if (mode is "all" or "gmail")
+        if ((mode is "all" or "gmail") && _gmail.IsAuthorized)
         {
             try
             {
