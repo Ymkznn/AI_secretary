@@ -231,12 +231,14 @@ public sealed class SqliteStore
                 UpdatedAt TEXT NOT NULL,
                 PRIMARY KEY (Language, MsgKey)
             );
-            CREATE TABLE IF NOT EXISTS PageIntents (
-                PatternKey TEXT PRIMARY KEY,
-                Intent TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS AutoStateRules (
+                TriggerKey TEXT PRIMARY KEY,
+                StateName TEXT NOT NULL,
+                StepsJson TEXT NOT NULL DEFAULT '[]',
                 PredictorCounter INTEGER NOT NULL DEFAULT 1,
                 HitCount INTEGER NOT NULL DEFAULT 0,
                 MissCount INTEGER NOT NULL DEFAULT 0,
+                Status TEXT NOT NULL DEFAULT 'Cold',
                 LastSeenAt TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS MemoryAnnotations (
@@ -2174,46 +2176,83 @@ public sealed class SqliteStore
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    // ─── PageIntents (2-bit page branch predictor) ────────────────────
+    // ─── AutoStateRules (zero-hook 2-bit autonomous state machine) ───
 
-    public async Task<PageIntentRecord?> GetPageIntentAsync(string patternKey, CancellationToken ct = default)
+    public async Task<AutoStateRuleRecord?> GetAutoStateRuleAsync(string triggerKey, CancellationToken ct = default)
     {
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT PatternKey, Intent, PredictorCounter, HitCount, MissCount, LastSeenAt FROM PageIntents WHERE PatternKey = @k LIMIT 1;";
-        cmd.Parameters.AddWithValue("@k", patternKey);
+        cmd.CommandText = "SELECT TriggerKey, StateName, StepsJson, PredictorCounter, HitCount, MissCount, Status, LastSeenAt FROM AutoStateRules WHERE TriggerKey = @k LIMIT 1;";
+        cmd.Parameters.AddWithValue("@k", triggerKey);
         await using var r = await cmd.ExecuteReaderAsync(ct);
         if (!await r.ReadAsync(ct)) return null;
-        return new PageIntentRecord(
-            PatternKey: r.GetString(0),
-            Intent: r.GetString(1),
-            PredictorCounter: r.GetInt32(2),
-            HitCount: r.GetInt32(3),
-            MissCount: r.GetInt32(4),
-            LastSeenAt: DateTimeOffset.Parse(r.GetString(5)));
+        return new AutoStateRuleRecord(
+            TriggerKey: r.GetString(0),
+            StateName: r.GetString(1),
+            StepsJson: r.GetString(2),
+            PredictorCounter: r.GetInt32(3),
+            HitCount: r.GetInt32(4),
+            MissCount: r.GetInt32(5),
+            Status: r.GetString(6),
+            LastSeenAt: DateTimeOffset.Parse(r.GetString(7)));
     }
 
-    public async Task UpsertPageIntentAsync(PageIntentRecord rec, CancellationToken ct = default)
+    public async Task<List<AutoStateRuleRecord>> GetAllAutoStateRulesAsync(CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT TriggerKey, StateName, StepsJson, PredictorCounter, HitCount, MissCount, Status, LastSeenAt FROM AutoStateRules ORDER BY LastSeenAt DESC LIMIT 100;";
+        var list = new List<AutoStateRuleRecord>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            list.Add(new AutoStateRuleRecord(
+                TriggerKey: r.GetString(0),
+                StateName: r.GetString(1),
+                StepsJson: r.GetString(2),
+                PredictorCounter: r.GetInt32(3),
+                HitCount: r.GetInt32(4),
+                MissCount: r.GetInt32(5),
+                Status: r.GetString(6),
+                LastSeenAt: DateTimeOffset.Parse(r.GetString(7))));
+        }
+        return list;
+    }
+
+    public async Task UpsertAutoStateRuleAsync(AutoStateRuleRecord rec, CancellationToken ct = default)
     {
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO PageIntents (PatternKey, Intent, PredictorCounter, HitCount, MissCount, LastSeenAt)
-            VALUES (@k, @intent, @cnt, @hits, @miss, @seen)
-            ON CONFLICT(PatternKey) DO UPDATE SET
-                Intent = excluded.Intent,
+            INSERT INTO AutoStateRules (TriggerKey, StateName, StepsJson, PredictorCounter, HitCount, MissCount, Status, LastSeenAt)
+            VALUES (@k, @state, @steps, @cnt, @hits, @miss, @status, @seen)
+            ON CONFLICT(TriggerKey) DO UPDATE SET
+                StateName = excluded.StateName,
+                StepsJson = excluded.StepsJson,
                 PredictorCounter = excluded.PredictorCounter,
                 HitCount = excluded.HitCount,
                 MissCount = excluded.MissCount,
+                Status = excluded.Status,
                 LastSeenAt = excluded.LastSeenAt;
             """;
-        cmd.Parameters.AddWithValue("@k", rec.PatternKey);
-        cmd.Parameters.AddWithValue("@intent", rec.Intent);
+        cmd.Parameters.AddWithValue("@k", rec.TriggerKey);
+        cmd.Parameters.AddWithValue("@state", rec.StateName);
+        cmd.Parameters.AddWithValue("@steps", rec.StepsJson);
         cmd.Parameters.AddWithValue("@cnt", rec.PredictorCounter);
         cmd.Parameters.AddWithValue("@hits", rec.HitCount);
         cmd.Parameters.AddWithValue("@miss", rec.MissCount);
+        cmd.Parameters.AddWithValue("@status", rec.Status);
         cmd.Parameters.AddWithValue("@seen", rec.LastSeenAt.ToString("O"));
         await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task<bool> DeleteAutoStateRuleAsync(string triggerKey, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM AutoStateRules WHERE TriggerKey = @k;";
+        cmd.Parameters.AddWithValue("@k", triggerKey);
+        return await cmd.ExecuteNonQueryAsync(ct) > 0;
     }
 
     public async Task<bool> DeleteWorkflowCacheAsync(string workflowId, CancellationToken ct = default)

@@ -16,16 +16,35 @@ public static class SystemAutomationPrompts
            "Keep ALL JSON keys unchanged, preserve ALL format placeholders like {0}, {1}, {2} and escape sequences verbatim. " +
            "Output ONLY a valid JSON object with the exact same keys (no markdown fences).";
 
-    public static string BuildWindowClassifierSystemPrompt()
-        => "Classify the user's current window into exact JSON: {\"intent\": \"otp_wait\" | \"form_fill\" | \"media_or_idle\"}. " +
-           "Use \"otp_wait\" for login/2FA/verification code entry pages in ANY language. " +
-           "Use \"form_fill\" only for multi-field applications, surveys, registration, or expense forms. " +
-           "Use \"media_or_idle\" for videos, streams, music, reading, chat, or general browsing.";
+    public static string BuildAutoStateTransitionSystemPrompt(string skillsSummary)
+        => $$$"""
+            You are StateMachineAgent, an autonomous zero-hook background state machine.
+            Given a raw window/page sensor signal, decide:
+            1. A short snake_case `state_name` describing the user's current context (open-ended, invented by you).
+            2. `steps`: an array of 0-2 safe, non-destructive atomic skill calls to execute immediately on entering this state.
 
-    public static string BuildWindowClassifierUserPrompt(string processName, string windowTitle, IReadOnlyList<string> fieldLabels)
+            Strict rules:
+            - For video/music/streaming, AI chat/search tools (e.g., YouTube, Gemini, ChatGPT, Google Search), social feeds, general reading, or ordinary browsing: ALWAYS return `"steps": []` (stay completely silent).
+            - Only emit non-empty `steps` when background preparation is clearly useful and non-intrusive (for example, on a login/2FA/verification code entry page, call `{"skill":"manage_mail","args":{"action":"sync","source":"all","boost_seconds":180}}`).
+            - NEVER emit mutating/destructive/form-submitting/mail-sending actions.
+            - Reply with ONLY raw JSON (no markdown fences):
+            {"state_name": "short_snake_case", "steps": [{"skill": "skill_name", "args": {}}]}
+
+            Available read/sync skills:
+            {{{skillsSummary}}}
+            """;
+
+    public static string BuildAutoStateTransitionUserPrompt(
+        string triggerKey,
+        string processName,
+        string windowTitle,
+        string? url,
+        int inputCount,
+        IReadOnlyList<string> fieldLabels)
     {
-        var fieldsText = fieldLabels.Count == 0 ? "(none)" : string.Join(", ", fieldLabels.Take(10));
-        return $"Process: {processName}\nTitle: {windowTitle}\nVisible inputs: {fieldsText}";
+        var fieldsText = fieldLabels.Count == 0 ? "(none)" : string.Join(", ", fieldLabels.Take(12));
+        var urlLine = string.IsNullOrWhiteSpace(url) ? "" : $"\nURL: {url}";
+        return $"TriggerKey: {triggerKey}\nProcess: {processName}\nTitle: {windowTitle}{urlLine}\nVisibleInputs: {inputCount}\nFieldLabels: {fieldsText}";
     }
 
     public static string BuildWorkflowOptimizerSystemPrompt()

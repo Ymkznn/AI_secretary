@@ -23,10 +23,10 @@ public sealed class ManageMailSkill : IBasicSkill
     public string MainAgentSpec => """
             manage_mail
                - Purpose: List inbox, read full email detail, or run background sync across Outlook/EWS and Gmail.
-               - Args: {"action": "list|detail|sync", "source": "outlook|gmail|all", "query": "optional search query", "max_results": 10, "mail_id": "required when action=detail"}
+               - Args: {"action": "list|detail|sync", "source": "outlook|gmail|all", "query": "optional search query", "max_results": 10, "mail_id": "required when action=detail", "boost_seconds": "optional 15-300s temporary fast poll window when action=sync"}
             
         """;
-    public string PlannerSpec => """manage_mail: List, inspect, or sync Outlook/Gmail. args: {"action":"list|detail|sync","source":"outlook|gmail|all","query":"...","max_results":10,"mail_id":"..."}""";
+    public string PlannerSpec => """manage_mail: List, inspect, or sync Outlook/Gmail. args: {"action":"list|detail|sync","source":"outlook|gmail|all","query":"...","max_results":10,"mail_id":"...","boost_seconds":180}""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
@@ -150,6 +150,8 @@ public sealed class ManageMailSkill : IBasicSkill
     private async Task SyncAsync(SkillExecutionContext ctx, string source)
     {
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
+        if (int.TryParse(ctx.GetArg("boost_seconds"), out var boostSecs) && boostSecs > 0)
+            _skills.RequestMailSyncBoost(boostSecs);
         var res = await _skills.SyncMailAsync(ctx.ConversationId, source, ctx.Ct);
         ctx.Observations.Add(res);
         ctx.CompletedSteps.Add($"manage_mail:sync:{source}");

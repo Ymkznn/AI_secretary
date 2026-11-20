@@ -28,7 +28,7 @@ public sealed class SecretaryController : IDisposable
     private readonly AppSettingsService _settings;
     private readonly InteractionGateway _interaction;
     private readonly ActivityMonitorService _activity;
-    private readonly PageIntentPredictorService _pagePredictor;
+    private readonly StateMachineAgent _stateMachine;
     private readonly BrowserHostService _browserHost;
     private readonly BrowserFormBridgeService _browserBridge;
     private readonly StandingWatcherService _watchers;
@@ -47,8 +47,7 @@ public sealed class SecretaryController : IDisposable
     private int _mainTurnActiveCount;
     private DateTimeOffset? _dndUntil;
     private bool _dndAllowUrgent = true;
-    private DateTimeOffset _otpBurstUntilUtc = DateTimeOffset.MinValue;
-    private string? _activeOtpPatternKey;
+    private DateTimeOffset _mailPollBoostUntilUtc = DateTimeOffset.MinValue;
     private sealed class ActivePlannerTaskState
     {
         public required string LogicalTaskId { get; init; }
@@ -112,7 +111,6 @@ public sealed class SecretaryController : IDisposable
         remove => _interaction.PendingRequestResolved -= value;
     }
     public event Action? TrustedPathsChanged;
-    public event Action<ProactiveSuggestionEvent>? ProactiveSuggestionRaised;
     public event Action<StandingWatcherRecord, string>? WatcherTriggered;
 
     public string ConversationId { get; private set; } = "conv-main";
@@ -140,7 +138,7 @@ public sealed class SecretaryController : IDisposable
         AppSettingsService settings,
         InteractionGateway interaction,
         ActivityMonitorService activity,
-        PageIntentPredictorService pagePredictor,
+        StateMachineAgent stateMachine,
         BrowserHostService browserHost,
         BrowserFormBridgeService browserBridge,
         StandingWatcherService watchers,
@@ -167,7 +165,7 @@ public sealed class SecretaryController : IDisposable
         _settings = settings;
         _interaction = interaction;
         _activity = activity;
-        _pagePredictor = pagePredictor;
+        _stateMachine = stateMachine;
         _browserHost = browserHost;
         _browserBridge = browserBridge;
         _watchers = watchers;
@@ -327,18 +325,10 @@ public sealed class SecretaryController : IDisposable
 
         await _workflowCache.LoadTuningAsync(_appCts.Token);
         await _workflowCache.MigrateAndCleanLegacyCachesAsync(ConversationId, _appCts.Token);
-        _activity.SemanticClassifyAsync = (proc, title, fields, token) =>
-            _planner.ClassifyWindowIntentAsync(proc, title, fields, token);
-        _activity.VerificationPageEntered += (_, patternKey) =>
-        {
-            _activeOtpPatternKey = patternKey;
-            _otpBurstUntilUtc = DateTimeOffset.UtcNow.AddMinutes(3);
-        };
-        _activity.ProactiveSuggestionRaised += ev =>
-        {
-            ProactiveSuggestionRaised?.Invoke(ev);
-            _ = PushPetMessageAsync($"💡 {ev.SuggestedMessage}", _appCts.Token);
-        };
+        _skills.MailSyncBoostRequested += secs =>
+            _mailPollBoostUntilUtc = DateTimeOffset.UtcNow.AddSeconds(Math.Clamp(secs, 15, 300));
+        _activity.WindowFocused += (target, url) =>
+            _ = _stateMachine.HandleWindowFocusAsync(ConversationId, target, url, _appCts.Token);
         _activity.Start();
 
         _ = Task.Run(() => RunSchedulerLoopAsync(_appCts.Token));
@@ -1502,51 +1492,11 @@ public sealed class SecretaryController : IDisposable
     {
         var finalActions = actions is not null ? new List<NotificationButtonOption>(actions) : new List<NotificationButtonOption>();
         var otpBtn = finalActions.FirstOrDefault(a => a.Type is "fill_otp" or "copy_otp");
-        var otp = otpBtn?.Prompt;
-        if (!string.IsNullOrEmpty(otp))
+        if (!string.IsNullOrEmpty(otpBtn?.Prompt))
         {
-            _skills.LastObservedOtpCode = otp;
+            _skills.LastObservedOtpCode = otpBtn.Prompt;
             _skills.LastObservedOtpHint = title;
-            _otpBurstUntilUtc = DateTimeOffset.MinValue;
-            if (_activeOtpPatternKey is { } hitKey)
-            {
-                _activeOtpPatternKey = null;
-                _ = _pagePredictor.RecordOutcomeAsync(hitKey, hit: true, estimatedTokensSaved: 90, CancellationToken.None);
-            }
-
-            if (_activity.HasMatchingVerificationWindow(title, mail.SenderName))
-            {
-                var evCtx = new PendingMailNotificationContext(convId, eventId, mail, title, summary, reRemindMinutes, finalActions, otp);
-                _skills.CurrentEventNotification = evCtx;
-                try
-                {
-                    await _planner.ExecuteGoalAsync(
-                        convId,
-                        taskId: $"ev-{eventId}",
-                        goal: "event:mail_otp_received",
-                        userPrompt: "event:mail_otp_received matching_verification_window=true. Check user_pref: if user prefers auto-filling OTP without asking, run fill_otp then push_notification(include_fill_button=false); otherwise run push_notification(include_fill_button=true).",
-                        targetMailId: mail.Id,
-                        confirmAsync: (_, _) => Task.FromResult(true),
-                        onStatusAsync: _ => Task.CompletedTask,
-                        onReplyAsync: (_, _) => Task.CompletedTask,
-                        tier: ModelTier.Simple,
-                        ct: ct);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug(ex, "Event workflow failed for {EventId}, falling back to notification", eventId);
-                }
-                finally
-                {
-                    _skills.CurrentEventNotification = null;
-                }
-
-                if (!evCtx.Published)
-                {
-                    await PersistNotificationAsync(convId, eventId, mail, title, summary, reRemindMinutes, finalActions, ct);
-                }
-                return;
-            }
+            _mailPollBoostUntilUtc = DateTimeOffset.MinValue;
         }
 
         await PersistNotificationAsync(convId, eventId, mail, title, summary, reRemindMinutes, finalActions, ct);
@@ -1604,15 +1554,15 @@ public sealed class SecretaryController : IDisposable
     {
         while (!ct.IsCancellationRequested)
         {
-            bool inOtpBurst = DateTimeOffset.UtcNow < _otpBurstUntilUtc;
-            var tickSeconds = inOtpBurst ? 6 : Math.Clamp(_settings.Current.Scheduler.TickSeconds, 5, 300);
+            bool inMailPollBoost = DateTimeOffset.UtcNow < _mailPollBoostUntilUtc;
+            var tickSeconds = inMailPollBoost ? 6 : Math.Clamp(_settings.Current.Scheduler.TickSeconds, 5, 300);
             try
             {
                 CleanupExpiredPlannerTasks();
                 await WakeDueSnoozedAsync(ct);
                 await WakeDueRemindersAsync(ct);
                 await WakeDuePinnedReRemindersAsync(ct);
-                if (inOtpBurst)
+                if (inMailPollBoost)
                 {
                     await _mailSync.SyncOnceAsync(
                         ConversationId,
@@ -1620,11 +1570,6 @@ public sealed class SecretaryController : IDisposable
                         (eventId, mail, title, summary, mins, actions) =>
                             PushProactiveNotificationAsync(ConversationId, eventId, mail, title, summary, ct, mins, actions),
                         ct);
-                }
-                else if (_activeOtpPatternKey is { } expiredKey)
-                {
-                    _activeOtpPatternKey = null;
-                    await _pagePredictor.RecordOutcomeAsync(expiredKey, hit: false, estimatedTokensSaved: 0, ct);
                 }
                 await _watchers.TickDueWatchersAsync(async (w, alertMsg) =>
                 {

@@ -1,6 +1,23 @@
 const API_BASE = 'http://127.0.0.1:19876';
 let sse = null;
 let lastSignalKey = '';
+let signalDebounceTimer = null;
+
+function scheduleReportPageSignal(tab) {
+  if (signalDebounceTimer) {
+    clearTimeout(signalDebounceTimer);
+    signalDebounceTimer = null;
+  }
+  if (!tab || !tab.id || tab.incognito || !tab.url || !/^https?:/i.test(tab.url)) return;
+  const tabId = tab.id;
+  signalDebounceTimer = setTimeout(async () => {
+    signalDebounceTimer = null;
+    try {
+      const current = await chrome.tabs.get(tabId);
+      if (current && current.active) await reportPageSignal(current);
+    } catch {}
+  }, 1200);
+}
 let lastPingAt = 0;
 
 async function getTargetTab() {
@@ -409,13 +426,13 @@ function setupKeepAlive() {
 
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   ensureSseConnected();
-  if (changeInfo.status === 'complete' && tab.active) reportPageSignal(tab);
+  if (changeInfo.status === 'complete' && tab.active) scheduleReportPageSignal(tab);
 });
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   ensureSseConnected();
   try {
     const tab = await chrome.tabs.get(tabId);
-    reportPageSignal(tab);
+    scheduleReportPageSignal(tab);
   } catch {}
 });
 

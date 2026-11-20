@@ -50,14 +50,6 @@ public sealed class ApiServerHost : IAsyncDisposable
         _controller.SkillsChanged += () => BroadcastEvent("skills_changed", new { });
         _controller.PinnedRemindersChanged += () => BroadcastEvent("pinned_changed", _controller.GetPinnedReminders());
         _controller.ProactiveAlert += (title, content) => BroadcastEvent("proactive_alert", new { title, content });
-        _controller.ProactiveSuggestionRaised += ev => BroadcastEvent("proactive_suggestion", new
-        {
-            ev.Kind,
-            ev.SuggestedMessage,
-            processName = ev.Target.ProcessName,
-            title = ev.Target.Title,
-            fields = ev.Target.FormFieldLabels ?? Array.Empty<string>()
-        });
         _controller.WatcherTriggered += (w, alert) => BroadcastEvent("watcher_triggered", new
         {
             w.WatcherId,

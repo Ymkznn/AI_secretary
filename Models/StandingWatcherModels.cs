@@ -63,12 +63,14 @@ public sealed record BrowserPageSignal(
     int InputCount,
     IReadOnlyList<string>? Labels = null);
 
-public sealed record PageIntentRecord(
-    string PatternKey,
-    string Intent, // "otp_wait" | "form_fill" | "media_or_idle"
+public sealed record AutoStateRuleRecord(
+    string TriggerKey,
+    string StateName,
+    string StepsJson,
     int PredictorCounter, // 0..3 (2-bit saturating counter)
     int HitCount,
     int MissCount,
+    string Status, // "Cold" | "Hot" | "Disabled"
     DateTimeOffset LastSeenAt);
 
 public sealed record BranchTelemetryStats(

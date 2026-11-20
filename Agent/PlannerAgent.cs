@@ -413,37 +413,6 @@ public sealed class PlannerAgent
         return new TriageResult(urgent, title, summary, reRemindMinutes, actions);
     }
 
-    /// <summary>
-    /// Language-agnostic semantic classifier for external foreground windows:
-    /// returns "otp_wait", "form_fill", or "media_or_idle" based on process, title, and UIA field labels.
-    /// </summary>
-    public async Task<string> ClassifyWindowIntentAsync(
-        string processName,
-        string windowTitle,
-        IReadOnlyList<string> fieldLabels,
-        CancellationToken ct = default)
-    {
-        var sys = Prompts.SystemAutomationPrompts.BuildWindowClassifierSystemPrompt();
-        var user = Prompts.SystemAutomationPrompts.BuildWindowClassifierUserPrompt(processName, windowTitle, fieldLabels);
-
-        try
-        {
-            var resp = await _model.CompleteAsync(new[]
-            {
-                new ModelMessage("system", sys),
-                new ModelMessage("user", user)
-            }, ModelTier.Simple, ct);
-
-            using var doc = JsonDocument.Parse(ExtractJson(resp.Content));
-            var intent = doc.RootElement.TryGetProperty("intent", out var iEl) ? iEl.GetString()?.Trim().ToLowerInvariant() : null;
-            return intent is "otp_wait" or "form_fill" or "media_or_idle" ? intent : "media_or_idle";
-        }
-        catch
-        {
-            return "media_or_idle";
-        }
-    }
-
     /// <summary>從回覆中抽離 `[TASK_STATUS: done|waiting]` 標記；若模型未輸出，則有選項按鈕時視為等待中。</summary>
     private static (string CleanText, bool IsDone) ExtractAndStripTaskStatus(string raw, bool hasChoices)
     {

@@ -17,34 +17,22 @@ public sealed record ExternalWindowTarget(
     IReadOnlyList<string>? FormFieldLabels = null,
     int VisibleInputCount = 0);
 
-public sealed record ProactiveSuggestionEvent(
-    string Kind, // "form_stuck" | "switch_back"
-    ExternalWindowTarget Target,
-    string SuggestedMessage);
-
 /// <summary>
-/// Tracks recent external foreground windows (explicitly excluding this app so focus-stealing when typing
-/// never targets the secretary itself), performs zero-token local UIA form/focus detection with password redaction,
-/// and raises debounced proactive assistance suggestions.
+/// Pure sensor tracking recent external foreground windows (excluding this app),
+/// reading local password-redacted UIA fields, and emitting debounced WindowFocused signals
+/// with zero hardcoded business hooks.
 /// </summary>
 public sealed class ActivityMonitorService : IDisposable
 {
     private readonly ILogger<ActivityMonitorService> _logger;
-    private readonly PageIntentPredictorService _pagePredictor;
     private readonly UiLocalizer _localizer;
     private readonly object _lock = new();
     private readonly LinkedList<ExternalWindowTarget> _recentTargets = new();
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _titleCooldowns = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _mutedTitles = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly CancellationTokenSource _cts = new();
     private Task? _loopTask;
     private nint _lastRawHwnd;
-    private DateTimeOffset _lastHwndEnteredAt = DateTimeOffset.UtcNow;
-    private bool _suggestedForCurrentDwell;
     private string? _lastVisitedTitle;
-    private string? _previousVisitedTitle;
-    private DateTimeOffset _lastSwitchAt = DateTimeOffset.MinValue;
 
     private static readonly HashSet<string> SensitiveProcesses = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -61,22 +49,12 @@ public sealed class ActivityMonitorService : IDisposable
         "chrome", "msedge", "firefox", "brave", "opera", "vivaldi"
     };
 
-    public event Action<ProactiveSuggestionEvent>? ProactiveSuggestionRaised;
-    public event Action<ExternalWindowTarget, string>? VerificationPageEntered;
-
-    /// <summary>
-    /// Language-agnostic AI semantic classifier: ("process", "title", fieldLabels) -> "otp_wait" | "form_fill" | "media_or_idle".
-    /// </summary>
-    public Func<string, string, IReadOnlyList<string>, CancellationToken, Task<string>>? SemanticClassifyAsync { get; set; }
-
-    private readonly ConcurrentDictionary<string, string> _intentCache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _pageHitCooldowns = new(StringComparer.OrdinalIgnoreCase);
+    public event Action<ExternalWindowTarget, string?>? WindowFocused;
 
     public bool ProactiveMonitoringEnabled { get; set; } = true;
 
-    public ActivityMonitorService(PageIntentPredictorService pagePredictor, UiLocalizer localizer, ILogger<ActivityMonitorService> logger)
+    public ActivityMonitorService(UiLocalizer localizer, ILogger<ActivityMonitorService> logger)
     {
-        _pagePredictor = pagePredictor;
         _localizer = localizer;
         _logger = logger;
     }
@@ -107,30 +85,13 @@ public sealed class ActivityMonitorService : IDisposable
             return _recentTargets.First?.Value;
     }
 
-    public bool HasMatchingVerificationWindow(string? titleHint, string? senderHint)
-    {
-        var targets = GetRecentExternalTargets();
-        foreach (var t in targets)
-        {
-            if (_intentCache.TryGetValue(t.Title, out var cachedIntent) && cachedIntent == "otp_wait")
-                return true;
-            if (!string.IsNullOrWhiteSpace(titleHint) && SharesKeyword(t.Title, titleHint))
-                return true;
-            if (!string.IsNullOrWhiteSpace(senderHint) && SharesKeyword(t.Title, senderHint))
-                return true;
-        }
-        return false;
-    }
-
     public async Task<(bool Ok, string Message)> TryFillOtpInExternalWindowAsync(string code, string? serviceHint = null, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(code))
             return (false, await _localizer.TextAsync("OtpEmpty", "Verification code is empty.", Array.Empty<object?>(), ct));
 
         var targets = GetRecentExternalTargets();
-        var target = targets.FirstOrDefault(t =>
-                         (!string.IsNullOrWhiteSpace(serviceHint) && SharesKeyword(t.Title, serviceHint))
-                         || (_intentCache.TryGetValue(t.Title, out var ci) && ci == "otp_wait"))
+        var target = targets.FirstOrDefault(t => !string.IsNullOrWhiteSpace(serviceHint) && SharesKeyword(t.Title, serviceHint))
                      ?? targets.FirstOrDefault();
 
         if (target is null)
@@ -179,10 +140,10 @@ public sealed class ActivityMonitorService : IDisposable
         }
     }
 
-    public async Task HandleBrowserPageSignalAsync(BrowserPageSignal signal, CancellationToken ct = default)
+    public Task HandleBrowserPageSignalAsync(BrowserPageSignal signal, CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(signal.Url) || signal.InputCount <= 0)
-            return;
+        if (!ProactiveMonitoringEnabled || string.IsNullOrWhiteSpace(signal.Url) || signal.InputCount <= 0)
+            return Task.CompletedTask;
 
         var title = string.IsNullOrWhiteSpace(signal.Title) ? signal.Url : signal.Title.Trim();
         var current = GetLastExternalTarget();
@@ -196,50 +157,8 @@ public sealed class ActivityMonitorService : IDisposable
             FormFieldLabels: signal.Labels ?? Array.Empty<string>(),
             VisibleInputCount: signal.InputCount);
 
-        var (patternKey, intent) = await ClassifyTargetIntentAsync(signal.Url, target, ct);
-        if (intent == "otp_wait")
-        {
-            VerificationPageEntered?.Invoke(target, patternKey);
-        }
-    }
-
-    private async Task<(string PatternKey, string Intent)> ClassifyTargetIntentAsync(
-        string? url,
-        ExternalWindowTarget target,
-        CancellationToken ct)
-    {
-        var (patternKey, predictedIntent, isHighConf) = await _pagePredictor.TryPredictAsync(url, target.ProcessName, target.Title, ct);
-        if (isHighConf && predictedIntent is not null)
-        {
-            _intentCache[target.Title] = predictedIntent;
-            // Record a telemetry hit whenever a non-OTP high-confidence cache entry skips an LLM call
-            // (otp_wait is separately validated when an OTP email arrives or the burst expires).
-            if (!string.Equals(predictedIntent, "otp_wait", StringComparison.OrdinalIgnoreCase))
-            {
-                var now = DateTimeOffset.UtcNow;
-                if (!_pageHitCooldowns.TryGetValue(patternKey, out var lastHit) || (now - lastHit) >= TimeSpan.FromSeconds(30))
-                {
-                    _pageHitCooldowns[patternKey] = now;
-                    _ = _pagePredictor.RecordOutcomeAsync(patternKey, hit: true, estimatedTokensSaved: 90, CancellationToken.None);
-                }
-            }
-            return (patternKey, predictedIntent);
-        }
-
-        if (_intentCache.TryGetValue(target.Title, out var cached))
-            return (patternKey, cached);
-
-        if (SemanticClassifyAsync is null)
-            return (patternKey, "media_or_idle");
-
-        var labels = target.FormFieldLabels ?? Array.Empty<string>();
-        if (labels.Count == 0 && target.VisibleInputCount <= 0)
-            return (patternKey, "media_or_idle");
-
-        var intent = await SemanticClassifyAsync(target.ProcessName, target.Title, labels, ct);
-        _intentCache[target.Title] = intent;
-        await _pagePredictor.RecordAiClassificationAsync(patternKey, intent, ct);
-        return (patternKey, intent);
+        WindowFocused?.Invoke(target, signal.Url);
+        return Task.CompletedTask;
     }
 
     private static bool SharesKeyword(string windowTitle, string hint)
@@ -256,13 +175,6 @@ public sealed class ActivityMonitorService : IDisposable
     {
         lock (_lock)
             return _recentTargets.ToList();
-    }
-
-    public void MuteWindowTitle(string title)
-    {
-        if (string.IsNullOrWhiteSpace(title)) return;
-        lock (_lock)
-            _mutedTitles.Add(title.Trim());
     }
 
     /// <summary>
@@ -304,7 +216,6 @@ public sealed class ActivityMonitorService : IDisposable
     private async Task MonitorLoopAsync(CancellationToken ct)
     {
         var selfPid = Environment.ProcessId;
-        var lastUiaCheckAt = DateTimeOffset.MinValue;
 
         while (!ct.IsCancellationRequested)
         {
@@ -336,76 +247,27 @@ public sealed class ActivityMonitorService : IDisposable
 
                 if (windowChanged)
                 {
-                    bool isSwitchBack = _previousVisitedTitle is not null
-                        && string.Equals(title, _previousVisitedTitle, StringComparison.Ordinal)
-                        && (now - _lastSwitchAt) < TimeSpan.FromSeconds(75);
-
-                    _previousVisitedTitle = _lastVisitedTitle;
                     _lastVisitedTitle = title;
                     _lastRawHwnd = hwnd;
-                    _lastHwndEnteredAt = now;
-                    _lastSwitchAt = now;
-                    _suggestedForCurrentDwell = false;
 
                     var newTarget = new ExternalWindowTarget(hwnd, (int)pid, procName, title, now);
                     RecordTarget(newTarget);
 
-                    if (BrowserProcesses.Contains(procName) && !SensitiveProcesses.Contains(procName))
+                    if (ProactiveMonitoringEnabled && BrowserProcesses.Contains(procName) && !SensitiveProcesses.Contains(procName))
                     {
+                        var capturedTitle = title;
                         _ = Task.Run(async () =>
                         {
                             await Task.Delay(1200, ct);
-                            if (ct.IsCancellationRequested || _lastRawHwnd != hwnd) return;
+                            if (ct.IsCancellationRequested ||
+                                _lastRawHwnd != hwnd ||
+                                !string.Equals(_lastVisitedTitle, capturedTitle, StringComparison.Ordinal))
+                                return;
+
                             var enriched = await RefreshExternalTargetUiaAsync(hwnd, ct) ?? newTarget;
-                            var (patternKey, intent) = await ClassifyTargetIntentAsync(url: null, enriched, ct);
-                            if (intent == "otp_wait")
-                            {
-                                VerificationPageEntered?.Invoke(enriched, patternKey);
-                            }
-                            else if (intent == "form_fill" && isSwitchBack && CanSuggest(title, DateTimeOffset.UtcNow) && !_suggestedForCurrentDwell)
-                            {
-                                _suggestedForCurrentDwell = true;
-                                _titleCooldowns[title] = DateTimeOffset.UtcNow;
-                                var switchMsg = await _localizer.TextAsync(
-                                    "ActivitySwitchBack",
-                                    "Were you looking up info to fill into '{0}'? Want me to help organize or prefill it?",
-                                    new object?[] { Truncate(title, 30) },
-                                    ct);
-                                ProactiveSuggestionRaised?.Invoke(new ProactiveSuggestionEvent(
-                                    "switch_back",
-                                    enriched,
-                                    switchMsg));
-                            }
+                            if ((enriched.FormFieldLabels is { Count: > 0 }) || enriched.VisibleInputCount > 0)
+                                WindowFocused?.Invoke(enriched, null);
                         }, ct);
-                    }
-                    continue;
-                }
-
-                if (!ProactiveMonitoringEnabled || _suggestedForCurrentDwell || SensitiveProcesses.Contains(procName))
-                    continue;
-
-                var dwell = now - _lastHwndEnteredAt;
-                if (BrowserProcesses.Contains(procName) && dwell >= TimeSpan.FromSeconds(15) && (now - lastUiaCheckAt) >= TimeSpan.FromSeconds(5))
-                {
-                    lastUiaCheckAt = now;
-                    var target = await RefreshExternalTargetUiaAsync(hwnd, ct);
-                    if (target is not null && target.IsFormLike && CanSuggest(title, now))
-                    {
-                        var (_, intent) = await ClassifyTargetIntentAsync(url: null, target, ct);
-                        if (intent == "form_fill")
-                        {
-                            _suggestedForCurrentDwell = true;
-                            _titleCooldowns[title] = now;
-                            var stuckMsg = await _localizer.TextAsync(
-                                "ActivityFormStuck",
-                                "Noticed you've been on '{0}' for a while. Need fill suggestions from memory?",
-                                new object?[] { Truncate(title, 30) },
-                                ct);
-                            ProactiveSuggestionRaised?.Invoke(new ProactiveSuggestionEvent(
-                                "form_stuck",
-                                target,
-                                stuckMsg));
-                        }
                     }
                 }
             }
@@ -418,16 +280,6 @@ public sealed class ActivityMonitorService : IDisposable
                 _logger.LogDebug(ex, "ActivityMonitorService tick error");
             }
         }
-    }
-
-    private bool CanSuggest(string title, DateTimeOffset now)
-    {
-        lock (_lock)
-        {
-            if (_mutedTitles.Contains(title.Trim()))
-                return false;
-        }
-        return !_titleCooldowns.TryGetValue(title, out var last) || (now - last) >= TimeSpan.FromMinutes(6);
     }
 
     private void RecordTarget(ExternalWindowTarget target)

@@ -145,6 +145,14 @@ public sealed class WorkflowOptimizerAgent
                 : 168;
 
             await _cache.ApplyTuningAsync(threshold, promote, disableIds, conversationId, note, ct);
+
+            // Also prune noisy/disabled AutoStateRules offline.
+            var stateRules = await _store.GetAllAutoStateRulesAsync(ct);
+            foreach (var r in stateRules.Where(x => x.Status == "Disabled" || (x.MissCount >= 3 && x.MissCount > x.HitCount)))
+            {
+                await _store.DeleteAutoStateRuleAsync(r.TriggerKey, ct);
+            }
+
             await _store.SetSyncValueAsync("workflow_optimizer_last_run",
                 JsonSerializer.Serialize(new
                 {

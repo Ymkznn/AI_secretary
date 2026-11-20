@@ -46,6 +46,8 @@ public sealed class SkillRuntime
     public event Action<string>? TrustedPathAdded;
     public event Action<string>? UserPrefChanged;
     public event Action<string, string>? FactModified;
+    public event Action<int>? MailSyncBoostRequested;
+    public void RequestMailSyncBoost(int seconds) => MailSyncBoostRequested?.Invoke(Math.Clamp(seconds, 15, 300));
     public Func<string, string, string, Task<PathPermissionDecision>>? ConfirmPathPermissionHandler { get; set; }
     public Func<string, string, CancellationToken, Task<string>>? SyncMailRequested { get; set; }
     public Func<string, string, MailItem?, string, string, int, List<NotificationButtonOption>?, CancellationToken, Task>? PublishNotificationHandler { get; set; }
