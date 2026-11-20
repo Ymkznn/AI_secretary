@@ -1607,7 +1607,7 @@ public sealed class SecretaryController : IDisposable
                 if (inSkillPollBoost && _boostedPollSkill is { } boostSkill)
                 {
                     using var argsDoc = JsonDocument.Parse(_boostedPollArgsJson);
-                    await _worker.ExecuteSingleSkillAsync(
+                    await _worker.RunStepAsync(
                         ConversationId,
                         $"[poll_boost] {boostSkill}",
                         boostSkill,
@@ -1615,7 +1615,9 @@ public sealed class SecretaryController : IDisposable
                         targetMailId: null,
                         confirmAsync: (_, _) => Task.FromResult(false),
                         onStatusAsync: _ => Task.CompletedTask,
-                        tier: ModelTier.Simple,
+                        sources: new List<MailSourceRef>(),
+                        observations: new List<string>(),
+                        completedSteps: new List<string>(),
                         ct: ct);
                 }
                 await _watchers.TickDueWatchersAsync(async (w, alertMsg) =>

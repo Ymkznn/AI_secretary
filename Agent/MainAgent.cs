@@ -27,6 +27,7 @@ public sealed class MainAgent
     private readonly ActivityMonitorService _activity;
     private readonly WorkflowCacheService _workflowCache;
     private readonly MemoryReflectionAgent _memoryReflection;
+    private readonly StateMachineAgent _stateMachine;
     private readonly ILogger<MainAgent> _logger;
 
     public MainAgent(
@@ -43,6 +44,7 @@ public sealed class MainAgent
         ActivityMonitorService activity,
         WorkflowCacheService workflowCache,
         MemoryReflectionAgent memoryReflection,
+        StateMachineAgent stateMachine,
         ILogger<MainAgent> logger)
     {
         _store = store;
@@ -58,6 +60,7 @@ public sealed class MainAgent
         _activity = activity;
         _workflowCache = workflowCache;
         _memoryReflection = memoryReflection;
+        _stateMachine = stateMachine;
         _logger = logger;
     }
 
@@ -263,6 +266,7 @@ public sealed class MainAgent
                     if (handled)
                     {
                         await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, bgCt);
+                        await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, bgCt);
                         onSingleSkillFinished?.Invoke(taskId);
                         onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
                         await bgReplyAsync(summary, sources);
@@ -307,6 +311,7 @@ public sealed class MainAgent
             if (handledSync)
             {
                 await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, ct);
+                await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, ct);
                 onSingleSkillFinished?.Invoke(taskId);
                 onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
                 await onReplyAsync(summarySync, sourcesSync);

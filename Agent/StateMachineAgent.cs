@@ -3,46 +3,39 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Prompts;
 using AiSecretary.Desktop.Services;
-using AiSecretary.Desktop.Skills;
 using Microsoft.Extensions.Logging;
 
 namespace AiSecretary.Desktop.Agent;
 
 /// <summary>
-/// Standalone zero-hook autonomous state machine agent.
-/// Receives raw sensor signals (window/page focus), consults or learns open-ended (StateName, Steps)
-/// rules backed by a SQLite 2-bit saturating counter, and dispatches safe read/sync skills via WorkerAgent.
-/// Enforces Latest-Wins cancellation and single-concurrency gating so rapid tab switching never jams the app.
+/// Zero-LLM behavior-learned autonomous state machine agent.
+/// Never spends tokens probing unknown windows/pages on focus. Instead, it passively observes
+/// safe read/sync skills that the user actually invokes on a window/page, promotes repeated
+/// (TriggerKey -> Steps) patterns via a SQLite 2-bit saturating counter, and replays Hot rules
+/// silently via <see cref="WorkerAgent.RunStepAsync"/> (0 LLM tokens on both cold and hot paths).
 /// </summary>
 public sealed class StateMachineAgent : IDisposable
 {
     private readonly SqliteStore _store;
-    private readonly IModelGateway _model;
     private readonly WorkerAgent _worker;
-    private readonly SkillRegistry _skillRegistry;
     private readonly GuardService _guard;
     private readonly ILogger<StateMachineAgent> _logger;
 
-    private readonly SemaphoreSlim _evalGate = new(1, 1);
     private readonly object _latestLock = new();
     private CancellationTokenSource? _latestCts;
+    private string? _lastFocusedTriggerKey;
+    private DateTimeOffset _lastFocusedAtUtc = DateTimeOffset.MinValue;
     private readonly ConcurrentDictionary<string, DateTimeOffset> _hitCooldowns = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _coldCooldowns = new(StringComparer.OrdinalIgnoreCase);
 
     public StateMachineAgent(
         SqliteStore store,
-        IModelGateway model,
         WorkerAgent worker,
-        SkillRegistry skillRegistry,
         GuardService guard,
         ILogger<StateMachineAgent> logger)
     {
         _store = store;
-        _model = model;
         _worker = worker;
-        _skillRegistry = skillRegistry;
         _guard = guard;
         _logger = logger;
     }
@@ -70,16 +63,14 @@ public sealed class StateMachineAgent : IDisposable
         string? url,
         CancellationToken appCt = default)
     {
-        var labels = target.FormFieldLabels ?? Array.Empty<string>();
-        if (labels.Count == 0 && target.VisibleInputCount <= 0)
-            return;
-
         var triggerKey = BuildTriggerKey(url, target.ProcessName, target.Title);
 
-        // Latest-Wins: cancel any in-flight evaluation for an older tab/window.
+        // Latest-Wins: record latest focused trigger key and cancel any older in-flight replay.
         CancellationTokenSource linked;
         lock (_latestLock)
         {
+            _lastFocusedTriggerKey = triggerKey;
+            _lastFocusedAtUtc = DateTimeOffset.UtcNow;
             try { _latestCts?.Cancel(); } catch { }
             try { _latestCts?.Dispose(); } catch { }
             _latestCts = CancellationTokenSource.CreateLinkedTokenSource(appCt);
@@ -88,91 +79,80 @@ public sealed class StateMachineAgent : IDisposable
         var ct = linked.Token;
 
         var existing = await _store.GetAutoStateRuleAsync(triggerKey, ct);
-        if (existing is not null && existing.Status != "Disabled" && existing.PredictorCounter >= 2)
-        {
-            var now = DateTimeOffset.UtcNow;
-            if (!_hitCooldowns.TryGetValue(triggerKey, out var lastHit) || (now - lastHit) >= TimeSpan.FromSeconds(30))
-            {
-                _hitCooldowns[triggerKey] = now;
-                await RecordOutcomeAsync(triggerKey, hit: true, estimatedTokensSaved: 90, ct);
-            }
-
-            var hotSteps = ParseSteps(existing.StepsJson);
-            if (hotSteps.Count > 0)
-                await ExecuteSafeStepsAsync(conversationId, triggerKey, existing.StateName, hotSteps, ct);
-            return;
-        }
-
-        // Prevent repeated cold LLM calls on the exact same page within 60s.
-        var nowUtc = DateTimeOffset.UtcNow;
-        if (_coldCooldowns.TryGetValue(triggerKey, out var lastCold) && (nowUtc - lastCold) < TimeSpan.FromSeconds(60))
-            return;
-        _coldCooldowns[triggerKey] = nowUtc;
-
-        if (!await _evalGate.WaitAsync(0, ct))
+        if (existing is null || existing.Status == "Disabled" || existing.PredictorCounter < 2)
             return;
 
-        try
-        {
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(8));
+        var now = DateTimeOffset.UtcNow;
+        if (_hitCooldowns.TryGetValue(triggerKey, out var lastHit) && (now - lastHit) < TimeSpan.FromSeconds(30))
+            return;
+        _hitCooldowns[triggerKey] = now;
 
-            var skillsSummary = string.Join("\n", _skillRegistry.All
-                .Where(s => _guard.IsSkillEnabled(s.Name))
-                .Select(s => $"- {s.PlannerSpec}"));
+        var hotSteps = ParseSteps(existing.StepsJson);
+        if (hotSteps.Count == 0)
+            return;
 
-            var sys = SystemAutomationPrompts.BuildAutoStateTransitionSystemPrompt(skillsSummary);
-            var user = SystemAutomationPrompts.BuildAutoStateTransitionUserPrompt(
-                triggerKey, target.ProcessName, target.Title, url, target.VisibleInputCount, labels);
-
-            var resp = await _model.CompleteAsync(new[]
-            {
-                new ModelMessage("system", sys),
-                new ModelMessage("user", user)
-            }, ModelTier.Simple, timeoutCts.Token);
-
-            var (stateName, steps) = ParseTransition(resp.Content);
-            var safeSteps = FilterSafeSteps(steps);
-            var stepsJson = JsonSerializer.Serialize(safeSteps);
-
-            int nextCounter = 1;
-            int hits = existing?.HitCount ?? 0;
-            int misses = existing?.MissCount ?? 0;
-            if (existing is not null &&
-                string.Equals(existing.StateName, stateName, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(existing.StepsJson, stepsJson, StringComparison.Ordinal))
-            {
-                nextCounter = Math.Min(3, existing.PredictorCounter + 1);
-            }
-
-            var updated = new AutoStateRuleRecord(
-                TriggerKey: triggerKey,
-                StateName: stateName,
-                StepsJson: stepsJson,
-                PredictorCounter: nextCounter,
-                HitCount: hits,
-                MissCount: misses,
-                Status: nextCounter >= 2 ? "Hot" : "Cold",
-                LastSeenAt: DateTimeOffset.UtcNow);
-            await _store.UpsertAutoStateRuleAsync(updated, CancellationToken.None);
-
-            if (safeSteps.Count > 0)
-                await ExecuteSafeStepsAsync(conversationId, triggerKey, stateName, safeSteps, ct);
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "[StateMachineAgent] transition evaluation failed for {Key}", triggerKey);
-        }
-        finally
-        {
-            _evalGate.Release();
-        }
+        await RecordOutcomeAsync(triggerKey, hit: true, estimatedTokensSaved: 350, ct);
+        await ExecuteSafeStepsAsync(conversationId, triggerKey, existing.StateName, hotSteps, ct);
     }
 
-    public async Task RecordOutcomeAsync(string triggerKey, bool hit, long estimatedTokensSaved = 90, CancellationToken ct = default)
+    /// <summary>
+    /// Passively observes a user-initiated single-skill execution on the recently focused external window/page.
+    /// Zero LLM calls: after 2 identical observations on the same TriggerKey, the rule promotes to Hot.
+    /// </summary>
+    public async Task ObserveUserSkillExecutionAsync(
+        ExternalWindowTarget? fallbackTarget,
+        string skillName,
+        JsonElement args,
+        CancellationToken ct = default)
+    {
+        var candidate = new CachedWorkflowStep(
+            skillName.Trim(),
+            args.ValueKind == JsonValueKind.Object ? args.Clone() : JsonDocument.Parse("{}").RootElement.Clone());
+        var safeSteps = FilterSafeSteps(new List<CachedWorkflowStep> { candidate });
+        if (safeSteps.Count == 0)
+            return;
+
+        string? triggerKey;
+        lock (_latestLock)
+        {
+            triggerKey = !string.IsNullOrWhiteSpace(_lastFocusedTriggerKey) &&
+                         (DateTimeOffset.UtcNow - _lastFocusedAtUtc) <= TimeSpan.FromMinutes(5)
+                ? _lastFocusedTriggerKey
+                : null;
+        }
+
+        if (string.IsNullOrWhiteSpace(triggerKey) && fallbackTarget is not null)
+            triggerKey = BuildTriggerKey(null, fallbackTarget.ProcessName, fallbackTarget.Title);
+
+        if (string.IsNullOrWhiteSpace(triggerKey))
+            return;
+
+        var stepsJson = JsonSerializer.Serialize(safeSteps);
+        var existing = await _store.GetAutoStateRuleAsync(triggerKey, ct);
+        if (existing is not null && existing.Status == "Disabled")
+            return;
+
+        int nextCounter = 1;
+        int hits = existing?.HitCount ?? 0;
+        int misses = existing?.MissCount ?? 0;
+        if (existing is not null && string.Equals(existing.StepsJson, stepsJson, StringComparison.Ordinal))
+            nextCounter = Math.Min(3, existing.PredictorCounter + 1);
+
+        var stateName = $"learned_{skillName.Trim().ToLowerInvariant()}";
+        var updated = new AutoStateRuleRecord(
+            TriggerKey: triggerKey,
+            StateName: stateName,
+            StepsJson: stepsJson,
+            PredictorCounter: nextCounter,
+            HitCount: hits,
+            MissCount: misses,
+            Status: nextCounter >= 2 ? "Hot" : "Cold",
+            LastSeenAt: DateTimeOffset.UtcNow);
+
+        await _store.UpsertAutoStateRuleAsync(updated, ct);
+    }
+
+    public async Task RecordOutcomeAsync(string triggerKey, bool hit, long estimatedTokensSaved = 350, CancellationToken ct = default)
     {
         var existing = await _store.GetAutoStateRuleAsync(triggerKey, ct);
         if (existing is null) return;
@@ -215,7 +195,7 @@ public sealed class StateMachineAgent : IDisposable
             if (!_guard.IsSkillEnabled(step.Skill)) continue;
             try
             {
-                await _worker.ExecuteSingleSkillAsync(
+                await _worker.RunStepAsync(
                     conversationId: conversationId,
                     userPrompt: $"[auto_state:{stateName}] {triggerKey}",
                     skillName: step.Skill,
@@ -223,7 +203,9 @@ public sealed class StateMachineAgent : IDisposable
                     targetMailId: null,
                     confirmAsync: (_, _) => Task.FromResult(false),
                     onStatusAsync: _ => Task.CompletedTask,
-                    tier: ModelTier.Simple,
+                    sources: new List<MailSourceRef>(),
+                    observations: new List<string>(),
+                    completedSteps: new List<string>(),
                     ct: ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -246,57 +228,6 @@ public sealed class StateMachineAgent : IDisposable
         return safe;
     }
 
-    private static (string StateName, List<CachedWorkflowStep> Steps) ParseTransition(string? raw)
-    {
-        var steps = new List<CachedWorkflowStep>();
-        if (string.IsNullOrWhiteSpace(raw))
-            return ("idle", steps);
-
-        var cleaned = raw.Trim();
-        if (cleaned.StartsWith("```", StringComparison.Ordinal))
-        {
-            var nl = cleaned.IndexOf('\n');
-            if (nl >= 0) cleaned = cleaned[(nl + 1)..];
-            var end = cleaned.LastIndexOf("```", StringComparison.Ordinal);
-            if (end >= 0) cleaned = cleaned[..end];
-            cleaned = cleaned.Trim();
-        }
-        var objStart = cleaned.IndexOf('{');
-        var objEnd = cleaned.LastIndexOf('}');
-        if (objStart >= 0 && objEnd > objStart)
-            cleaned = cleaned[objStart..(objEnd + 1)];
-
-        try
-        {
-            using var doc = JsonDocument.Parse(cleaned);
-            var root = doc.RootElement;
-            var stateName = root.TryGetProperty("state_name", out var sn) && sn.ValueKind == JsonValueKind.String
-                ? sn.GetString()?.Trim().ToLowerInvariant()
-                : null;
-            if (string.IsNullOrWhiteSpace(stateName))
-                stateName = "idle";
-
-            if (root.TryGetProperty("steps", out var arr) && arr.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var el in arr.EnumerateArray())
-                {
-                    if (el.ValueKind != JsonValueKind.Object) continue;
-                    var skill = el.TryGetProperty("skill", out var sk) ? sk.GetString()?.Trim() : null;
-                    if (string.IsNullOrWhiteSpace(skill)) continue;
-                    var args = el.TryGetProperty("args", out var a) && a.ValueKind == JsonValueKind.Object
-                        ? a.Clone()
-                        : JsonDocument.Parse("{}").RootElement.Clone();
-                    steps.Add(new CachedWorkflowStep(skill, args));
-                }
-            }
-            return (stateName, steps);
-        }
-        catch
-        {
-            return ("idle", steps);
-        }
-    }
-
     private static List<CachedWorkflowStep> ParseSteps(string json)
     {
         try
@@ -317,6 +248,5 @@ public sealed class StateMachineAgent : IDisposable
             try { _latestCts?.Dispose(); } catch { }
             _latestCts = null;
         }
-        _evalGate.Dispose();
     }
 }
