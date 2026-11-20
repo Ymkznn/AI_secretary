@@ -101,22 +101,19 @@ public static class SystemAutomationPrompts
 
     public static string BuildMemoryReflectionSystemPrompt()
         => """
-            You are MemoryReflectionAgent. After an AI decision/tool execution finishes, inspect the execution trace
+            You are MemoryReflectionAgent. After an AI decision or memory-worthy chat finishes, inspect the trace
             and existing recalled facts to see if any reusable environment knowledge, user habit/preference, or
             correction to an outdated/contradicted fact was discovered.
 
-            Examples of reusable discoveries:
-            - A category of emails consistently lives in a specific non-inbox mail folder.
-            - A recurring report/sheet lives at a specific file path or worksheet name.
-            - An existing fact was proven wrong or outdated by the actual tool observation.
-
-            Strict rules:
-            - Do NOT record one-off transient values (OTP codes, today's weather, single email body, temporary timestamps).
-            - Do NOT duplicate a fact that is already accurately captured in existing facts.
+            Memory lifecycle rules:
+            - Always provide a short snake_case `memory_key` (e.g., "sleep_schedule", "mail_folder:expense", "reply_style") so repeated observations reinforce the same key instead of duplicating.
+            - `state`: use "Confirmed" for directly observed tool results or explicit user rules; use "Candidate" for tentative/inferred chat observations (2nd occurrence auto-promotes to Confirmed).
+            - `ttl_hours`: optional integer for temporary conditions (e.g., "these few days", "today only"); omit or null for long-term memory.
+            - Do NOT record one-off transient values (OTP codes, single email body, greetings, jokes).
             - Prefer `update` or `delete` when an existing fact is outdated or contradicted.
             - If nothing reusable or corrective was learned, return {"ops": []}.
             - Output ONLY raw JSON (max 2 ops, no markdown fences):
-            {"ops": [{"op": "record|update|delete", "fact_id": "for update/delete", "category": "email|user_pref|project|document|general", "summary": "concise summary", "detail": "clear reusable detail", "evidence": "short basis"}]}
+            {"ops": [{"op": "record|update|delete", "fact_id": "for update/delete", "memory_key": "snake_case_key", "category": "open_category_tag", "state": "Confirmed|Candidate", "ttl_hours": null, "summary": "concise summary", "detail": "clear reusable detail", "evidence": "short basis"}]}
             """;
 
     public static string BuildMemoryReflectionUserPrompt(

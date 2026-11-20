@@ -34,6 +34,22 @@ public sealed class MemoryReflectionAgent : IDisposable
         _logger = logger;
     }
 
+    public void EnqueueChatReflection(string conversationId, string userPrompt, string directReply)
+    {
+        if (string.IsNullOrWhiteSpace(userPrompt) || !_guard.IsSkillEnabled("manage_facts"))
+            return;
+
+        var replySnippet = directReply.Length > 600 ? directReply[..600] + "…" : directReply;
+        _ = Task.Run(() => ReflectAsync(
+            conversationId,
+            userPrompt,
+            new[] { "chat_reply" },
+            new[] { $"User stated: {userPrompt}" },
+            replySnippet,
+            defaultState: "Candidate",
+            CancellationToken.None));
+    }
+
     public void EnqueueDecisionReflection(
         string conversationId,
         string userPrompt,
@@ -54,7 +70,7 @@ public sealed class MemoryReflectionAgent : IDisposable
             .ToList();
         var replySnippet = finalReply.Length > 600 ? finalReply[..600] + "…" : finalReply;
 
-        _ = Task.Run(() => ReflectAsync(conversationId, userPrompt, stepsCopy, obsCopy, replySnippet, CancellationToken.None));
+        _ = Task.Run(() => ReflectAsync(conversationId, userPrompt, stepsCopy, obsCopy, replySnippet, defaultState: "Confirmed", CancellationToken.None));
     }
 
     private async Task ReflectAsync(
@@ -63,6 +79,7 @@ public sealed class MemoryReflectionAgent : IDisposable
         IReadOnlyList<string> completedSteps,
         IReadOnlyList<string> observations,
         string finalReply,
+        string defaultState,
         CancellationToken ct)
     {
         if (!await _gate.WaitAsync(0, ct))
@@ -76,7 +93,7 @@ public sealed class MemoryReflectionAgent : IDisposable
             var recalled = await _store.RecallRelevantFactsAsync(conversationId, userPrompt, 6, timeoutCts.Token);
             var existingBlock = recalled.Count == 0
                 ? "(none)"
-                : string.Join("\n", recalled.Select(f => $"- fact_id={f.FactId} | category={f.Category} | summary={f.Summary}"));
+                : string.Join("\n", recalled.Select(f => $"- fact_id={f.FactId} | key={f.MemoryKey} | state={f.State}({f.ReinforceCount}) | category={f.Category} | summary={f.Summary}"));
 
             var sys = SystemAutomationPrompts.BuildMemoryReflectionSystemPrompt();
             var user = SystemAutomationPrompts.BuildMemoryReflectionUserPrompt(
@@ -88,7 +105,7 @@ public sealed class MemoryReflectionAgent : IDisposable
                 new ModelMessage("user", user)
             }, ModelTier.Simple, timeoutCts.Token);
 
-            await ApplyReflectionOpsAsync(conversationId, resp.Content, timeoutCts.Token);
+            await ApplyReflectionOpsAsync(conversationId, resp.Content, defaultState, timeoutCts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -103,7 +120,7 @@ public sealed class MemoryReflectionAgent : IDisposable
         }
     }
 
-    private async Task ApplyReflectionOpsAsync(string conversationId, string? raw, CancellationToken ct)
+    private async Task ApplyReflectionOpsAsync(string conversationId, string? raw, string defaultState, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(raw)) return;
 
@@ -131,10 +148,15 @@ public sealed class MemoryReflectionAgent : IDisposable
             if (applied >= 2 || item.ValueKind != JsonValueKind.Object) break;
             var op = item.TryGetProperty("op", out var oEl) ? oEl.GetString()?.Trim().ToLowerInvariant() : null;
             var factId = item.TryGetProperty("fact_id", out var fEl) ? fEl.GetString()?.Trim() : null;
+            var memKey = item.TryGetProperty("memory_key", out var mkEl) ? mkEl.GetString()?.Trim() : null;
             var category = item.TryGetProperty("category", out var cEl) ? cEl.GetString()?.Trim() : null;
+            var state = item.TryGetProperty("state", out var stEl) ? stEl.GetString()?.Trim() : defaultState;
             var summary = item.TryGetProperty("summary", out var sEl) ? sEl.GetString()?.Trim() : null;
             var detail = item.TryGetProperty("detail", out var dEl) ? dEl.GetString()?.Trim() : null;
             var evidence = item.TryGetProperty("evidence", out var eEl) ? eEl.GetString()?.Trim() : null;
+            DateTimeOffset? expiresAt = null;
+            if (item.TryGetProperty("ttl_hours", out var ttlEl) && ttlEl.ValueKind == JsonValueKind.Number && ttlEl.TryGetInt32(out var ttlHours) && ttlHours > 0)
+                expiresAt = DateTimeOffset.UtcNow.AddHours(Math.Clamp(ttlHours, 1, 24 * 90));
 
             switch (op)
             {
@@ -146,9 +168,12 @@ public sealed class MemoryReflectionAgent : IDisposable
                         detail: detail,
                         category: string.IsNullOrWhiteSpace(category) ? "general" : category,
                         evidence: evidence,
-                        confidence: "observed",
+                        confidence: string.Equals(state, "Candidate", StringComparison.OrdinalIgnoreCase) ? "inferred" : "observed",
                         tags: null,
-                        ct: ct);
+                        ct: ct,
+                        memoryKey: memKey,
+                        state: string.IsNullOrWhiteSpace(state) ? defaultState : state,
+                        expiresAt: expiresAt);
                     applied++;
                     break;
                 case "update":

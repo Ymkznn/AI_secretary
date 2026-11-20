@@ -160,11 +160,16 @@ public sealed class SqliteStore
             CREATE TABLE IF NOT EXISTS KnowledgeFacts (
                 FactId TEXT PRIMARY KEY,
                 ConversationId TEXT NOT NULL,
+                MemoryKey TEXT NOT NULL DEFAULT '',
                 Category TEXT NOT NULL DEFAULT 'general',
                 Summary TEXT NOT NULL,
                 Detail TEXT NOT NULL,
                 Evidence TEXT NULL,
                 Confidence TEXT NOT NULL DEFAULT 'observed',
+                State TEXT NOT NULL DEFAULT 'Confirmed',
+                ReinforceCount INTEGER NOT NULL DEFAULT 1,
+                ExpiresAt TEXT NULL,
+                LastVerifiedAt TEXT NULL,
                 TagsJson TEXT NOT NULL DEFAULT '[]',
                 CreatedAt TEXT NOT NULL,
                 UpdatedAt TEXT NOT NULL
@@ -270,7 +275,12 @@ public sealed class SqliteStore
             "ALTER TABLE Reminders ADD COLUMN LinkedEventId TEXT NULL;",
             "ALTER TABLE Reminders ADD COLUMN RecurrenceRule TEXT NULL;",
             "ALTER TABLE CalendarEvents ADD COLUMN Recurrence TEXT NOT NULL DEFAULT 'none';",
-            "ALTER TABLE CalendarEvents ADD COLUMN ExceptionDatesJson TEXT NOT NULL DEFAULT '[]';"
+            "ALTER TABLE CalendarEvents ADD COLUMN ExceptionDatesJson TEXT NOT NULL DEFAULT '[]';",
+            "ALTER TABLE KnowledgeFacts ADD COLUMN MemoryKey TEXT NOT NULL DEFAULT '';",
+            "ALTER TABLE KnowledgeFacts ADD COLUMN State TEXT NOT NULL DEFAULT 'Confirmed';",
+            "ALTER TABLE KnowledgeFacts ADD COLUMN ReinforceCount INTEGER NOT NULL DEFAULT 1;",
+            "ALTER TABLE KnowledgeFacts ADD COLUMN ExpiresAt TEXT NULL;",
+            "ALTER TABLE KnowledgeFacts ADD COLUMN LastVerifiedAt TEXT NULL;"
         })
         {
             try
@@ -1168,30 +1178,93 @@ public sealed class SqliteStore
     public async Task UpsertFactAsync(KnowledgeFactRecord fact, CancellationToken ct = default)
     {
         await using var conn = await OpenAsync(ct);
+
+        var memKey = (fact.MemoryKey ?? "").Trim().ToLowerInvariant();
+        var verifiedAt = (fact.LastVerifiedAt ?? fact.UpdatedAt).ToString("O");
+        var factId = fact.FactId;
+        var reinforceCount = Math.Max(1, fact.ReinforceCount);
+        var state = string.IsNullOrWhiteSpace(fact.State) ? "Confirmed" : fact.State.Trim();
+
+        // Semantic MemoryKey deduplication & 2-bit reinforcement: repeating a Candidate auto-promotes to Confirmed.
+        if (!string.IsNullOrWhiteSpace(memKey))
+        {
+            await using var findCmd = conn.CreateCommand();
+            findCmd.CommandText = """
+                SELECT FactId, ReinforceCount, State
+                FROM KnowledgeFacts
+                WHERE ConversationId = $conv AND lower(MemoryKey) = $mkey
+                LIMIT 1;
+                """;
+            findCmd.Parameters.AddWithValue("$conv", fact.ConversationId);
+            findCmd.Parameters.AddWithValue("$mkey", memKey);
+            await using var r = await findCmd.ExecuteReaderAsync(ct);
+            if (await r.ReadAsync(ct))
+            {
+                factId = r.GetString(0);
+                var prevCount = r.IsDBNull(1) ? 1 : r.GetInt32(1);
+                var prevState = r.IsDBNull(2) ? "Confirmed" : r.GetString(2);
+                reinforceCount = Math.Min(10, prevCount + 1);
+                if (reinforceCount >= 2 ||
+                    string.Equals(prevState, "Confirmed", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(state, "Confirmed", StringComparison.OrdinalIgnoreCase))
+                {
+                    state = "Confirmed";
+                }
+            }
+        }
+
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO KnowledgeFacts (FactId, ConversationId, Category, Summary, Detail, Evidence, Confidence, TagsJson, CreatedAt, UpdatedAt)
-            VALUES ($id, $conv, $cat, $sum, $det, $ev, $conf, $tags, $created, $updated)
+            INSERT INTO KnowledgeFacts (FactId, ConversationId, MemoryKey, Category, Summary, Detail, Evidence, Confidence, State, ReinforceCount, ExpiresAt, LastVerifiedAt, TagsJson, CreatedAt, UpdatedAt)
+            VALUES ($id, $conv, $mkey, $cat, $sum, $det, $ev, $conf, $state, $rcnt, $exp, $ver, $tags, $created, $updated)
             ON CONFLICT(FactId) DO UPDATE SET
+                MemoryKey = CASE WHEN excluded.MemoryKey <> '' THEN excluded.MemoryKey ELSE KnowledgeFacts.MemoryKey END,
                 Category = excluded.Category,
                 Summary = excluded.Summary,
                 Detail = excluded.Detail,
                 Evidence = excluded.Evidence,
                 Confidence = excluded.Confidence,
+                State = excluded.State,
+                ReinforceCount = excluded.ReinforceCount,
+                ExpiresAt = excluded.ExpiresAt,
+                LastVerifiedAt = excluded.LastVerifiedAt,
                 TagsJson = excluded.TagsJson,
                 UpdatedAt = excluded.UpdatedAt;
             """;
-        cmd.Parameters.AddWithValue("$id", fact.FactId);
+        cmd.Parameters.AddWithValue("$id", factId);
         cmd.Parameters.AddWithValue("$conv", fact.ConversationId);
+        cmd.Parameters.AddWithValue("$mkey", memKey);
         cmd.Parameters.AddWithValue("$cat", fact.Category);
         cmd.Parameters.AddWithValue("$sum", fact.Summary);
         cmd.Parameters.AddWithValue("$det", fact.Detail);
         cmd.Parameters.AddWithValue("$ev", (object?)fact.Evidence ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$conf", fact.Confidence);
+        cmd.Parameters.AddWithValue("$state", state);
+        cmd.Parameters.AddWithValue("$rcnt", reinforceCount);
+        cmd.Parameters.AddWithValue("$exp", fact.ExpiresAt.HasValue ? fact.ExpiresAt.Value.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("$ver", verifiedAt);
         cmd.Parameters.AddWithValue("$tags", JsonSerializer.Serialize(fact.Tags));
         cmd.Parameters.AddWithValue("$created", fact.CreatedAt.ToString("O"));
         cmd.Parameters.AddWithValue("$updated", fact.UpdatedAt.ToString("O"));
         await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task<int> PruneExpiredAndStaleCandidateFactsAsync(string conversationId, DateTimeOffset nowUtc, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM KnowledgeFacts
+            WHERE ConversationId = $conv
+              AND (
+                    (ExpiresAt IS NOT NULL AND ExpiresAt <= $now)
+                 OR (State = 'Candidate' AND ReinforceCount < 2 AND COALESCE(LastVerifiedAt, UpdatedAt) < $cutoff)
+              );
+            """;
+        cmd.Parameters.AddWithValue("$conv", conversationId);
+        cmd.Parameters.AddWithValue("$now", nowUtc.ToString("O"));
+        cmd.Parameters.AddWithValue("$cutoff", nowUtc.AddDays(-14).ToString("O"));
+        return await cmd.ExecuteNonQueryAsync(ct);
     }
 
     public async Task<List<FactSummaryItem>> ListFactsAsync(
@@ -1251,13 +1324,16 @@ public sealed class SqliteStore
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT FactId, Category, Summary, TagsJson, Confidence, CreatedAt
+            SELECT FactId, Category, Summary, TagsJson, Confidence, CreatedAt, COALESCE(MemoryKey, ''), COALESCE(State, 'Confirmed'), COALESCE(ReinforceCount, 1)
             FROM KnowledgeFacts
             WHERE ConversationId = $conv
+              AND COALESCE(State, 'Confirmed') = 'Confirmed'
+              AND (ExpiresAt IS NULL OR ExpiresAt > $now)
             ORDER BY UpdatedAt DESC
             LIMIT 100;
             """;
         cmd.Parameters.AddWithValue("$conv", conversationId);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
 
         var candidates = new List<(FactSummaryItem Item, string TagsText)>();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -1268,7 +1344,10 @@ public sealed class SqliteStore
                 reader.GetString(1),
                 reader.GetString(2),
                 reader.GetString(4),
-                DateTimeOffset.Parse(reader.GetString(5)));
+                DateTimeOffset.Parse(reader.GetString(5)),
+                reader.GetString(6),
+                reader.GetString(7),
+                reader.GetInt32(8));
             var tagsJson = reader.IsDBNull(3) ? "[]" : reader.GetString(3);
             candidates.Add((item, tagsJson));
         }
@@ -1372,11 +1451,15 @@ public sealed class SqliteStore
         cmd.CommandText = """
             SELECT FactId, ConversationId, Category, Summary, Detail, Evidence, Confidence, TagsJson, CreatedAt, UpdatedAt
             FROM KnowledgeFacts
-            WHERE ConversationId = $conv AND Category = 'user_pref'
+            WHERE ConversationId = $conv
+              AND Category = 'user_pref'
+              AND COALESCE(State, 'Confirmed') = 'Confirmed'
+              AND (ExpiresAt IS NULL OR ExpiresAt > $now)
             ORDER BY UpdatedAt DESC
             LIMIT $limit;
             """;
         cmd.Parameters.AddWithValue("$conv", conversationId);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
         cmd.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 50));
 
         var list = new List<KnowledgeFactRecord>();

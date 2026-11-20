@@ -211,7 +211,7 @@ public sealed class MainAgent
 
         await _sessions.RecordTokensAsync(mainSession, routeResp.EstimatedTokens, ct: ct);
 
-        var (action, targetTaskId, closeTaskId, tier, directReply, ack, ttsText, choices, skill, args, goal) = ParseRoute(routeResp.Content, userPrompt);
+        var (action, targetTaskId, closeTaskId, tier, memoryWorthy, directReply, ack, ttsText, choices, skill, args, goal) = ParseRoute(routeResp.Content, userPrompt);
         var effectiveGoal = string.IsNullOrWhiteSpace(goal) ? userPrompt : goal;
 
         if (!string.IsNullOrWhiteSpace(preferredLogicalTaskId))
@@ -237,6 +237,8 @@ public sealed class MainAgent
             if (!string.IsNullOrWhiteSpace(ttsText))
                 onDirectTtsText?.Invoke(ttsText);
             await onReplyAsync(directReply, new List<MailSourceRef>());
+            if (memoryWorthy)
+                _memoryReflection.EnqueueChatReflection(conversationId, userPrompt, directReply);
             return;
         }
 
@@ -437,7 +439,7 @@ public sealed class MainAgent
     }
 
     /// <summary>解析路由模型輸出的 JSON 指令；若解析失敗則安全退回複雜 Planner 模式。</summary>
-    private (string Action, string? TargetTaskId, string? CloseTaskId, ModelTier Tier, string Reply, string Ack, string TtsText, List<string> Choices, string Skill, JsonElement Args, string Goal) ParseRoute(string raw, string fallbackGoal)
+    private (string Action, string? TargetTaskId, string? CloseTaskId, ModelTier Tier, bool MemoryWorthy, string Reply, string Ack, string TtsText, List<string> Choices, string Skill, JsonElement Args, string Goal) ParseRoute(string raw, string fallbackGoal)
     {
         try
         {
@@ -455,6 +457,7 @@ public sealed class MainAgent
             var tier = tierStr.Equals("complex", StringComparison.OrdinalIgnoreCase)
                 ? ModelTier.Complex
                 : (action.Equals("call_planner", StringComparison.OrdinalIgnoreCase) ? ModelTier.Complex : ModelTier.Simple);
+            var memoryWorthy = root.TryGetProperty("memory_worthy", out var mw) && mw.ValueKind == JsonValueKind.True;
             var reply = root.TryGetProperty("reply", out var r) ? r.GetString() ?? "" : "";
             var ack = root.TryGetProperty("ack", out var ak) ? ak.GetString()?.Trim() ?? "" : "";
             var ttsText = root.TryGetProperty("tts_text", out var tt) ? tt.GetString() ?? "" : "";
@@ -471,12 +474,12 @@ public sealed class MainAgent
             var skill = root.TryGetProperty("skill", out var sk) ? sk.GetString() ?? "" : "";
             var args = root.TryGetProperty("args", out var ar) ? ar.Clone() : default;
             var goal = root.TryGetProperty("goal", out var g) ? g.GetString() ?? fallbackGoal : fallbackGoal;
-            return (action.ToLowerInvariant(), targetTaskId, closeTaskId, tier, reply, ack, ttsText, choices, skill, args, goal);
+            return (action.ToLowerInvariant(), targetTaskId, closeTaskId, tier, memoryWorthy, reply, ack, ttsText, choices, skill, args, goal);
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "MainAgent route parse fallback to planner");
-            return ("call_planner", null, null, ModelTier.Complex, "", "", "", new List<string>(), "", default, fallbackGoal);
+            return ("call_planner", null, null, ModelTier.Complex, false, "", "", "", new List<string>(), "", default, fallbackGoal);
         }
     }
 

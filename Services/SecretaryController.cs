@@ -47,7 +47,9 @@ public sealed class SecretaryController : IDisposable
     private int _mainTurnActiveCount;
     private DateTimeOffset? _dndUntil;
     private bool _dndAllowUrgent = true;
-    private DateTimeOffset _mailPollBoostUntilUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _boostedPollUntilUtc = DateTimeOffset.MinValue;
+    private string? _boostedPollSkill;
+    private string _boostedPollArgsJson = "{}";
     private sealed class ActivePlannerTaskState
     {
         public required string LogicalTaskId { get; init; }
@@ -294,39 +296,14 @@ public sealed class SecretaryController : IDisposable
             await _store.UpsertChatMessageAsync(m, _appCts.Token);
         }
 
-        // Bootstrap default mail-sync schedule once so Agent & user can inspect/update/delete it via schedules
-        var bootstrapped = await _store.GetSyncValueAsync("mail_monitor_bootstrapped", _appCts.Token);
-        if (bootstrapped != "1")
-        {
-            var mailSkill = _skillRegistry.FindByCapability("mail");
-            if (mailSkill is not null)
-            {
-                var existing = await _store.GetPendingRemindersAsync(_appCts.Token);
-                if (!existing.Any(r =>
-                        !string.IsNullOrWhiteSpace(r.SkillName) &&
-                        string.Equals(_skillRegistry.Resolve(r.SkillName)?.Name, mailSkill.Name, StringComparison.OrdinalIgnoreCase)))
-                {
-                    var intervalMins = Math.Max(1, _config.GetValue<int>("MailMonitor:PollIntervalSeconds", 60) / 60);
-                    await _store.CreateReminderAsync(new ReminderRecord(
-                        ReminderId: Guid.NewGuid().ToString("N"),
-                        ConversationId: ConversationId,
-                        Title: "Mail Sync",
-                        Message: "Periodically sync Outlook EWS and Gmail and triage urgent mail.",
-                        RelatedMailId: null,
-                        RemindAt: DateTimeOffset.UtcNow.AddSeconds(10),
-                        Status: "Pending",
-                        IntervalMinutes: intervalMins,
-                        SkillName: mailSkill.Name,
-                        SkillArgsJson: """{"action":"sync","source":"all"}"""), _appCts.Token);
-                }
-            }
-            await _store.SetSyncValueAsync("mail_monitor_bootstrapped", "1", _appCts.Token);
-        }
-
         await _workflowCache.LoadTuningAsync(_appCts.Token);
         await _workflowCache.MigrateAndCleanLegacyCachesAsync(ConversationId, _appCts.Token);
-        _skills.MailSyncBoostRequested += secs =>
-            _mailPollBoostUntilUtc = DateTimeOffset.UtcNow.AddSeconds(Math.Clamp(secs, 15, 300));
+        _skills.SkillPollBoostRequested += (skillName, argsJson, secs) =>
+        {
+            _boostedPollSkill = skillName;
+            _boostedPollArgsJson = string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson;
+            _boostedPollUntilUtc = DateTimeOffset.UtcNow.AddSeconds(Math.Clamp(secs, 15, 300));
+        };
         _activity.WindowFocused += (target, url) =>
             _ = _stateMachine.HandleWindowFocusAsync(ConversationId, target, url, _appCts.Token);
         _activity.Start();
@@ -1496,7 +1473,7 @@ public sealed class SecretaryController : IDisposable
         {
             _skills.LastObservedOtpCode = otpBtn.Prompt;
             _skills.LastObservedOtpHint = title;
-            _mailPollBoostUntilUtc = DateTimeOffset.MinValue;
+            _boostedPollUntilUtc = DateTimeOffset.MinValue;
         }
 
         await PersistNotificationAsync(convId, eventId, mail, title, summary, reRemindMinutes, finalActions, ct);
@@ -1554,22 +1531,27 @@ public sealed class SecretaryController : IDisposable
     {
         while (!ct.IsCancellationRequested)
         {
-            bool inMailPollBoost = DateTimeOffset.UtcNow < _mailPollBoostUntilUtc;
-            var tickSeconds = inMailPollBoost ? 6 : Math.Clamp(_settings.Current.Scheduler.TickSeconds, 5, 300);
+            bool inSkillPollBoost = DateTimeOffset.UtcNow < _boostedPollUntilUtc && !string.IsNullOrWhiteSpace(_boostedPollSkill);
+            var tickSeconds = inSkillPollBoost ? 6 : Math.Clamp(_settings.Current.Scheduler.TickSeconds, 5, 300);
             try
             {
                 CleanupExpiredPlannerTasks();
                 await WakeDueSnoozedAsync(ct);
                 await WakeDueRemindersAsync(ct);
                 await WakeDuePinnedReRemindersAsync(ct);
-                if (inMailPollBoost)
+                if (inSkillPollBoost && _boostedPollSkill is { } boostSkill)
                 {
-                    await _mailSync.SyncOnceAsync(
+                    using var argsDoc = JsonDocument.Parse(_boostedPollArgsJson);
+                    await _worker.ExecuteSingleSkillAsync(
                         ConversationId,
-                        "all",
-                        (eventId, mail, title, summary, mins, actions) =>
-                            PushProactiveNotificationAsync(ConversationId, eventId, mail, title, summary, ct, mins, actions),
-                        ct);
+                        $"[poll_boost] {boostSkill}",
+                        boostSkill,
+                        argsDoc.RootElement.Clone(),
+                        targetMailId: null,
+                        confirmAsync: (_, _) => Task.FromResult(false),
+                        onStatusAsync: _ => Task.CompletedTask,
+                        tier: ModelTier.Simple,
+                        ct: ct);
                 }
                 await _watchers.TickDueWatchersAsync(async (w, alertMsg) =>
                 {

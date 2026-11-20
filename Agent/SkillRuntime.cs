@@ -46,8 +46,9 @@ public sealed class SkillRuntime
     public event Action<string>? TrustedPathAdded;
     public event Action<string>? UserPrefChanged;
     public event Action<string, string>? FactModified;
-    public event Action<int>? MailSyncBoostRequested;
-    public void RequestMailSyncBoost(int seconds) => MailSyncBoostRequested?.Invoke(Math.Clamp(seconds, 15, 300));
+    public event Action<string, string, int>? SkillPollBoostRequested;
+    public void RequestSkillPollBoost(string skillName, string argsJson, int seconds)
+        => SkillPollBoostRequested?.Invoke(skillName, argsJson, Math.Clamp(seconds, 15, 300));
     public Func<string, string, string, Task<PathPermissionDecision>>? ConfirmPathPermissionHandler { get; set; }
     public Func<string, string, CancellationToken, Task<string>>? SyncMailRequested { get; set; }
     public Func<string, string, MailItem?, string, string, int, List<NotificationButtonOption>?, CancellationToken, Task>? PublishNotificationHandler { get; set; }
@@ -266,7 +267,10 @@ public sealed class SkillRuntime
         string confidence = "observed",
         string category = "general",
         List<string>? tags = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        string? memoryKey = null,
+        string state = "Confirmed",
+        DateTimeOffset? expiresAt = null)
     {
         var normalizedConfidence = string.Equals(confidence, "inferred", StringComparison.OrdinalIgnoreCase)
             ? "inferred"
@@ -274,6 +278,9 @@ public sealed class SkillRuntime
         var normalizedCategory = string.IsNullOrWhiteSpace(category)
             ? "general"
             : category.Trim().ToLowerInvariant();
+        var normalizedState = string.Equals(state, "Candidate", StringComparison.OrdinalIgnoreCase)
+            ? "Candidate"
+            : "Confirmed";
 
         var now = DateTimeOffset.UtcNow;
         var fact = new KnowledgeFactRecord(
@@ -286,10 +293,15 @@ public sealed class SkillRuntime
             Confidence: normalizedConfidence,
             Tags: tags?.Where(t => !string.IsNullOrWhiteSpace(t)).Select(t => t.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList() ?? new List<string>(),
             CreatedAt: now,
-            UpdatedAt: now);
+            UpdatedAt: now,
+            MemoryKey: (memoryKey ?? "").Trim().ToLowerInvariant(),
+            State: normalizedState,
+            ReinforceCount: 1,
+            ExpiresAt: expiresAt,
+            LastVerifiedAt: now);
 
         await _store.UpsertFactAsync(fact, ct);
-        if (normalizedCategory == "user_pref")
+        if (normalizedCategory == "user_pref" && normalizedState == "Confirmed")
             UserPrefChanged?.Invoke(conversationId);
         return fact;
     }

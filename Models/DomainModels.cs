@@ -194,14 +194,22 @@ public sealed record KnowledgeFactRecord(
     string Confidence,
     List<string> Tags,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    string MemoryKey = "",
+    string State = "Confirmed",
+    int ReinforceCount = 1,
+    DateTimeOffset? ExpiresAt = null,
+    DateTimeOffset? LastVerifiedAt = null);
 
 public sealed record FactSummaryItem(
     string FactId,
     string Category,
     string Summary,
     string Confidence,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    string MemoryKey = "",
+    string State = "Confirmed",
+    int ReinforceCount = 1);
 
 public sealed record CalendarEventRecord(
     string EventId,

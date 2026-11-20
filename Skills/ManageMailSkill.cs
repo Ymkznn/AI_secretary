@@ -193,7 +193,7 @@ public sealed class ManageMailSkill : IBasicSkill
     {
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
         if (int.TryParse(ctx.GetArg("boost_seconds"), out var boostSecs) && boostSecs > 0)
-            _skills.RequestMailSyncBoost(boostSecs);
+            _skills.RequestSkillPollBoost(Name, """{"action":"sync","source":"all"}""", boostSecs);
         var res = await _skills.SyncMailAsync(ctx.ConversationId, source, ctx.Ct);
         ctx.Observations.Add(res);
         ctx.CompletedSteps.Add($"manage_mail:sync:{source}");
