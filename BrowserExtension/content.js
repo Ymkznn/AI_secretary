@@ -115,21 +115,108 @@
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  function applyFills(fills) {
-    let applied = 0;
-    for (const f of fills || []) {
-      const targetId = f.field_id || f.fieldId || '';
-      if (!targetId) continue;
-      const matches = queryAllDeep(document, `[data-aisec-id="${CSS.escape(targetId)}"]`);
-      const el = matches[0];
-      if (!el) continue;
-      const type = (el.type || '').toLowerCase();
-      if (type === 'password' || type === 'submit' || type === 'button') continue;
+  const SKIP_FILL_TYPES = new Set(['password', 'submit', 'button', 'image', 'reset', 'hidden', 'file']);
 
-      setNativeValue(el, f.value ?? '');
-      applied++;
+  function normText(t) {
+    return String(t || '').replace(/[\s\*＊:：]+/g, ' ').trim().toLowerCase();
+  }
+
+  function editableCandidates() {
+    return queryAllDeep(document, 'input, textarea, select, [contenteditable="true"]').filter(el => {
+      const type = (el.type || '').toLowerCase();
+      return !SKIP_FILL_TYPES.has(type) && !el.disabled && !el.readOnly;
+    });
+  }
+
+  // Locate the target element even if the page re-rendered (React/Vue) and dropped data-aisec-id:
+  // 1) data-aisec-id  2) re-tag the DOM and retry  3) id/name attribute  4) unique label match
+  function findTargetElement(f, framePrefix) {
+    const targetId = f.fieldId || f.field_id || f.FieldId || '';
+    const name = f.name || f.Name || '';
+    const label = f.label || f.Label || '';
+
+    if (targetId) {
+      let el = queryAllDeep(document, `[data-aisec-id="${CSS.escape(targetId)}"]`)[0];
+      if (el) return { el, via: 'aisec-id' };
+      try { extractFormFields(framePrefix || ''); } catch {}
+      el = queryAllDeep(document, `[data-aisec-id="${CSS.escape(targetId)}"]`)[0];
+      if (el) return { el, via: 'aisec-id(retag)' };
     }
-    return applied;
+
+    const cands = editableCandidates();
+    const keys = [name, targetId].filter(k => k && !/^aisec_/.test(k));
+    for (const k of keys) {
+      const el = cands.find(c => c.id === k || c.name === k);
+      if (el) return { el, via: 'id/name' };
+    }
+
+    if (label) {
+      const want = normText(label);
+      const exact = cands.filter(c => normText(findLabel(c, c.ownerDocument)) === want);
+      if (exact.length === 1) return { el: exact[0], via: 'label' };
+      if (exact.length === 0 && want.length >= 2) {
+        const partial = cands.filter(c => {
+          const l = normText(findLabel(c, c.ownerDocument));
+          return l && (l.includes(want) || want.includes(l));
+        });
+        if (partial.length === 1) return { el: partial[0], via: 'label~' };
+      }
+    }
+    return null;
+  }
+
+  function applyValue(el, value) {
+    const tag = (el.tagName || '').toUpperCase();
+    const type = (el.type || '').toLowerCase();
+    const v = String(value ?? '');
+    if (type === 'checkbox' || type === 'radio') {
+      const want = /^(true|1|yes|y|on|checked|是|勾選)$/i.test(v.trim()) || (type === 'radio' && v && v === el.value);
+      if (el.checked !== want) el.click();
+      return;
+    }
+    if (tag === 'SELECT') {
+      const opt = Array.from(el.options).find(o => o.value === v)
+        || Array.from(el.options).find(o => normText(o.text) === normText(v))
+        || Array.from(el.options).find(o => normText(o.text).includes(normText(v)) && v);
+      setNativeValue(el, opt ? opt.value : v);
+      return;
+    }
+    setNativeValue(el, v);
+  }
+
+  function readBack(el) {
+    const tag = (el.tagName || '').toUpperCase();
+    const type = (el.type || '').toLowerCase();
+    if (type === 'checkbox' || type === 'radio') return el.checked ? 'checked' : 'unchecked';
+    if (tag === 'SELECT') return el.selectedOptions?.[0]?.text?.trim() ?? el.value ?? '';
+    if (tag !== 'INPUT' && tag !== 'TEXTAREA' && el.isContentEditable) return (el.innerText || '').trim();
+    return el.value ?? '';
+  }
+
+  // Returns { appliedCount, applied: [{ fieldId, label, via, readBackValue }] } so the agent can verify the result.
+  function applyFills(fills, framePrefix) {
+    const applied = [];
+    for (const f of fills || []) {
+      const targetId = f.fieldId || f.field_id || f.FieldId || '';
+      const value = f.value ?? f.Value ?? '';
+      const hit = findTargetElement(f, framePrefix);
+      if (!hit) continue;
+      const el = hit.el;
+      const type = (el.type || '').toLowerCase();
+      if (SKIP_FILL_TYPES.has(type)) continue;
+      try {
+        applyValue(el, value);
+        applied.push({
+          fieldId: targetId,
+          label: findLabel(el, el.ownerDocument),
+          via: hit.via,
+          readBackValue: String(readBack(el)).slice(0, 200)
+        });
+      } catch (e) {
+        applied.push({ fieldId: targetId, error: String(e?.message || e) });
+      }
+    }
+    return { appliedCount: applied.filter(a => !a.error).length, applied };
   }
 
   function isVisibleInput(el) {
@@ -271,8 +358,8 @@
       } else if (msg?.type === 'EXTRACT_DOM') {
         sendResponse(h.extractDom(msg.selector || '', msg.maxChars));
       } else if (msg?.type === 'APPLY_FILLS') {
-        const count = h.applyFills(msg.fills);
-        sendResponse({ applied: count });
+        const res = h.applyFills(msg.fills, msg.framePrefix || '');
+        sendResponse({ applied: res.appliedCount, result: res });
       } else if (msg?.type === 'FILL_OTP') {
         sendResponse(h.fillOtp(msg.code));
       }

@@ -204,24 +204,64 @@ async function handleExtractDom(requestId, selector, maxChars) {
   }
 }
 
-async function handleApplyFills(fills) {
+async function handleApplyFills(requestId, fills) {
+  const list = Array.isArray(fills) ? fills : [];
+  let result = { appliedCount: 0, items: [], url: '', title: '', error: null };
   try {
     const tab = await getTargetTab();
-    if (!tab) return;
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
-      files: ['content.js']
-    });
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
-      args: [fills || []],
-      func: (fillsList) => {
-        return window.__aiSecretaryHelper ? window.__aiSecretaryHelper.applyFills(fillsList) : 0;
+    if (!tab) {
+      result.error = 'no eligible active tab (incognito / non-http tab or no focused browser window)';
+    } else {
+      result.url = tab.url || '';
+      result.title = tab.title || '';
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        files: ['content.js']
+      });
+      const frameResults = await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        args: [list],
+        func: (fillsList) => {
+          const isTop = window === window.top;
+          const prefix = isTop ? 'top' : (window.name || location.pathname.replace(/[^a-zA-Z0-9]/g, '_').slice(-16) || 'sub');
+          return window.__aiSecretaryHelper
+            ? window.__aiSecretaryHelper.applyFills(fillsList, prefix)
+            : { appliedCount: 0, applied: [] };
+        }
+      });
+
+      // Merge per-frame results: a field counts as applied if any frame applied it.
+      const byId = new Map();
+      for (const fr of frameResults || []) {
+        for (const a of fr?.result?.applied || []) {
+          if (!a?.fieldId) continue;
+          const prev = byId.get(a.fieldId);
+          if (!prev || (prev.error && !a.error)) byId.set(a.fieldId, a);
+        }
       }
-    });
+      result.items = list.map(f => {
+        const fid = f.fieldId || f.field_id || f.FieldId || '';
+        const a = byId.get(fid);
+        if (a && !a.error) {
+          return { fieldId: fid, applied: true, label: a.label || null, readBackValue: a.readBackValue ?? null, error: null };
+        }
+        return { fieldId: fid, applied: false, label: f.label || null, readBackValue: null, error: a?.error || 'field not found in page DOM' };
+      });
+      result.appliedCount = result.items.filter(i => i.applied).length;
+    }
   } catch (e) {
+    result.error = String(e?.message || e);
     console.debug('AiSecretary apply fills error:', e);
   }
+
+  if (!requestId) return;
+  try {
+    await fetch(`${API_BASE}/api/browser/fill-result/${encodeURIComponent(requestId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(result)
+    });
+  } catch {}
 }
 
 async function handleFillOtp(requestId, code) {
@@ -315,7 +355,7 @@ function connectSse() {
     lastPingAt = Date.now();
     try {
       const data = JSON.parse(ev.data);
-      if (Array.isArray(data?.fills)) handleApplyFills(data.fills);
+      if (Array.isArray(data?.fills)) handleApplyFills(data.requestId, data.fills);
     } catch {}
   });
   sse.addEventListener('browser_fill_otp', (ev) => {

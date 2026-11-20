@@ -98,7 +98,8 @@ public sealed class WorkflowCacheService
         string userPrompt,
         CancellationToken ct = default)
     {
-        var queryTokens = Tokenize($"{goal} {userPrompt}");
+        // Normalize the query exactly like stored signatures so Jaccard compares like with like.
+        var queryTokens = Tokenize(BuildSignature($"{goal} {userPrompt}"));
         if (queryTokens.Count == 0) return (null, new List<CachedWorkflowStep>());
 
         var all = await _store.GetWorkflowCachesAsync(conversationId, ct);
@@ -125,7 +126,7 @@ public sealed class WorkflowCacheService
             return (null, new List<CachedWorkflowStep>());
 
         var steps = ParseSteps(best.StepsJson);
-        if (steps.Count == 0 || steps.Any(s => !_guard.IsSkillEnabled(s.Skill)))
+        if (steps.Count == 0 || steps.Any(s => !_guard.IsSkillEnabled(s.Skill)) || HasNonReusableMutatingSteps(steps))
             return (null, new List<CachedWorkflowStep>());
 
         return (best, steps);
@@ -178,6 +179,9 @@ public sealed class WorkflowCacheService
         IReadOnlyList<KnowledgeFactRecord>? sourcePrefs = null)
     {
         if (steps.Count < 2) return;
+        // Plans that create/delete/update/fill with one-off hardcoded arguments (ids, text, values) cannot be replayed
+        // for a different request; caching them only produces mispredictions that cost an extra LLM round.
+        if (HasNonReusableMutatingSteps(steps)) return;
 
         var sig = BuildSignature($"{goal} {userPrompt}");
         if (string.IsNullOrWhiteSpace(sig)) return;
@@ -252,9 +256,35 @@ public sealed class WorkflowCacheService
         }
     }
 
-    private static string BuildSignature(string raw)
-        => string.Join(" ", Tokenize(raw).OrderBy(t => t, StringComparer.OrdinalIgnoreCase).Take(12));
+    private static readonly HashSet<string> MutatingActions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "create", "add", "delete", "remove", "update", "edit", "fill", "write", "append", "execute", "run",
+        "send", "reply", "forward", "move", "rename", "dismiss", "cancel", "update_interval", "update_slide_text"
+    };
 
+    internal static bool HasNonReusableMutatingSteps(IReadOnlyList<CachedWorkflowStep> steps)
+    {
+        foreach (var step in steps)
+        {
+            if (step.Args.ValueKind != JsonValueKind.Object) continue;
+            if (step.Args.TryGetProperty("action", out var a) && a.ValueKind == JsonValueKind.String &&
+                MutatingActions.Contains(a.GetString() ?? ""))
+                return true;
+        }
+        return false;
+    }
+
+    private static string BuildSignature(string raw)
+        => string.Join(" ", Tokenize(raw).OrderBy(t => t, StringComparer.OrdinalIgnoreCase).Take(48));
+
+    private static bool IsCjk(char c)
+        => (c >= '\u3040' && c <= '\u30FF') || (c >= '\u3400' && c <= '\u4DBF') ||
+           (c >= '\u4E00' && c <= '\u9FFF') || (c >= '\uAC00' && c <= '\uD7AF') || (c >= '\uF900' && c <= '\uFAFF');
+
+    /// <summary>
+    /// Word tokens for Latin text, character bigrams for CJK runs. The old regex treated a whole Chinese
+    /// sentence as one token, so two differently-worded requests never overlapped (≈0% predictor hit rate).
+    /// </summary>
     private static HashSet<string> Tokenize(string raw)
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -262,8 +292,24 @@ public sealed class WorkflowCacheService
         foreach (Match m in Regex.Matches(raw.ToLowerInvariant(), @"[\p{L}\p{N}_]+"))
         {
             var tok = m.Value;
-            if (tok.Length >= 2)
-                set.Add(tok);
+            int i = 0;
+            while (i < tok.Length)
+            {
+                int j = i;
+                bool cjk = IsCjk(tok[i]);
+                while (j < tok.Length && IsCjk(tok[j]) == cjk) j++;
+                var run = tok[i..j];
+                if (cjk)
+                {
+                    if (run.Length == 1) set.Add(run);
+                    for (int k = 0; k + 1 < run.Length; k++) set.Add(run.Substring(k, 2));
+                }
+                else if (run.Length >= 2)
+                {
+                    set.Add(run);
+                }
+                i = j;
+            }
         }
         return set;
     }

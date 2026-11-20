@@ -58,7 +58,14 @@ public partial class MainWindow : Window
     private bool _suppressPinnedDuringAlertBubble;
     private bool _forceShowProcessingBubble;
     private Action? _cancelPendingPrompt;
+    private string? _pendingPromptKey;
     private bool HasPendingPrompt => _cancelPendingPrompt is not null;
+
+    private static string PromptKey(string title, string message) => title + "\n" + message;
+
+    private bool IsVisiblePromptStillPending()
+        => _pendingPromptKey is { } key
+           && _controller.GetPendingInteractions().Any(r => PromptKey(r.Title, r.Message) == key);
     private string _currentOutputMarkdown = "";
     private readonly List<string> _attachedFiles = new();
     private bool _isDraggingPet;
@@ -114,9 +121,13 @@ public partial class MainWindow : Window
         _controller.InteractionAdded += _req => Dispatcher.InvokeAsync(RefreshPinnedReminders);
         _controller.InteractionResolved += _id => Dispatcher.InvokeAsync(() =>
         {
-            if (_cancelPendingPrompt is { } cancel)
+            // Only dismiss the visible prompt if *its own* request was resolved elsewhere (API / ❓ pill).
+            // Previously any resolution dismissed whatever prompt was on screen, so a confirmation that popped up
+            // right after the user answered another one was immediately cancelled and treated as "deny".
+            if (_cancelPendingPrompt is { } cancel && !IsVisiblePromptStillPending())
             {
                 _cancelPendingPrompt = null;
+                _pendingPromptKey = null;
                 cancel();
                 OutputActionsPanel.Children.Clear();
                 OutputActionsPanel.Visibility = Visibility.Collapsed;
@@ -1156,9 +1167,11 @@ public partial class MainWindow : Window
     private void CloseBubbleBtn_Click(object sender, RoutedEventArgs e)
     {
         // If there is a pending permission request, keep it alive in the ❓ pill instead of forcing Deny when closing the bubble.
-        if (_controller.GetPendingInteractions().Count == 0 && _cancelPendingPrompt is { } cancel)
+        // Cancelling (not denying) keeps the request alive in the ❓ pill and lets the next queued prompt show.
+        if (_cancelPendingPrompt is { } cancel)
         {
             _cancelPendingPrompt = null;
+            _pendingPromptKey = null;
             cancel();
         }
 
@@ -1180,13 +1193,18 @@ public partial class MainWindow : Window
         if (_cancelPendingPrompt is { } prevCancel)
         {
             _cancelPendingPrompt = null;
+            _pendingPromptKey = null;
             prevCancel();
         }
 
-        _cancelPendingPrompt = () => tcs.TrySetResult(false);
+        // Dismissing/replacing this bubble without an explicit choice must NOT count as "deny";
+        // cancelling keeps the request pending in the ❓ pill so it can still be answered.
+        _pendingPromptKey = PromptKey(title, message);
+        _cancelPendingPrompt = () => tcs.TrySetCanceled();
         void Resolve(bool approved)
         {
             _cancelPendingPrompt = null;
+            _pendingPromptKey = null;
             tcs.TrySetResult(approved);
             _ = RefreshOutputAsync();
         }
@@ -1216,13 +1234,18 @@ public partial class MainWindow : Window
         if (_cancelPendingPrompt is { } prevCancel)
         {
             _cancelPendingPrompt = null;
+            _pendingPromptKey = null;
             prevCancel();
         }
 
-        _cancelPendingPrompt = () => tcs.TrySetResult(CommandApprovalDecision.Deny);
+        // Dismissing/replacing this bubble without an explicit choice must NOT count as "deny";
+        // cancelling keeps the request pending in the ❓ pill so it can still be answered.
+        _pendingPromptKey = PromptKey(title, message);
+        _cancelPendingPrompt = () => tcs.TrySetCanceled();
         void Resolve(CommandApprovalDecision decision)
         {
             _cancelPendingPrompt = null;
+            _pendingPromptKey = null;
             tcs.TrySetResult(decision);
             _ = RefreshOutputAsync();
         }
@@ -1253,13 +1276,18 @@ public partial class MainWindow : Window
         if (_cancelPendingPrompt is { } prevCancel)
         {
             _cancelPendingPrompt = null;
+            _pendingPromptKey = null;
             prevCancel();
         }
 
-        _cancelPendingPrompt = () => tcs.TrySetResult(PathPermissionDecision.Deny);
+        // Dismissing/replacing this bubble without an explicit choice must NOT count as "deny";
+        // cancelling keeps the request pending in the ❓ pill so it can still be answered.
+        _pendingPromptKey = PromptKey(title, message);
+        _cancelPendingPrompt = () => tcs.TrySetCanceled();
         void Resolve(PathPermissionDecision decision)
         {
             _cancelPendingPrompt = null;
+            _pendingPromptKey = null;
             tcs.TrySetResult(decision);
             _ = RefreshOutputAsync();
         }

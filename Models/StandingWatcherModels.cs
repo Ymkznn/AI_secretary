@@ -36,7 +36,9 @@ public sealed record BrowserFormContext(
 
 public sealed record BrowserFillAction(
     string FieldId,
-    string Value);
+    string Value,
+    string? Label = null,
+    string? Name = null);
 
 public sealed record CachedWorkflowStep(
     string Skill,

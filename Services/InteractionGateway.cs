@@ -22,6 +22,7 @@ public sealed class InteractionGateway
     private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _confirmWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<PathPermissionDecision>> _pathWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<CommandApprovalDecision>> _commandWaiters = new();
+    private readonly SemaphoreSlim _uiPromptGate = new(1, 1);
 
     public Func<string, string, Task<bool>>? UiConfirmHandler { get; set; }
     public Func<string, string, string, Task<PathPermissionDecision>>? UiPathPermissionHandler { get; set; }
@@ -115,15 +116,46 @@ public sealed class InteractionGateway
         using var reg = ct.Register(() => ResolveInteraction(id, waiters, cancelFallback));
 
         if (uiCall is not null)
-        {
-            _ = uiCall().ContinueWith(t =>
-            {
-                var result = t.IsCompletedSuccessfully ? t.Result : cancelFallback;
-                ResolveInteraction(id, waiters, result);
-            }, TaskScheduler.Default);
-        }
+            _ = RunUiPromptSerializedAsync(id, waiters, uiCall);
 
         return await tcs.Task;
+    }
+
+    /// <summary>
+    /// Shows UI bubble prompts one at a time. When several tasks request confirmation at the same moment,
+    /// the second prompt used to replace the first one; the replaced prompt was then auto-resolved as
+    /// "deny" even though the user had just clicked a choice. Prompts are now queued, and a prompt that is
+    /// dismissed/replaced without an explicit user choice stays pending (❓ pill / API) instead of denying.
+    /// </summary>
+    private async Task RunUiPromptSerializedAsync<TResult>(
+        string id,
+        ConcurrentDictionary<string, TaskCompletionSource<TResult>> waiters,
+        Func<Task<TResult>> uiCall)
+    {
+        await _uiPromptGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            // Already resolved elsewhere (API / pending pill / cancellation) while waiting in the queue.
+            if (!waiters.ContainsKey(id))
+                return;
+
+            Task<TResult> uiTask;
+            try
+            {
+                uiTask = uiCall();
+                var result = await uiTask.ConfigureAwait(false);
+                ResolveInteraction(id, waiters, result);
+            }
+            catch
+            {
+                // Prompt was dismissed/replaced without an explicit choice: keep the request pending so the
+                // user can still answer it from the pending list instead of silently treating it as "deny".
+            }
+        }
+        finally
+        {
+            _uiPromptGate.Release();
+        }
     }
 
     private bool ResolveInteraction<TResult>(

@@ -84,7 +84,7 @@ public sealed class MainAgent
         var mainSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Main", ct: ct);
 
         var recent = await _store.GetChatMessagesAsync(conversationId, 80, ct);
-        var historyMessages = BuildHistoryModelMessages(recent, userPrompt, maxMessages: 50, perMessageMaxChars: 12000, totalMaxChars: 80000);
+        var historyMessages = BuildHistoryModelMessages(recent, userPrompt, maxMessages: 16, perMessageMaxChars: 3000, totalMaxChars: 20000);
 
         var recalledFacts = await _store.RecallRelevantFactsAsync(conversationId, userPrompt, 5, ct);
         var factsContext = MainAgentPrompts.FormatFactsContext(recalledFacts);
@@ -428,18 +428,26 @@ public sealed class MainAgent
         return missingTags.Count == 0 ? head : $"{head}\n{string.Join(" ", missingTags)}";
     }
 
-    /// <summary>將近期對話紀錄轉換為受字數與訊息數限制的結構化模型訊息序列（供快取與上下文重用）。</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> s_historyAnchors = new();
+
+    /// <summary>
+    /// 將近期對話紀錄轉換為受字數與訊息數限制的結構化模型訊息序列（供快取與上下文重用）。
+    /// - 歷史訊息中的 [Attachment: ...] 一律換成 [History attachment: 檔名]，避免每輪、每次 LLM 呼叫重新展開整份文件/圖片。
+    ///   （僅保留最近失敗輪次的附件，讓使用者重試時仍可讀取。）
+    /// - 視窗起點採「黏性錨點」：只要仍在訊息數/字數上限內就沿用同一個起點，讓 history 前綴每輪完全相同，
+    ///   provider 的 prompt cache 才能命中；超出上限時才一次性往後跳到約 60% 預算處，而不是每輪滑動一格（滑動會讓快取全失效）。
+    /// </summary>
     internal static List<ModelMessage> BuildHistoryModelMessages(
         IReadOnlyList<ChatMessageRecord> recent,
         string? excludeTrailingUserPrompt = null,
-        int maxMessages = 50,
-        int perMessageMaxChars = 12000,
-        int totalMaxChars = 80000)
+        int maxMessages = 16,
+        int perMessageMaxChars = 3000,
+        int totalMaxChars = 20000)
     {
         var eligible = recent
             .Where(m => m.Role is "user" or "assistant" or "notification")
             .Where(m => !m.IsStreaming && !string.IsNullOrWhiteSpace(m.Content))
-            .TakeLast(maxMessages)
+            .TakeLast(Math.Max(maxMessages * 3, 30))
             .ToList();
 
         if (!string.IsNullOrWhiteSpace(excludeTrailingUserPrompt) && eligible.Count > 0)
@@ -456,35 +464,67 @@ public sealed class MainAgent
             }
         }
 
-        var selected = new List<(string Role, string Content)>(eligible.Count);
-        int totalChars = 0;
-        for (int i = eligible.Count - 1; i >= 0; i--)
+        if (eligible.Count == 0)
+            return new List<ModelMessage>();
+
+        var contents = new List<(string Role, string Content)>(eligible.Count);
+        for (int i = 0; i < eligible.Count; i++)
         {
             var m = eligible[i];
             var role = m.Role == "user" ? "user" : "assistant";
             var rawContent = m.Role == "notification"
                 ? $"[System Notification] {m.Content}"
                 : m.Content;
+            var keepAttachments = m.Role == "user" && i >= eligible.Count - 6 && IsFollowedByError(eligible, i);
             var content = AttachmentExtractor.AttachmentPattern.Replace(
                 rawContent,
                 match =>
                 {
                     var name = Path.GetFileName(match.Groups[1].Value.Trim());
-                    return name.StartsWith("screen_", StringComparison.OrdinalIgnoreCase)
-                        ? $"[History screenshot: {name}]"
-                        : match.Value;
+                    if (name.StartsWith("screen_", StringComparison.OrdinalIgnoreCase))
+                        return $"[History screenshot: {name}]";
+                    return keepAttachments ? match.Value : $"[History attachment: {name}]";
                 });
-            content = TruncatePreservingAttachments(content, perMessageMaxChars);
-            if (selected.Count > 0 && totalChars + content.Length > totalMaxChars)
-                break;
-            selected.Add((role, content));
-            totalChars += content.Length;
+            contents.Add((role, TruncatePreservingAttachments(content, perMessageMaxChars)));
         }
-        selected.Reverse();
 
-        var normalized = new List<ModelMessage>(selected.Count);
-        foreach (var (role, content) in selected)
+        int SumFrom(int start)
         {
+            int sum = 0;
+            for (int i = start; i < contents.Count; i++) sum += contents[i].Content.Length;
+            return sum;
+        }
+
+        var anchorKey = $"{eligible[0].ConversationId}|{maxMessages}|{totalMaxChars}";
+        int startIdx = -1;
+        if (s_historyAnchors.TryGetValue(anchorKey, out var anchorId))
+        {
+            var idx = eligible.FindIndex(m => m.Id == anchorId);
+            if (idx >= 0 && eligible.Count - idx <= maxMessages && SumFrom(idx) <= totalMaxChars)
+                startIdx = idx;
+        }
+
+        if (startIdx < 0)
+        {
+            // Re-anchor with headroom (~60% of both budgets) so the same prefix can be reused for several turns.
+            var targetMessages = Math.Max(1, (int)Math.Ceiling(maxMessages * 0.6));
+            var targetChars = (int)(totalMaxChars * 0.6);
+            startIdx = eligible.Count - 1;
+            int sum = contents[startIdx].Content.Length;
+            while (startIdx > 0
+                   && eligible.Count - (startIdx - 1) <= targetMessages
+                   && sum + contents[startIdx - 1].Content.Length <= targetChars)
+            {
+                startIdx--;
+                sum += contents[startIdx].Content.Length;
+            }
+            s_historyAnchors[anchorKey] = eligible[startIdx].Id;
+        }
+
+        var normalized = new List<ModelMessage>(contents.Count - startIdx);
+        for (int i = startIdx; i < contents.Count; i++)
+        {
+            var (role, content) = contents[i];
             if (normalized.Count == 0 && role == "assistant")
                 continue;
             if (normalized.Count > 0 && normalized[^1].Role == role)

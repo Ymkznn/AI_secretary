@@ -70,9 +70,9 @@ applyBtn.addEventListener('click', async () => {
     const frameResults = await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       args: [lastFills],
-      func: (fillsList) => window.__aiSecretaryHelper ? window.__aiSecretaryHelper.applyFills(fillsList) : 0
+      func: (fillsList) => window.__aiSecretaryHelper ? window.__aiSecretaryHelper.applyFills(fillsList) : { appliedCount: 0 }
     });
-    const applied = (frameResults || []).reduce((acc, r) => acc + (r?.result || 0), 0);
+    const applied = (frameResults || []).reduce((acc, r) => acc + (r?.result?.appliedCount || 0), 0);
     statusEl.textContent = `已安全預填 ${applied} 個欄位（未自動送出，請手動確認後提交）。`;
   } catch (err) {
     statusEl.textContent = `套用失敗：${err.message}`;

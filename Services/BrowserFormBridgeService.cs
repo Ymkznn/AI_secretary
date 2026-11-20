@@ -22,6 +22,21 @@ public sealed record BrowserTabTitleResult(
     string? Title = null,
     bool Incognito = false);
 
+public sealed record BrowserFormFillItemResult(
+    string FieldId,
+    bool Applied,
+    string? Label = null,
+    string? ReadBackValue = null,
+    string? Error = null);
+
+/// <summary>Result reported back by the extension after applying prefill values in every frame.</summary>
+public sealed record BrowserFormFillResult(
+    int AppliedCount,
+    IReadOnlyList<BrowserFormFillItemResult> Items,
+    string? Url = null,
+    string? Title = null,
+    string? Error = null);
+
 /// <summary>
 /// Bridges on-demand form read/fill, full DOM read, and OTP DOM fill commands between C# Agent skills and the Chrome/Edge MV3 Extension over SSE + HTTP,
 /// so the user never has to manually click the browser extension icon.
@@ -32,10 +47,12 @@ public sealed class BrowserFormBridgeService
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserDomSnapshot?>> _domWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserOtpFillResult?>> _otpWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserTabTitleResult?>> _titleWaiters = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserFormFillResult?>> _fillWaiters = new();
 
     public event Action<string>? ExtractRequested;
     public event Action<string, string?, int>? DomRequested;
-    public event Action<IReadOnlyList<BrowserFillAction>>? ApplyFillsRequested;
+    /// <summary>(requestId, fills). The extension must POST the outcome to /api/browser/fill-result/{requestId}.</summary>
+    public event Action<string, IReadOnlyList<BrowserFillAction>>? ApplyFillsRequested;
     public event Action<string, string>? FillOtpRequested;
     public event Action<string>? TitleRequested;
 
@@ -113,6 +130,23 @@ public sealed class BrowserFormBridgeService
         return true;
     }
 
+    /// <summary>
+    /// Applies prefill values and waits for the extension to report which fields were actually found/filled,
+    /// so the agent no longer claims success for a blind fire-and-forget dispatch.
+    /// Returns null when the extension did not answer within the timeout.
+    /// </summary>
+    public Task<BrowserFormFillResult?> RequestApplyFillsAsync(IReadOnlyList<BrowserFillAction> fills, TimeSpan timeout, CancellationToken ct = default)
+        => WaitWithTimeoutAsync(_fillWaiters, id => ApplyFillsRequested?.Invoke(id, fills), timeout, ct);
+
+    public bool CompleteApplyFills(string requestId, BrowserFormFillResult result)
+    {
+        if (!_fillWaiters.TryRemove(requestId, out var tcs))
+            return false;
+        tcs.TrySetResult(result);
+        return true;
+    }
+
+    /// <summary>Legacy fire-and-forget dispatch (no result tracking).</summary>
     public void DispatchApplyFills(IReadOnlyList<BrowserFillAction> fills)
-        => ApplyFillsRequested?.Invoke(fills);
+        => ApplyFillsRequested?.Invoke(Guid.NewGuid().ToString("N"), fills);
 }

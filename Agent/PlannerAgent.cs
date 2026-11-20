@@ -97,7 +97,7 @@ public sealed class PlannerAgent
         var customSkillsPrompt = PlannerPrompts.FormatCustomSkillsPrompt(customList);
 
         var recent = await _store.GetChatMessagesAsync(conversationId, 80, ct);
-        var historyMessages = MainAgent.BuildHistoryModelMessages(recent, userPrompt, maxMessages: 50, perMessageMaxChars: 12000, totalMaxChars: 80000);
+        var historyMessages = MainAgent.BuildHistoryModelMessages(recent, userPrompt, maxMessages: 10, perMessageMaxChars: 2500, totalMaxChars: 12000);
 
         var recalledFacts = await _store.RecallRelevantFactsAsync(conversationId, userPrompt, 5, ct);
         var factsContext = MainAgentPrompts.FormatFactsContext(recalledFacts);
