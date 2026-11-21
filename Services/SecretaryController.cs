@@ -28,6 +28,7 @@ public sealed class SecretaryController : IDisposable
     private readonly AppSettingsService _settings;
     private readonly InteractionGateway _interaction;
     private readonly ActivityMonitorService _activity;
+    private readonly UserPresenceService _presence;
     private readonly StateMachineAgent _stateMachine;
     private readonly BrowserHostService _browserHost;
     private readonly BrowserFormBridgeService _browserBridge;
@@ -46,6 +47,8 @@ public sealed class SecretaryController : IDisposable
     private readonly ConcurrentDictionary<string, ActiveAgentRun> _agentRuns = new();
     private readonly List<PinnedReminderItem> _pinnedReminders = new();
     private readonly ConcurrentDictionary<string, DateTimeOffset> _pinnedNextRemindAt = new();
+    private readonly List<string> _awayHighlights = new();
+    private readonly object _awayLock = new();
     private readonly object _pinnedLock = new();
     private readonly object _choicesLock = new();
     // Lock hierarchy (STRICT): _userTurnGate -> _presentGate (never reverse!).
@@ -172,6 +175,7 @@ public sealed class SecretaryController : IDisposable
         AppSettingsService settings,
         InteractionGateway interaction,
         ActivityMonitorService activity,
+        UserPresenceService presence,
         StateMachineAgent stateMachine,
         BrowserHostService browserHost,
         BrowserFormBridgeService browserBridge,
@@ -203,6 +207,7 @@ public sealed class SecretaryController : IDisposable
         _settings = settings;
         _interaction = interaction;
         _activity = activity;
+        _presence = presence;
         _stateMachine = stateMachine;
         _browserHost = browserHost;
         _browserBridge = browserBridge;
@@ -384,6 +389,15 @@ public sealed class SecretaryController : IDisposable
             _otpDetector.OnPageSignal(sig.Url, sig.Title, sig.Headings, sig.OtpFieldPresent, sig.OtpFieldFocused, sig.CapturedAt);
         };
         _otpDetector.SituationDetected += OnOtpSituationDetected;
+        _presence.PresenceChanged += _ => AgentsChanged?.Invoke();
+        _presence.ReturnedFromSilence += () =>
+        {
+            // Reset proactive idle timer on return so random check-in never fires 1 second after touching the mouse.
+            _lastUserActivityUtc = DateTimeOffset.UtcNow;
+            RollNextProactiveMinutes();
+        };
+        _presence.WelcomeBackDetected += OnWelcomeBackDetected;
+        _presence.Start();
         _activity.Start();
 
         _ = Task.Run(() => RunSchedulerLoopAsync(_appCts.Token));
@@ -1907,6 +1921,28 @@ public sealed class SecretaryController : IDisposable
 
     private void RaiseProactiveAlert(string title, string content)
     {
+        if (_presence.IsSilentForTokens)
+        {
+            var snippet = content.ReplaceLineEndings(" ").Trim();
+            if (snippet.Length > 90) snippet = snippet[..90] + "…";
+            var item = string.IsNullOrWhiteSpace(title) ? snippet : $"{title}：{snippet}";
+            if (!string.IsNullOrWhiteSpace(item))
+            {
+                lock (_awayLock)
+                {
+                    if (_awayHighlights.Count >= 6) _awayHighlights.RemoveAt(0);
+                    _awayHighlights.Add(item);
+                }
+            }
+        }
+
+        // Never speak confidential notifications out loud to an empty office desk while screen is locked.
+        if (_presence.IsSessionLocked)
+        {
+            ProactiveAlert?.Invoke(title, content);
+            return;
+        }
+
         _tts.EnqueueSummarySpeech(title, content, () => ProactiveAlert?.Invoke(title, content));
     }
 
@@ -2097,7 +2133,7 @@ public sealed class SecretaryController : IDisposable
 
     private async Task WakeDuePinnedReRemindersAsync(CancellationToken ct)
     {
-        if (IsDndActive()) return;
+        if (IsDndActive() || _presence.IsSilentForTokens) return;
         var now = DateTimeOffset.UtcNow;
         List<PinnedReminderItem> snapshot;
         lock (_pinnedLock)
@@ -2164,10 +2200,110 @@ public sealed class SecretaryController : IDisposable
         RollNextProactiveMinutes();
     }
 
+    public (bool AfkSilenceEnabled, int AfkSilenceMinutes, bool AfkWelcomeBackEnabled, int AfkWelcomeBackMinMinutes, int AfkAudioWelcomeBackMinutes) GetAfkPresenceSettings()
+    {
+        var sched = _settings.Current.Scheduler;
+        return (
+            sched.AfkSilenceEnabled,
+            Math.Clamp(sched.AfkSilenceMinutes, 2, 180),
+            sched.AfkWelcomeBackEnabled,
+            Math.Clamp(sched.AfkWelcomeBackMinMinutes, 5, 240),
+            Math.Clamp(sched.AfkAudioWelcomeBackMinutes, 15, 360));
+    }
+
+    public async Task SaveAfkPresenceSettingsAsync(
+        bool silenceEnabled,
+        int silenceMinutes,
+        bool welcomeBackEnabled,
+        int welcomeBackMinMinutes,
+        int audioWelcomeBackMinutes)
+    {
+        int sMin = Math.Clamp(silenceMinutes, 2, 180);
+        int wMin = Math.Clamp(welcomeBackMinMinutes, 5, 240);
+        int aMin = Math.Clamp(audioWelcomeBackMinutes, Math.Max(15, wMin), 360);
+        await _settings.SaveOverridesAsync(s =>
+        {
+            s.Scheduler.AfkSilenceEnabled = silenceEnabled;
+            s.Scheduler.AfkSilenceMinutes = sMin;
+            s.Scheduler.AfkWelcomeBackEnabled = welcomeBackEnabled;
+            s.Scheduler.AfkWelcomeBackMinMinutes = wMin;
+            s.Scheduler.AfkAudioWelcomeBackMinutes = aMin;
+        });
+        AgentsChanged?.Invoke();
+    }
+
+    public string GetPresenceStatusLabel() => _presence.FormatStatusLabel();
+    public void NotifyDisplayPowerState(bool isOn) => _presence.NotifyDisplayPowerState(isOn);
+
+    private void OnWelcomeBackDetected(WelcomeBackEvent ev)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var ct = _appCts.Token;
+                var sched = _settings.Current.Scheduler;
+                if (IsDndActive() || HasRunningTasks || !sched.ProactiveEnabledWithStyle || !sched.AfkWelcomeBackEnabled)
+                    return;
+
+                // Small 1.5s settle delay after unlock/mouse-move so window focus stabilizes.
+                await Task.Delay(1500, ct);
+                if (IsDndActive() || HasRunningTasks || _presence.IsSilentForTokens)
+                    return;
+
+                List<string> pinnedTitles;
+                lock (_pinnedLock)
+                    pinnedTitles = _pinnedReminders.Select(p => p.Title).ToList();
+
+                List<string> awayUpdates;
+                lock (_awayLock)
+                {
+                    awayUpdates = _awayHighlights.ToList();
+                    _awayHighlights.Clear();
+                }
+
+                var activeWindow = await BuildProactiveWindowLabelAsync(ct);
+                var (reply, ttsText) = await _mainAgent.GenerateWelcomeBackLineAsync(
+                    ConversationId, ev, pinnedTitles, awayUpdates, ct, activeWindow);
+                if (string.IsNullOrWhiteSpace(reply) || HasRunningTasks || IsDndActive() || _presence.IsSilentForTokens)
+                    return;
+
+                _lastProactiveChatUtc = DateTimeOffset.UtcNow;
+                _lastUserActivityUtc = DateTimeOffset.UtcNow;
+                RollNextProactiveMinutes();
+
+                var nowUtc = DateTimeOffset.UtcNow;
+                var msg = new ChatMessageRecord
+                {
+                    ConversationId = ConversationId,
+                    Role = "assistant",
+                    Content = reply,
+                    CreatedAt = nowUtc,
+                    RevealedAt = nowUtc
+                };
+                await _store.UpsertChatMessageAsync(msg, ct);
+                var alertTitle = _localizer.TextCached("AlertTitleDefault", "AI Secretary");
+                void RevealWelcome()
+                {
+                    StateChanged?.Invoke();
+                    ProactiveAlert?.Invoke(alertTitle, reply);
+                }
+                if (!string.IsNullOrWhiteSpace(ttsText))
+                    _tts.EnqueueJapaneseSpeech(ttsText, RevealWelcome);
+                else
+                    _tts.EnqueueSummarySpeech(alertTitle, reply, RevealWelcome);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "OnWelcomeBackDetected error");
+            }
+        });
+    }
+
     private async Task TryProactiveStyleChatAsync(CancellationToken ct)
     {
         var sched = _settings.Current.Scheduler;
-        if (IsDndActive() || HasRunningTasks || !sched.ProactiveEnabledWithStyle)
+        if (IsDndActive() || HasRunningTasks || !sched.ProactiveEnabledWithStyle || _presence.IsSilentForTokens)
             return;
 
         if (_nextProactiveIdleMinutes <= 0)
@@ -2842,6 +2978,7 @@ public sealed class SecretaryController : IDisposable
     public void Dispose()
     {
         _appCts.Cancel();
+        _presence.Dispose();
         _activity.Dispose();
         _browserHost.Dispose();
     }

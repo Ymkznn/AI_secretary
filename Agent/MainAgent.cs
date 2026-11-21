@@ -1004,6 +1004,70 @@ public sealed class MainAgent
         }
     }
 
+    /// <summary>
+    /// 偵測到使用者長時間中離後回到電腦前時，產生一句自然的自主關心與離開期間重點彙報。
+    /// </summary>
+    public async Task<(string? Reply, string? TtsText)> GenerateWelcomeBackLineAsync(
+        string conversationId,
+        WelcomeBackEvent ev,
+        IReadOnlyList<string> pinnedTitles,
+        IReadOnlyList<string> awayUpdates,
+        CancellationToken ct = default,
+        string? activeWindow = null)
+    {
+        var activeStylePrompt = _tts.GetActiveStylePrompt() ?? _styles.GetActiveStylePrompt();
+        if (string.IsNullOrWhiteSpace(activeStylePrompt))
+            return (null, null);
+
+        var recent = await _store.GetChatMessagesAsync(conversationId, 20, ct);
+        var history = BuildRecentHistory(recent, maxMessages: 10, perMessageMaxChars: 350, totalMaxChars: 3500);
+        var pinnedText = pinnedTitles.Count == 0 ? "(None)" : string.Join(", ", pinnedTitles);
+        var updatesText = awayUpdates.Count == 0 ? "(None)" : string.Join("; ", awayUpdates);
+        var awayMins = Math.Max(1, (int)Math.Round(ev.AwayDuration.TotalMinutes));
+        var awayLabel = awayMins >= 60 ? $"{awayMins / 60} 小時 {awayMins % 60} 分鐘" : $"{awayMins} 分鐘";
+
+        var ttsEnabled = _tts.IsEnabled && _tts.ChatMode != "notify_only";
+        var sys = MainAgentPrompts.BuildWelcomeBackSystemPrompt(
+            activeStylePrompt,
+            _tts.ChatMode == "full",
+            ev.AudioWasPlaying,
+            _tts.TargetLang,
+            GetReplyLanguage(),
+            ttsEnabled);
+        var user = MainAgentPrompts.BuildWelcomeBackUserPrompt(
+            DateTimeOffset.Now,
+            awayLabel,
+            ev.Reason.ToString(),
+            updatesText,
+            pinnedText,
+            string.IsNullOrWhiteSpace(history) ? "(None)" : history,
+            activeWindow);
+
+        try
+        {
+            var resp = await _model.CompleteAsync(new[]
+            {
+                new ModelMessage("system", sys),
+                new ModelMessage("user", user)
+            }, new LlmCallOptions("MainAgent.WelcomeBack", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), ct);
+
+            var s = resp.Content.Trim();
+            var first = s.IndexOf('{');
+            var last = s.LastIndexOf('}');
+            if (first >= 0 && last > first) s = s[first..(last + 1)];
+
+            using var doc = JsonDocument.Parse(s);
+            var reply = doc.RootElement.TryGetProperty("reply", out var r) ? r.GetString()?.Trim() : null;
+            var ttsText = doc.RootElement.TryGetProperty("tts_text", out var tt) ? tt.GetString()?.Trim() : null;
+            return (string.IsNullOrWhiteSpace(reply) ? null : reply, string.IsNullOrWhiteSpace(ttsText) ? null : ttsText);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Welcome-back line generation skipped");
+            return (null, null);
+        }
+    }
+
     /// <summary>依語音模式播報派發確認語（直接播報指定語系台詞或摘要播報）。</summary>
     private void SpeakDispatchAck(string ackText, string? ttsText)
     {

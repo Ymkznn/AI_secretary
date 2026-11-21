@@ -195,7 +195,11 @@ public partial class MainWindow : Window
 
         InitializeTrayIcon();
 
-        SourceInitialized += (_, _) => Win11BackdropHelper.HideFromAltTab(this);
+        SourceInitialized += (_, _) =>
+        {
+            Win11BackdropHelper.HideFromAltTab(this);
+            RegisterDisplayPowerHook();
+        };
 
         Loaded += async (_, _) =>
         {
@@ -217,6 +221,7 @@ public partial class MainWindow : Window
 
         Closed += (_, _) =>
         {
+            UnregisterDisplayPowerHook();
             _blinkTimer.Stop();
             _fadeTimer.Stop();
             _pinnedCollapseTimer.Stop();
@@ -2438,4 +2443,71 @@ public partial class MainWindow : Window
 
         return System.Drawing.Icon.FromHandle(bmp.GetHicon());
     }
+
+    private IntPtr _displayPowerNotifyHandle;
+    private System.Windows.Interop.HwndSource? _powerHwndSource;
+    private static readonly Guid GuidConsoleDisplayState = new("6FE69556-704A-47A0-8F24-C28D936FDA47");
+    private const int WmPowerBroadcast = 0x0218;
+    private const int PbtPowerSettingChange = 0x8013;
+
+    private void RegisterDisplayPowerHook()
+    {
+        try
+        {
+            var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            if (hwnd == IntPtr.Zero) return;
+            _powerHwndSource = System.Windows.Interop.HwndSource.FromHwnd(hwnd);
+            _powerHwndSource?.AddHook(PowerWndProc);
+            var guid = GuidConsoleDisplayState;
+            _displayPowerNotifyHandle = RegisterPowerSettingNotification(hwnd, ref guid, 0 /* DEVICE_NOTIFY_WINDOW_HANDLE */);
+        }
+        catch { }
+    }
+
+    private void UnregisterDisplayPowerHook()
+    {
+        try
+        {
+            if (_powerHwndSource is not null)
+            {
+                _powerHwndSource.RemoveHook(PowerWndProc);
+                _powerHwndSource = null;
+            }
+            if (_displayPowerNotifyHandle != IntPtr.Zero)
+            {
+                UnregisterPowerSettingNotification(_displayPowerNotifyHandle);
+                _displayPowerNotifyHandle = IntPtr.Zero;
+            }
+        }
+        catch { }
+    }
+
+    private IntPtr PowerWndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg == WmPowerBroadcast && wParam.ToInt32() == PbtPowerSettingChange && lParam != IntPtr.Zero)
+        {
+            try
+            {
+                var settingGuid = System.Runtime.InteropServices.Marshal.PtrToStructure<Guid>(lParam);
+                if (settingGuid == GuidConsoleDisplayState)
+                {
+                    var dataLen = System.Runtime.InteropServices.Marshal.ReadInt32(lParam, 16);
+                    if (dataLen >= 1)
+                    {
+                        var state = System.Runtime.InteropServices.Marshal.ReadByte(lParam, 20);
+                        // 0 = Display Off, 1 = Display On, 2 = Dimmed
+                        _controller.NotifyDisplayPowerState(state != 0);
+                    }
+                }
+            }
+            catch { }
+        }
+        return IntPtr.Zero;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr RegisterPowerSettingNotification(IntPtr hRecipient, ref Guid powerSettingGuid, uint flags);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnregisterPowerSettingNotification(IntPtr handle);
 }

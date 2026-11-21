@@ -34,6 +34,11 @@ public sealed class SchedulerSettings
     public int ProactiveIdleMinMinutes { get; set; } = 12;
     public int ProactiveIdleMaxMinutes { get; set; } = 30;
     public bool ProactiveEnabledWithStyle { get; set; } = true;
+    public bool AfkSilenceEnabled { get; set; } = true;
+    public int AfkSilenceMinutes { get; set; } = 15;
+    public bool AfkWelcomeBackEnabled { get; set; } = true;
+    public int AfkWelcomeBackMinMinutes { get; set; } = 25;
+    public int AfkAudioWelcomeBackMinutes { get; set; } = 60;
 }
 
 public sealed class TtsSettings

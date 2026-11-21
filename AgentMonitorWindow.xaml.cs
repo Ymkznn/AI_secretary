@@ -63,6 +63,7 @@ public partial class AgentMonitorWindow : Wpf.Ui.Controls.FluentWindow
         var autonomyPolicies = await _controller.GetAutonomyPoliciesAsync();
         var learningEvents = await _controller.GetRecentLearningEventsAsync(15);
 
+        HeaderText.Text = $"運作總覽與背景排程（狀態：{_controller.GetPresenceStatusLabel()}）";
         StopAllBtn.IsEnabled = _controller.HasRunningTasks;
 
         var runningRuns = runs.Where(IsRunActive).ToList();

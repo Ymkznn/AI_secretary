@@ -94,6 +94,7 @@ public partial class App : System.Windows.Application
         sc.AddSingleton<AppLauncherService>();
         sc.AddSingleton<ScreenCaptureService>();
         sc.AddSingleton<ActivityMonitorService>();
+        sc.AddSingleton<UserPresenceService>();
         sc.AddSingleton<StateMachineAgent>();
         sc.AddSingleton<BrowserHostService>();
         sc.AddSingleton<BrowserFormBridgeService>();

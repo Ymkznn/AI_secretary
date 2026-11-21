@@ -226,4 +226,56 @@ public static class MainAgentPrompts
             recent_history:
             {history}
             """;
+
+    public static string BuildWelcomeBackSystemPrompt(
+        string activeStylePrompt,
+        bool isFullTtsMode,
+        bool audioWasPlaying,
+        string ttsLang = "zh",
+        string replyLang = "繁體中文",
+        bool ttsEnabled = true)
+    {
+        var jaTtsExtra = ttsLang == "ja"
+            ? " Convert ALL English words to katakana (dataset->データセット, Colab->コラボ, Gmail->ジーメール, AI->エーアイ) and write names in hiragana."
+            : "";
+        var ttsRule = !ttsEnabled
+            ? "null (TTS is disabled)"
+            : (isFullTtsMode
+                ? $"natural spoken text in language '{ttsLang}' matching the full reply (plain spoken text only; no Markdown, URLs, or symbols).{jaTtsExtra}"
+                : $"one short natural spoken sentence (under 20 words / 35 chars) in language '{ttsLang}' (plain spoken text only; no Markdown, URLs, or symbols).{jaTtsExtra}");
+
+        var contextTone = audioWasPlaying
+            ? "The user had video/audio playing with no keyboard/mouse input for a long stretch — they might have been watching a long stream/video OR stepped away leaving it playing. Keep your check-in light and natural for EITHER case (never assume they definitely left the room)."
+            : "The user just returned to the PC after stepping away for a while. Greet them warmly in 1-2 natural sentences (like welcoming them back), and if `away_updates` lists anything that happened while they were away, briefly mention the key highlight(s) in the same message.";
+
+        return $$"""
+            Roleplay the following persona for a brief, natural return check-in (1-2 sentences).
+            - {{contextTone}}
+            - Do NOT overuse the user's name if recent messages already used it; avoid stiff customer-service phrasing.
+            - On-screen `reply` MUST be written strictly in '{{replyLang}}' (NEVER output English prose unless `replyLang` is English).
+            - `tts_text` must be {{ttsRule}}.
+            - Output pure JSON only: {"reply": "...", "tts_text": "..."}
+
+            {{activeStylePrompt}}
+            """;
+    }
+
+    public static string BuildWelcomeBackUserPrompt(
+        DateTimeOffset now,
+        string awayDurationText,
+        string triggerReason,
+        string awayUpdates,
+        string pinnedText,
+        string history,
+        string? activeWindow = null)
+        => $"""
+            now: {now:yyyy-MM-dd HH:mm (dddd)}
+            away_duration: {awayDurationText}
+            return_signal: {triggerReason}
+            active_window: {(string.IsNullOrWhiteSpace(activeWindow) ? "(None)" : activeWindow)}
+            away_updates: {awayUpdates}
+            pinned_items: {pinnedText}
+            recent_history:
+            {history}
+            """;
 }

@@ -44,6 +44,9 @@ public partial class SettingsWindow : Wpf.Ui.Controls.FluentWindow
         FadeSecondsBox.ValueChanged += async (_, _) => await SaveFadeSecondsAsync();
         ProactiveMinBox.ValueChanged += async (_, _) => await SaveProactiveChatAsync();
         ProactiveMaxBox.ValueChanged += async (_, _) => await SaveProactiveChatAsync();
+        AfkSilenceMinBox.ValueChanged += async (_, _) => await SaveAfkSettingsAsync();
+        AfkWelcomeMinBox.ValueChanged += async (_, _) => await SaveAfkSettingsAsync();
+        AfkAudioWelcomeBox.ValueChanged += async (_, _) => await SaveAfkSettingsAsync();
 
         Loaded += async (_, _) =>
         {
@@ -81,6 +84,12 @@ public partial class SettingsWindow : Wpf.Ui.Controls.FluentWindow
             ProactiveChatCheck.IsChecked = proEnabled;
             ProactiveMinBox.Value = proMin;
             ProactiveMaxBox.Value = proMax;
+            var (afkSilence, afkMin, afkWelcome, afkWelcomeMin, afkAudioMin) = _controller.GetAfkPresenceSettings();
+            AfkSilenceCheck.IsChecked = afkSilence;
+            AfkSilenceMinBox.Value = afkMin;
+            AfkWelcomeBackCheck.IsChecked = afkWelcome;
+            AfkWelcomeMinBox.Value = afkWelcomeMin;
+            AfkAudioWelcomeBox.Value = afkAudioMin;
 
             ApplyTheme(mode);
             RefreshTrustedPathsList();
@@ -274,6 +283,25 @@ public partial class SettingsWindow : Wpf.Ui.Controls.FluentWindow
         if (ProactiveMinBox.Value is double min && ProactiveMaxBox.Value is double max)
         {
             await _controller.SaveProactiveChatSettingsAsync(ProactiveChatCheck.IsChecked == true, (int)min, (int)max);
+        }
+    }
+
+    private async void AfkSetting_Changed(object sender, RoutedEventArgs e)
+        => await SaveAfkSettingsAsync();
+
+    private async Task SaveAfkSettingsAsync()
+    {
+        if (_initializing) return;
+        if (AfkSilenceMinBox.Value is double silenceMin &&
+            AfkWelcomeMinBox.Value is double welcomeMin &&
+            AfkAudioWelcomeBox.Value is double audioMin)
+        {
+            await _controller.SaveAfkPresenceSettingsAsync(
+                AfkSilenceCheck.IsChecked == true,
+                (int)silenceMin,
+                AfkWelcomeBackCheck.IsChecked == true,
+                (int)welcomeMin,
+                (int)audioMin);
         }
     }
 

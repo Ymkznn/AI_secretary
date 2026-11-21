@@ -240,12 +240,62 @@
                                                      Unchecked="ProactiveChatSetting_Changed" />
                                 </Grid>
                             </ui:CardExpander.Header>
-                            <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="隨機間隔" Style="{StaticResource FieldLabel}" Margin="0,0,12,0" />
-                                <ui:NumberBox x:Name="ProactiveMinBox" Width="135" Minimum="1" Maximum="1440" SmallChange="1" MaxDecimalPlaces="0" />
-                                <TextBlock x:Name="ProactiveSepText" Text="～" Style="{StaticResource FieldLabel}" Margin="10,0" />
-                                <ui:NumberBox x:Name="ProactiveMaxBox" Width="135" Minimum="1" Maximum="1440" SmallChange="1" MaxDecimalPlaces="0" />
-                                <TextBlock x:Name="ProactiveUnitText" Text="分鐘" Style="{StaticResource FieldLabel}" Margin="10,0,0,0" />
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                    <TextBlock Text="隨機間隔" Style="{StaticResource FieldLabel}" Margin="0,0,12,0" />
+                                    <ui:NumberBox x:Name="ProactiveMinBox" Width="135" Minimum="1" Maximum="1440" SmallChange="1" MaxDecimalPlaces="0" />
+                                    <TextBlock x:Name="ProactiveSepText" Text="～" Style="{StaticResource FieldLabel}" Margin="10,0" />
+                                    <ui:NumberBox x:Name="ProactiveMaxBox" Width="135" Minimum="1" Maximum="1440" SmallChange="1" MaxDecimalPlaces="0" />
+                                    <TextBlock x:Name="ProactiveUnitText" Text="分鐘" Style="{StaticResource FieldLabel}" Margin="10,0,0,0" />
+                                </StackPanel>
+
+                                <Separator Opacity="0.18" Margin="0,0,0,10" />
+
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel VerticalAlignment="Center">
+                                        <TextBlock Text="中離靜默省 Token" FontWeight="SemiBold" />
+                                        <TextBlock Text="鎖屏或無鍵鼠操作達門檻時暫停主動搭話與重提（看片不打擾、離席省費）" FontSize="11.5" Opacity="0.65" TextWrapping="Wrap" />
+                                    </StackPanel>
+                                    <ui:ToggleSwitch x:Name="AfkSilenceCheck"
+                                                     Grid.Column="1"
+                                                     Margin="8,0,0,0"
+                                                     Checked="AfkSetting_Changed"
+                                                     Unchecked="AfkSetting_Changed" />
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                    <TextBlock Text="無操作超過" Style="{StaticResource FieldLabel}" Margin="0,0,10,0" />
+                                    <ui:NumberBox x:Name="AfkSilenceMinBox" Width="120" Minimum="2" Maximum="180" SmallChange="1" MaxDecimalPlaces="0" />
+                                    <TextBlock Text="分鐘即靜默" Style="{StaticResource FieldLabel}" Margin="10,0,0,0" />
+                                </StackPanel>
+
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel VerticalAlignment="Center">
+                                        <TextBlock Text="久離回來主動關心" FontWeight="SemiBold" />
+                                        <TextBlock Text="短暫鎖屏（如去廁所）不打擾；真正久離回來時打招呼並彙報期間事件" FontSize="11.5" Opacity="0.65" TextWrapping="Wrap" />
+                                    </StackPanel>
+                                    <ui:ToggleSwitch x:Name="AfkWelcomeBackCheck"
+                                                     Grid.Column="1"
+                                                     Margin="8,0,0,0"
+                                                     Checked="AfkSetting_Changed"
+                                                     Unchecked="AfkSetting_Changed" />
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="一般離席滿" Style="{StaticResource FieldLabel}" Margin="0,0,8,0" />
+                                    <ui:NumberBox x:Name="AfkWelcomeMinBox" Width="110" Minimum="5" Maximum="240" SmallChange="5" MaxDecimalPlaces="0" />
+                                    <TextBlock Text="分鐘｜播片滿" Style="{StaticResource FieldLabel}" Margin="10,0,8,0" />
+                                    <ui:NumberBox x:Name="AfkAudioWelcomeBox" Width="110" Minimum="15" Maximum="360" SmallChange="5" MaxDecimalPlaces="0" />
+                                    <TextBlock Text="分鐘" Style="{StaticResource FieldLabel}" Margin="8,0,0,0" />
+                                </StackPanel>
                             </StackPanel>
                         </ui:CardExpander>
 

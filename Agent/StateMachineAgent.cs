@@ -73,6 +73,7 @@ public sealed class StateMachineAgent : IDisposable
     private readonly IModelGateway _model;
     private readonly BrowserFormBridgeService _browserBridge;
     private readonly AgentBlackboard _blackboard;
+    private readonly UserPresenceService _presence;
     private readonly ILogger<StateMachineAgent> _logger;
 
     private readonly object _latestLock = new();
@@ -91,6 +92,7 @@ public sealed class StateMachineAgent : IDisposable
         IModelGateway model,
         BrowserFormBridgeService browserBridge,
         AgentBlackboard blackboard,
+        UserPresenceService presence,
         ILogger<StateMachineAgent> logger)
     {
         _store = store;
@@ -99,6 +101,7 @@ public sealed class StateMachineAgent : IDisposable
         _model = model;
         _browserBridge = browserBridge;
         _blackboard = blackboard;
+        _presence = presence;
         _logger = logger;
     }
 
@@ -257,6 +260,9 @@ public sealed class StateMachineAgent : IDisposable
         string? url,
         CancellationToken ct)
     {
+        if (_presence.IsSilentForTokens)
+            return;
+
         var proc = (target.ProcessName ?? "").Trim();
         if (string.IsNullOrWhiteSpace(proc) || NoiseProcesses.Contains(proc))
             return;
