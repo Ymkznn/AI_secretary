@@ -44,121 +44,76 @@ public sealed class ProactiveTopicAndBackoffTests
     }
 
     [Fact]
-    public void TopicPicker_NeverRepeatsLastTwoTopicsConsecutively()
+    public void TopicPicker_LowersWeightAfterBeingPicked_InsteadOfHardBanning()
     {
-        var rng = new Random(42);
-        var recent = new List<ProactiveTopicKind>();
         var activity = new ProactiveActivitySnapshot("osu!", "osu! - 水樹奈々 - 嘆きの花", null);
         var customTopic = new KnowledgeFactRecord(
             "f-trivia", "conv-1", "user_pref", "分享冷知識", "偶爾分享有趣冷知識",
             null, "observed", new List<string> { "proactive_topic" },
             DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "proactive_topic:trivia", "Confirmed", 2);
 
-        for (int i = 0; i < 60; i++)
-        {
-            var ctx = new ProactiveTopicContext(
-                Now: new DateTimeOffset(2026, 11, 21, 22, 0, 0, TimeSpan.FromHours(8)),
-                RecentUserMessages24h: new[] { "幫我追蹤 EMS 單號" },
-                PendingConfirmations: Array.Empty<string>(),
-                RecentBlackboardResults: new[] { "EMS 追蹤: 已到達國際交換局" },
-                PinnedReminders: new[] { "11/25 打 HTB Vaccine" },
-                UpcomingSchedules: Array.Empty<string>(),
-                Activity: activity,
-                CustomTopics: new[] { customTopic },
-                RecentSharedCustomSummaries: new[] { "章魚有三顆心臟" },
-                RecentTopics: recent,
-                AwarenessLevel: ProactiveAwarenessLevel.Normal);
+        ProactiveTopicContext MakeCtx(IReadOnlyList<ProactiveTopicKind> recent) => new(
+            Now: new DateTimeOffset(2026, 11, 21, 22, 0, 0, TimeSpan.FromHours(8)),
+            RecentUserMessages24h: new[] { "幫我追蹤 EMS 單號" },
+            PendingConfirmations: Array.Empty<string>(),
+            RecentBlackboardResults: new[] { "EMS 追蹤: 已到達國際交換局" },
+            PinnedReminders: new[] { "11/25 打 HTB Vaccine" },
+            UpcomingSchedules: Array.Empty<string>(),
+            Activity: activity,
+            CustomTopics: new[] { customTopic },
+            RecentSharedCustomSummaries: new[] { "章魚有三顆心臟" },
+            RecentTopics: recent,
+            AwarenessLevel: ProactiveAwarenessLevel.Normal);
 
-            var picked = ProactiveTopicEngine.PickTopic(ctx, rng);
+        // Fresh weights: CurrentActivity is 25%
+        var fresh = ProactiveTopicEngine.ComputeTopicWeights(MakeCtx(Array.Empty<ProactiveTopicKind>()));
+        Assert.Equal(0.25, fresh[ProactiveTopicKind.CurrentActivity], precision: 4);
 
-            if (recent.Count >= 1)
-                Assert.NotEqual(recent[^1], picked.Topic);
-            if (recent.Count >= 2)
-                Assert.NotEqual(recent[^2], picked.Topic);
+        // Immediately after CurrentActivity is picked -> weight is sharply lowered (> 0, NOT hard-banned!)
+        var afterOne = ProactiveTopicEngine.ComputeTopicWeights(MakeCtx(new[] { ProactiveTopicKind.CurrentActivity }));
+        Assert.True(afterOne[ProactiveTopicKind.CurrentActivity] > 0.0, "Topic must still be selectable (soft decay, not hard-banned)");
+        Assert.True(afterOne[ProactiveTopicKind.CurrentActivity] < fresh[ProactiveTopicKind.CurrentActivity] * 0.35);
 
-            recent.Add(picked.Topic);
-            if (recent.Count > 6) recent.RemoveAt(0);
-        }
-
-        // Edge case: only 2 topics have data (TimeAndLife + PersonaSmallTalk) -> still never repeats immediately previous topic
-        var minimalRecent = new List<ProactiveTopicKind>();
-        for (int i = 0; i < 20; i++)
-        {
-            var minCtx = new ProactiveTopicContext(
-                Now: DateTimeOffset.Now,
-                RecentUserMessages24h: Array.Empty<string>(),
-                PendingConfirmations: Array.Empty<string>(),
-                RecentBlackboardResults: Array.Empty<string>(),
-                PinnedReminders: Array.Empty<string>(),
-                UpcomingSchedules: Array.Empty<string>(),
-                Activity: null,
-                CustomTopics: Array.Empty<KnowledgeFactRecord>(),
-                RecentSharedCustomSummaries: Array.Empty<string>(),
-                RecentTopics: minimalRecent,
-                AwarenessLevel: ProactiveAwarenessLevel.Normal);
-
-            var picked = ProactiveTopicEngine.PickTopic(minCtx, rng);
-            if (minimalRecent.Count >= 1)
-                Assert.NotEqual(minimalRecent[^1], picked.Topic);
-            Assert.True(picked.Topic is ProactiveTopicKind.TimeAndLife or ProactiveTopicKind.PersonaSmallTalk);
-            minimalRecent.Add(picked.Topic);
-        }
+        // Two turns after CurrentActivity was picked -> partially recovered, still lower than fresh
+        var afterTwo = ProactiveTopicEngine.ComputeTopicWeights(MakeCtx(new[] { ProactiveTopicKind.CurrentActivity, ProactiveTopicKind.TimeAndLife }));
+        Assert.True(afterTwo[ProactiveTopicKind.CurrentActivity] > afterOne[ProactiveTopicKind.CurrentActivity]);
+        Assert.True(afterTwo[ProactiveTopicKind.CurrentActivity] < fresh[ProactiveTopicKind.CurrentActivity]);
     }
 
     [Fact]
-    public void PromptIsolation_OmitsAllWindowInfoWhenActivityNotPicked_AndMasksTitlesForLowAndNormal()
+    public void PromptIsolation_OmitsAllWindowInfoWhenActivityNotPicked_AndPassesTitleDirectlyWhenPicked()
     {
-        var sensitiveActivity = new ProactiveActivitySnapshot(
+        var activity = new ProactiveActivitySnapshot(
             ProcessName: "osu!",
-            Title: "osu! - 水樹奈々 - 嘆きの花 [SecretMap.osz]",
+            Title: "osu! - 水樹奈々 - 嘆きの花",
             Url: null);
 
-        // 1) When CurrentActivity is excluded (in RecentTopics) -> ZERO window/process/title info in prompt!
-        var nonActCtx = new ProactiveTopicContext(
-            Now: new DateTimeOffset(2026, 11, 21, 22, 30, 0, TimeSpan.FromHours(8)),
-            RecentUserMessages24h: Array.Empty<string>(),
-            PendingConfirmations: Array.Empty<string>(),
-            RecentBlackboardResults: Array.Empty<string>(),
-            PinnedReminders: Array.Empty<string>(),
-            UpcomingSchedules: Array.Empty<string>(),
-            Activity: sensitiveActivity,
-            CustomTopics: Array.Empty<KnowledgeFactRecord>(),
-            RecentSharedCustomSummaries: Array.Empty<string>(),
-            RecentTopics: new[] { ProactiveTopicKind.CurrentActivity, ProactiveTopicKind.TimeAndLife },
-            AwarenessLevel: ProactiveAwarenessLevel.High);
+        // 1) When a non-activity topic is selected -> ZERO window/process/title info in prompt!
+        var selectedNonAct = new SelectedProactiveTopic(
+            Topic: ProactiveTopicKind.PersonaSmallTalk,
+            ActivityPayload: null,
+            SelectedCustomTopic: null,
+            RecentSharedSummaries: Array.Empty<string>(),
+            OngoingThreadItems: Array.Empty<string>(),
+            ReminderItems: Array.Empty<string>());
 
-        var pickedNonAct = ProactiveTopicEngine.PickTopic(nonActCtx, new Random(1));
-        Assert.NotEqual(ProactiveTopicKind.CurrentActivity, pickedNonAct.Topic);
-        Assert.Null(pickedNonAct.ActivityPayload);
-
-        var promptNonAct = MainAgentPrompts.BuildProactiveUserPrompt(nonActCtx.Now, pickedNonAct, nonActCtx.RecentTopics);
+        var promptNonAct = MainAgentPrompts.BuildProactiveUserPrompt(
+            new DateTimeOffset(2026, 11, 21, 22, 30, 0, TimeSpan.FromHours(8)),
+            selectedNonAct,
+            new[] { ProactiveTopicKind.CurrentActivity });
         Assert.DoesNotContain("current_activity:", promptNonAct);
-        Assert.DoesNotContain("category=", promptNonAct);
         Assert.DoesNotContain("osu!", promptNonAct, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("嘆きの花", promptNonAct);
-        Assert.DoesNotContain("SecretMap", promptNonAct);
 
-        // 2) Low & Normal: coarse category ONLY, NEVER raw song/file title!
-        var normalPayload = ProactiveTopicEngine.FormatActivityForPrompt(sensitiveActivity, ProactiveAwarenessLevel.Normal);
-        var lowPayload = ProactiveTopicEngine.FormatActivityForPrompt(sensitiveActivity, ProactiveAwarenessLevel.Low);
-        Assert.Equal("category=rhythm_game", normalPayload);
-        Assert.Equal("category=rhythm_game", lowPayload);
-        Assert.DoesNotContain("嘆きの花", normalPayload!);
-        Assert.DoesNotContain("SecretMap", normalPayload!);
+        // 2) When CurrentActivity IS picked -> passes process + title directly (no coarse category masking)
+        var normalPayload = ProactiveTopicEngine.FormatActivityForPrompt(activity, ProactiveAwarenessLevel.Normal);
+        Assert.Equal("osu!: osu! - 水樹奈々 - 嘆きの花", normalPayload);
 
-        // Browser YouTube -> watching_video category on Normal, no video title leaked
-        var ytSnap = new ProactiveActivitySnapshot("msedge", "腳踩空力爆打球鯊 - YouTube", "https://www.youtube.com/watch?v=123");
-        Assert.Equal("category=watching_video", ProactiveTopicEngine.FormatActivityForPrompt(ytSnap, ProactiveAwarenessLevel.Normal));
-
-        // 3) High: includes full title (for yandere/menhera persona), EXCEPT incognito stays redacted!
-        var highPayload = ProactiveTopicEngine.FormatActivityForPrompt(sensitiveActivity, ProactiveAwarenessLevel.High);
-        Assert.Contains("rhythm_game", highPayload!);
-        Assert.Contains("嘆きの花", highPayload!);
-
+        // 3) Incognito / private browsing stays redacted
         var incognitoSnap = new ProactiveActivitySnapshot("msedge", "Private Secret Page", "https://secret.example", IsIncognito: true);
-        var highIncognito = ProactiveTopicEngine.FormatActivityForPrompt(incognitoSnap, ProactiveAwarenessLevel.High);
-        Assert.DoesNotContain("Private Secret Page", highIncognito!);
-        Assert.Contains("private", highIncognito!, StringComparison.OrdinalIgnoreCase);
+        var incognitoPayload = ProactiveTopicEngine.FormatActivityForPrompt(incognitoSnap, ProactiveAwarenessLevel.High);
+        Assert.DoesNotContain("Private Secret Page", incognitoPayload!);
+        Assert.Contains("private browsing", incognitoPayload!, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

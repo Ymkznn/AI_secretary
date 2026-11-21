@@ -60,8 +60,8 @@ public sealed record ProactiveGenerationResult(
 
 /// <summary>
 /// Language-agnostic proactive idle check-in engine:
-/// - Programmatically picks ONE topic with weighted randomness and last-2 exclusion.
-/// - Maps active process/URL into coarse neutral activity categories for Low/Normal awareness (never leaking raw titles/filenames).
+/// - Programmatically picks ONE topic with weighted randomness and soft recency decay (lowers weight after being picked instead of hard-banning).
+/// - Passes window/tab title directly ONLY when CurrentActivity is picked (incognito stays redacted).
 /// - Resolves effective awareness strictly by precedence: verbal override > cached LLM classification > default Normal.
 /// - Computes exponential backoff intervals on consecutive unanswered check-ins.
 /// </summary>
@@ -70,80 +70,13 @@ public static class ProactiveTopicEngine
     public const string AwarenessTag = "proactive_awareness";
     public const string CustomTopicTag = "proactive_topic";
 
+    /// <summary>Soft cooldown decay applied when a topic was just used (last 1 turn / last 2 turns).</summary>
+    public const double LastOneDecayMultiplier = 0.15;
+    public const double LastTwoDecayMultiplier = 0.45;
+
     private static readonly Regex AwarenessLevelRegex = new(
         @"\b(low|normal|high)\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
-
-    private static readonly HashSet<string> BrowserProcesses = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "msedge", "chrome", "firefox", "brave", "opera", "vivaldi", "arc"
-    };
-
-    private static readonly HashSet<string> CodingProcesses = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "code", "code - insiders", "devenv", "rider64", "idea64", "pycharm64", "webstorm64",
-        "clion64", "goland64", "cursor", "windsurf", "antigravity", "sublime_text", "notepad++",
-        "windowsterminal", "wt", "powershell", "pwsh", "cmd", "mintty", "wezterm-gui", "alacritty"
-    };
-
-    private static readonly HashSet<string> RhythmGameProcesses = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "osu!", "osu", "kalpa", "djmax", "djmax respect v", "muse_dash", "musedash",
-        "arcaea", "vividstasis", "etterna", "stepmania", "quaver", "malody", "adofai",
-        "a dance of fire and ice", "project diva", "ez2on"
-    };
-
-    private static readonly HashSet<string> GamingProcesses = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "steam", "epicgameslauncher", "playnite.desktopapp", "genshinimpact", "starrail",
-        "zenlesszonezero", "valorant", "valorant-win64-shipping", "leagueclient", "league of legends",
-        "minecraft", "robloxplayerbeta", "bluearchive", "nikke", "umamusume", "wuthering waves"
-    };
-
-    private static readonly HashSet<string> VideoPlayerProcesses = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "vlc", "mpv", "potplayermini64", "potplayer", "mpc-hc64", "mpc-be64", "wmplayer"
-    };
-
-    private static readonly HashSet<string> MusicPlayerProcesses = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "spotify", "itunes", "foobar2000", "musicbee", "applemusic"
-    };
-
-    private static readonly HashSet<string> ChatProcesses = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "discord", "line", "slack", "teams", "ms-teams", "telegram", "whatsapp", "messenger"
-    };
-
-    private static readonly HashSet<string> OfficeProcesses = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "winword", "excel", "powerpnt", "onenote", "outlook", "olk", "notion", "obsidian",
-        "acrobat", "acrord32", "foxitpdfreader", "wps"
-    };
-
-    private static readonly string[] VideoHosts =
-    {
-        "youtube.com", "youtu.be", "twitch.tv", "bilibili.com", "nicovideo.jp",
-        "ani.gamer.com.tw", "netflix.com", "disneyplus.com", "primevideo.com",
-        "crunchyroll.com", "abema.tv", "holodex.net"
-    };
-
-    private static readonly string[] MusicHosts =
-    {
-        "music.youtube.com", "open.spotify.com", "soundcloud.com", "music.apple.com"
-    };
-
-    private static readonly string[] CodingHosts =
-    {
-        "github.com", "gitlab.com", "stackoverflow.com", "stackexchange.com",
-        "learn.microsoft.com", "developer.mozilla.org", "docs.python.org",
-        "hackthebox.com", "app.hackthebox.com", "tryhackme.com", "portswigger.net", "leetcode.com"
-    };
-
-    private static readonly string[] ChatHosts =
-    {
-        "discord.com", "web.whatsapp.com", "web.telegram.org", "mail.google.com", "outlook.live.com"
-    };
 
     public static string ComputeStyleHash(string stylePrompt)
     {
@@ -231,98 +164,26 @@ public static class ProactiveTopicEngine
             .ToList();
     }
 
-    public static string? ClassifyActivityCategory(ProactiveActivitySnapshot? snap)
+    /// <summary>
+    /// Formats current window/tab title directly when CurrentActivity is chosen (incognito stays redacted).
+    /// </summary>
+    public static string? FormatActivityForPrompt(ProactiveActivitySnapshot? snap, ProactiveAwarenessLevel _ = ProactiveAwarenessLevel.Normal)
     {
         if (snap is null)
             return null;
 
         var proc = (snap.ProcessName ?? "").Trim();
-        if (proc.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-            proc = proc[..^4];
-
-        if (RhythmGameProcesses.Contains(proc))
-            return "rhythm_game";
-        if (CodingProcesses.Contains(proc))
-            return "coding";
-        if (GamingProcesses.Contains(proc))
-            return "gaming";
-        if (VideoPlayerProcesses.Contains(proc))
-            return "watching_video";
-        if (MusicPlayerProcesses.Contains(proc))
-            return "listening_music";
-        if (ChatProcesses.Contains(proc))
-            return "chatting";
-        if (OfficeProcesses.Contains(proc))
-            return "office_work";
-
-        if (BrowserProcesses.Contains(proc))
-        {
-            if (snap.IsIncognito)
-                return "browsing";
-
-            if (!string.IsNullOrWhiteSpace(snap.Url) && Uri.TryCreate(snap.Url, UriKind.Absolute, out var uri))
-            {
-                var host = uri.Host.ToLowerInvariant();
-                if (MusicHosts.Any(h => host == h || host.EndsWith("." + h, StringComparison.Ordinal)))
-                    return "listening_music";
-                if (VideoHosts.Any(h => host == h || host.EndsWith("." + h, StringComparison.Ordinal)))
-                    return "watching_video";
-                if (CodingHosts.Any(h => host == h || host.EndsWith("." + h, StringComparison.Ordinal)))
-                    return "coding";
-                if (ChatHosts.Any(h => host == h || host.EndsWith("." + h, StringComparison.Ordinal)))
-                    return "chatting";
-            }
-
-            // Brand-name fallback from title when extension URL is unavailable (language-independent site names only)
-            var title = snap.Title ?? "";
-            if (title.Contains("YouTube Music", StringComparison.OrdinalIgnoreCase) ||
-                title.Contains("Spotify", StringComparison.OrdinalIgnoreCase))
-                return "listening_music";
-            if (title.Contains("YouTube", StringComparison.OrdinalIgnoreCase) ||
-                title.Contains("Twitch", StringComparison.OrdinalIgnoreCase) ||
-                title.Contains("Netflix", StringComparison.OrdinalIgnoreCase) ||
-                title.Contains("bilibili", StringComparison.OrdinalIgnoreCase) ||
-                title.Contains("niconico", StringComparison.OrdinalIgnoreCase))
-                return "watching_video";
-            if (title.Contains("GitHub", StringComparison.OrdinalIgnoreCase) ||
-                title.Contains("Stack Overflow", StringComparison.OrdinalIgnoreCase) ||
-                title.Contains("Hack The Box", StringComparison.OrdinalIgnoreCase))
-                return "coding";
-
-            return "browsing";
-        }
-
-        return string.IsNullOrWhiteSpace(proc) ? null : "desktop_app";
-    }
-
-    /// <summary>
-    /// Formats current activity for the proactive prompt.
-    /// Low/Normal: coarse category ONLY (NEVER leaks filenames, song names, video titles, or URLs).
-    /// High: category + full window/tab title (private browsing remains redacted).
-    /// </summary>
-    public static string? FormatActivityForPrompt(ProactiveActivitySnapshot? snap, ProactiveAwarenessLevel level)
-    {
-        var category = ClassifyActivityCategory(snap);
-        if (string.IsNullOrWhiteSpace(category) || snap is null)
-            return null;
-
-        if (level != ProactiveAwarenessLevel.High)
-            return $"category={category}";
-
         if (snap.IsIncognito)
-            return "category=browsing (private browsing)";
+            return string.IsNullOrWhiteSpace(proc) ? "(private browsing)" : $"{proc} (private browsing)";
 
         var rawTitle = (snap.Title ?? "").Trim();
-        if (rawTitle.Length > 120)
-            rawTitle = rawTitle[..120] + "…";
+        if (rawTitle.Length > 140)
+            rawTitle = rawTitle[..140] + "…";
 
-        var proc = (snap.ProcessName ?? "").Trim();
         if (string.IsNullOrWhiteSpace(rawTitle))
-            return $"category={category}" + (string.IsNullOrWhiteSpace(proc) ? "" : $" ({proc})");
+            return string.IsNullOrWhiteSpace(proc) ? null : proc;
 
-        return string.IsNullOrWhiteSpace(proc)
-            ? $"category={category} | title={rawTitle}"
-            : $"category={category} | app={proc} | title={rawTitle}";
+        return string.IsNullOrWhiteSpace(proc) ? rawTitle : $"{proc}: {rawTitle}";
     }
 
     public static double GetActivityTargetWeight(ProactiveAwarenessLevel level) => level switch
@@ -332,10 +193,12 @@ public static class ProactiveTopicEngine
         _ => 0.25
     };
 
-    public static SelectedProactiveTopic PickTopic(ProactiveTopicContext ctx, Random? rng = null)
+    /// <summary>
+    /// Computes normalized selection probabilities for all eligible topics, applying soft recency decay
+    /// (never hard-banning recently picked topics).
+    /// </summary>
+    public static Dictionary<ProactiveTopicKind, double> ComputeTopicWeights(ProactiveTopicContext ctx)
     {
-        rng ??= Random.Shared;
-
         var ongoingItems = BuildOngoingThreadItems(ctx);
         var reminderItems = BuildReminderItems(ctx);
         var customTopics = ExtractConfirmedCustomTopics(ctx.CustomTopics);
@@ -354,23 +217,11 @@ public static class ProactiveTopicEngine
         if (customTopics.Count > 0)
             eligible.Add((ProactiveTopicKind.CustomUserTopic, 25.0));
         if (!string.IsNullOrWhiteSpace(activityPayload))
-            eligible.Add((ProactiveTopicKind.CurrentActivity, 0.0)); // weight set dynamically by AwarenessLevel
+            eligible.Add((ProactiveTopicKind.CurrentActivity, 0.0)); // scaled dynamically by AwarenessLevel
 
-        // Exclude last 2 topics to prevent repetition; fall back to excluding only last 1 if needed.
-        var lastTwo = ctx.RecentTopics.TakeLast(2).ToHashSet();
-        var filtered = eligible.Where(e => !lastTwo.Contains(e.Topic)).ToList();
-        if (filtered.Count == 0 && ctx.RecentTopics.Count > 0)
-        {
-            var lastOne = ctx.RecentTopics[^1];
-            filtered = eligible.Where(e => e.Topic != lastOne).ToList();
-        }
-        if (filtered.Count == 0)
-            filtered = eligible;
-
-        // Compute normalized weights respecting AwarenessLevel share for CurrentActivity.
-        var hasActivity = filtered.Any(x => x.Topic == ProactiveTopicKind.CurrentActivity);
-        var others = filtered.Where(x => x.Topic != ProactiveTopicKind.CurrentActivity).ToList();
-        var weighted = new List<(ProactiveTopicKind Topic, double Weight)>(filtered.Count);
+        var hasActivity = eligible.Any(x => x.Topic == ProactiveTopicKind.CurrentActivity);
+        var others = eligible.Where(x => x.Topic != ProactiveTopicKind.CurrentActivity).ToList();
+        var rawWeights = new Dictionary<ProactiveTopicKind, double>(eligible.Count);
 
         if (hasActivity && others.Count > 0)
         {
@@ -378,25 +229,63 @@ public static class ProactiveTopicEngine
             double otherShare = 1.0 - actShare;
             double otherBaseSum = others.Sum(o => o.BaseWeight);
 
-            weighted.Add((ProactiveTopicKind.CurrentActivity, actShare));
+            rawWeights[ProactiveTopicKind.CurrentActivity] = actShare;
             foreach (var o in others)
-                weighted.Add((o.Topic, otherBaseSum > 0 ? otherShare * (o.BaseWeight / otherBaseSum) : otherShare / others.Count));
+                rawWeights[o.Topic] = otherBaseSum > 0 ? otherShare * (o.BaseWeight / otherBaseSum) : otherShare / others.Count;
         }
         else if (hasActivity)
         {
-            weighted.Add((ProactiveTopicKind.CurrentActivity, 1.0));
+            rawWeights[ProactiveTopicKind.CurrentActivity] = 1.0;
         }
         else
         {
             double baseSum = others.Sum(o => o.BaseWeight);
             foreach (var o in others)
-                weighted.Add((o.Topic, baseSum > 0 ? o.BaseWeight / baseSum : 1.0 / others.Count));
+                rawWeights[o.Topic] = baseSum > 0 ? o.BaseWeight / baseSum : 1.0 / others.Count;
         }
+
+        // Soft recency decay: reduce probability after being picked instead of hard-banning.
+        ProactiveTopicKind? last1 = ctx.RecentTopics.Count >= 1 ? ctx.RecentTopics[^1] : null;
+        ProactiveTopicKind? last2 = ctx.RecentTopics.Count >= 2 ? ctx.RecentTopics[^2] : null;
+
+        var decayed = new Dictionary<ProactiveTopicKind, double>(rawWeights.Count);
+        double total = 0.0;
+        foreach (var (topic, w) in rawWeights)
+        {
+            double mult = 1.0;
+            if (last1 == topic)
+                mult = LastOneDecayMultiplier;
+            else if (last2 == topic)
+                mult = LastTwoDecayMultiplier;
+
+            double adjusted = w * mult;
+            decayed[topic] = adjusted;
+            total += adjusted;
+        }
+
+        if (total > 0)
+        {
+            foreach (var key in decayed.Keys.ToList())
+                decayed[key] /= total;
+        }
+        return decayed;
+    }
+
+    public static SelectedProactiveTopic PickTopic(ProactiveTopicContext ctx, Random? rng = null)
+    {
+        rng ??= Random.Shared;
+
+        var ongoingItems = BuildOngoingThreadItems(ctx);
+        var reminderItems = BuildReminderItems(ctx);
+        var customTopics = ExtractConfirmedCustomTopics(ctx.CustomTopics);
+        var activityPayload = FormatActivityForPrompt(ctx.Activity, ctx.AwarenessLevel);
+
+        var weights = ComputeTopicWeights(ctx);
 
         double roll = rng.NextDouble();
         double acc = 0.0;
-        var chosen = weighted[^1].Topic;
-        foreach (var (topic, weight) in weighted)
+        var chosen = weights.Keys.Last();
+        foreach (var (topic, weight) in weights)
         {
             acc += weight;
             if (roll <= acc)
