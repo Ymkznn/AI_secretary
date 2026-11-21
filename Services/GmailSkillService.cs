@@ -59,6 +59,14 @@ public sealed class GmailSkillService
                 if (File.Exists(userCreds)) return userCreds;
                 var baseCreds = Path.Combine(AppContext.BaseDirectory, "gmail_credentials.json");
                 if (File.Exists(baseCreds)) return baseCreds;
+
+                // Fallback: walk up from BaseDirectory (e.g. bin/Release/net8.0-windows -> repo root)
+                var dir = new DirectoryInfo(AppContext.BaseDirectory);
+                for (int i = 0; i < 4 && dir is not null; i++, dir = dir.Parent)
+                {
+                    var candidate = Path.Combine(dir.FullName, "gmail_credentials.json");
+                    if (File.Exists(candidate)) return candidate;
+                }
                 return userCreds;
             }
             return ResolvePath(configured);
@@ -322,7 +330,7 @@ public sealed class GmailSkillService
             ThreadId: threadId);
     }
 
-    private async Task<string> EnsureAccessTokenAsync(CancellationToken ct)
+    private async Task<string> EnsureAccessTokenAsync(CancellationToken ct, bool forceRefresh = false)
     {
         await _tokenLock.WaitAsync(ct);
         try
@@ -334,7 +342,7 @@ public sealed class GmailSkillService
             }
 
             var token = LoadTokenState();
-            if (token is not null && !string.IsNullOrWhiteSpace(token.AccessToken) && token.ExpiresAt > DateTimeOffset.UtcNow)
+            if (!forceRefresh && token is not null && !string.IsNullOrWhiteSpace(token.AccessToken) && token.ExpiresAt > DateTimeOffset.UtcNow)
             {
                 return token.AccessToken;
             }
@@ -376,9 +384,12 @@ public sealed class GmailSkillService
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
             var newAccess = root.GetProperty("access_token").GetString() ?? "";
+            var rotatedRefresh = root.TryGetProperty("refresh_token", out var rrt) && !string.IsNullOrWhiteSpace(rrt.GetString())
+                ? rrt.GetString()!
+                : refreshToken;
             var expiresIn = root.TryGetProperty("expires_in", out var exp) ? exp.GetInt32() : 3600;
 
-            var updated = new GmailTokenState(newAccess, refreshToken, DateTimeOffset.UtcNow.AddSeconds(expiresIn - 60));
+            var updated = new GmailTokenState(newAccess, rotatedRefresh, DateTimeOffset.UtcNow.AddSeconds(expiresIn - 60));
             SaveTokenState(updated);
             return newAccess;
         }

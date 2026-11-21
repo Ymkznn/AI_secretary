@@ -146,9 +146,14 @@ public sealed class WorkflowOptimizerAgent
 
             await _cache.ApplyTuningAsync(threshold, promote, disableIds, conversationId, note, ct);
 
-            // Also prune noisy/disabled AutoStateRules and expired/stale Candidate facts offline.
+            // Prune noisy/disabled AutoStateRules (keep Muted rules so user opt-out persists until manual revive) and expired/stale Candidate facts offline.
             var stateRules = await _store.GetAllAutoStateRulesAsync(ct);
-            foreach (var r in stateRules.Where(x => x.Status == "Disabled" || (x.MissCount >= 3 && x.MissCount > x.HitCount)))
+            var nowUtc = DateTimeOffset.UtcNow;
+            foreach (var r in stateRules.Where(x =>
+                         x.Status != "Muted" &&
+                         (x.Status == "Disabled" ||
+                          (x.Status == "Ignored" && (!x.CooldownUntil.HasValue || x.CooldownUntil.Value <= nowUtc)) ||
+                          (x.MissCount >= 3 && x.MissCount > x.HitCount))))
             {
                 await _store.DeleteAutoStateRuleAsync(r.TriggerKey, ct);
             }

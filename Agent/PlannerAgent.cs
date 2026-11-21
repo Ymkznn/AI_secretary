@@ -7,19 +7,25 @@ using AiSecretary.Desktop.Skills;
 
 namespace AiSecretary.Desktop.Agent;
 
-/// <summary>
-/// 郵件急迫性分診結果。
-/// </summary>
-/// <param name="Urgent">是否屬於需主動通知並置頂的急迫郵件。</param>
-/// <param name="Title">通知卡片標題。</param>
-/// <param name="Summary">一句話郵件摘要。</param>
-/// <param name="ReRemindMinutes">置頂重複提醒間隔（分鐘），0 表示不重複。</param>
-/// <param name="Actions">通知卡片上的快捷動作按鈕清單。</param>
+/// <summary>郵件急迫性分診結果。</summary>
 public sealed record TriageResult(bool Urgent, string Title, string Summary, int ReRemindMinutes = 15, List<NotificationButtonOption>? Actions = null);
 
+/// <summary>Planner 完成多輪規劃與 Worker 執行後回報給 MainAgent 的純資料結果（Planner 本身不直接對使用者發言）。</summary>
+public sealed record PlannerReport(
+    string Goal,
+    List<string> CompletedSteps,
+    List<string> Observations,
+    List<MailSourceRef> Sources,
+    int RoundsExecuted,
+    bool ReachedRoundLimit,
+    bool WasDeclinedOrDenied);
+
 /// <summary>
-/// 自主規劃代理（Planner）：負責多步驟任務拆解、委派 <see cref="WorkerAgent"/> 執行、
-/// 彙整最終回覆並判定任務是否結案（[TASK_STATUS]），以及新進郵件的急迫性分診。
+/// 內部任務規劃代理（Planner）：
+/// - 僅負責將 <see cref="MainAgent"/> 交付的目標拆解為工具步驟並委派 <see cref="WorkerAgent"/> 執行。
+/// - 支援可設定上限的多輪 Planner ↔ Worker 迴圈（<see cref="GuardService.MaxPlannerRounds"/>），
+///   並在每輪間同步新抵達的背景通知（如驗證碼信件），直到達成目標、無法繼續或觸及輪數上限。
+/// - 絕不直接與使用者對話；完成後僅回傳 <see cref="PlannerReport"/> 交由 <see cref="MainAgent"/> 統一對外回覆。
 /// </summary>
 public sealed class PlannerAgent
 {
@@ -28,12 +34,9 @@ public sealed class PlannerAgent
     private readonly GuardService _guard;
     private readonly IModelGateway _model;
     private readonly ContextSessionManager _sessions;
-    private readonly StyleService _styles;
-    private readonly TtsService _tts;
     private readonly SkillRegistry _skillRegistry;
     private readonly WorkerAgent _worker;
     private readonly WorkflowCacheService _workflowCache;
-    private readonly MemoryReflectionAgent _memoryReflection;
     private readonly UiLocalizer _localizer;
     private readonly AppSettingsService _settings;
     private readonly ActivityMonitorService _activity;
@@ -45,12 +48,9 @@ public sealed class PlannerAgent
         GuardService guard,
         IModelGateway model,
         ContextSessionManager sessions,
-        StyleService styles,
-        TtsService tts,
         SkillRegistry skillRegistry,
         WorkerAgent worker,
         WorkflowCacheService workflowCache,
-        MemoryReflectionAgent memoryReflection,
         UiLocalizer localizer,
         AppSettingsService settings,
         ActivityMonitorService activity,
@@ -61,12 +61,9 @@ public sealed class PlannerAgent
         _guard = guard;
         _model = model;
         _sessions = sessions;
-        _styles = styles;
-        _tts = tts;
         _skillRegistry = skillRegistry;
         _worker = worker;
         _workflowCache = workflowCache;
-        _memoryReflection = memoryReflection;
         _localizer = localizer;
         _settings = settings;
         _activity = activity;
@@ -79,9 +76,9 @@ public sealed class PlannerAgent
             : _settings.Current.Llm.ReplyLanguage.Trim();
 
     /// <summary>
-    /// 針對複雜或多步驟任務進行規劃與執行，並在完成後透過 <paramref name="onTaskCompleted"/> 回報是否已結案。
+    /// 執行多輪 Planner ↔ Worker 任務迴圈，完成或觸及上限後將結構化 <see cref="PlannerReport"/> 回報給 MainAgent。
     /// </summary>
-    public async Task ExecuteGoalAsync(
+    public async Task<PlannerReport> ExecuteGoalAsync(
         string conversationId,
         string taskId,
         string goal,
@@ -89,21 +86,19 @@ public sealed class PlannerAgent
         string? targetMailId,
         Func<string, string, Task<bool>> confirmAsync,
         Func<string, Task> onStatusAsync,
-        Func<string, List<MailSourceRef>, Task> onReplyAsync,
         Action<string, string>? onStageChanged = null,
         ModelTier tier = ModelTier.Complex,
-        CancellationToken ct = default,
-        Action<string>? onDirectTtsText = null,
-        Action<IReadOnlyList<string>>? onChoices = null,
-        Action<bool>? onTaskCompleted = null)
+        CancellationToken ct = default)
     {
         var plannerSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Planner", ct: ct);
+        var lastNotifCheckUtc = DateTimeOffset.UtcNow;
+        var seenNotifIds = new HashSet<string>(StringComparer.Ordinal);
 
         var customList = _skillRegistry.GetCustom().Where(s => s.IsEnabled).ToList();
         var customSkillsPrompt = PlannerPrompts.FormatCustomSkillsPrompt(customList);
 
         var recent = await _store.GetChatMessagesAsync(conversationId, 80, ct);
-        var historyMessages = MainAgent.BuildHistoryModelMessages(recent, userPrompt, maxMessages: 10, perMessageMaxChars: 2500, totalMaxChars: 12000);
+        var historyMessages = MainAgent.BuildHistoryModelMessages(recent, userPrompt, maxMessages: 32, perMessageMaxChars: 3000, totalMaxChars: 36000);
 
         var recalledFacts = await _store.RecallRelevantFactsAsync(conversationId, userPrompt, 5, ct);
         var factsContext = MainAgentPrompts.FormatFactsContext(recalledFacts);
@@ -128,14 +123,16 @@ public sealed class PlannerAgent
             customSkillsPrompt,
             goal,
             userPrompt,
-            activeWindowContext);
+            activeWindowContext,
+            _sandbox.GetTrustedPaths());
 
         var sources = new List<MailSourceRef>();
         var observations = new List<string>();
         var completedSteps = new List<string>();
-        var plannedSteps = new List<PlannedStep>();
-        string? statusNote = null;
         bool usedPredictedBranch = false;
+        int roundsExecuted = 0;
+        bool reachedRoundLimit = false;
+        bool wasDeclinedOrDenied = false;
 
         // CPU-style 2-bit Branch Predictor: try matching a Hot workflow before burning a Planner LLM call
         var (predictedRec, predictedSteps) = await _workflowCache.TryPredictAsync(conversationId, goal, userPrompt, ct);
@@ -166,7 +163,7 @@ public sealed class PlannerAgent
             if (predSucceeded)
             {
                 usedPredictedBranch = true;
-                plannedSteps = predSteps;
+                roundsExecuted = 1;
                 await _sessions.CompleteTaskSessionAsync(
                     workerSession,
                     new SessionHandoff(goal, completedSteps, new List<string>(), new List<string>(), sources.Select(s => s.MailId).ToList()),
@@ -174,7 +171,6 @@ public sealed class PlannerAgent
             }
             else
             {
-                // Misprediction rollback: clear failed observations and fall back to full Planner
                 sources.Clear();
                 observations.Clear();
                 completedSteps.Clear();
@@ -190,19 +186,30 @@ public sealed class PlannerAgent
             planMessages.AddRange(historyMessages);
             planMessages.Add(new("user", plannerPrompt));
 
-            var planResp = await _model.CompleteAsync(planMessages, tier, ct);
+            var maxRounds = _guard.MaxPlannerRounds;
+            var workerSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Worker", forceNewSession: true, ct: ct);
+            List<PlannedStep>? firstRoundSteps = null;
+            int firstRoundExecutedCount = 0;
 
-            await _sessions.RecordTokensAsync(plannerSession, planResp.EstimatedTokens, ct: ct);
-
-            (plannedSteps, statusNote) = ParsePlanWithStatus(planResp.Content);
-
-            if (plannedSteps.Count > 0)
+            for (int round = 1; round <= maxRounds; round++)
             {
+                ct.ThrowIfCancellationRequested();
+                roundsExecuted = round;
+
+                var planResp = await _model.CompleteAsync(planMessages, tier, ct);
+                await _sessions.RecordTokensAsync(plannerSession, planResp.EstimatedTokens, ct: ct);
+
+                var (plannedSteps, statusNote, done) = ParsePlanWithStatus(planResp.Content);
+                if (plannedSteps.Count == 0 || done)
+                    break;
+
                 if (!string.IsNullOrWhiteSpace(statusNote))
                     await onStatusAsync(statusNote);
+
                 onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerPreparing", "Worker preparing {0} step(s)...", plannedSteps.Count));
-                var workerSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Worker", forceNewSession: true, ct: ct);
                 var stepLimit = Math.Min(plannedSteps.Count, _guard.MaxWorkerStepsPerTask);
+                int obsBefore = observations.Count;
+                int stepsBefore = completedSteps.Count;
 
                 for (int i = 0; i < stepLimit; i++)
                 {
@@ -216,132 +223,79 @@ public sealed class PlannerAgent
                         confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
                 }
 
-                // Automatic 1-round self-repair if a tool/script execution failed (and wasn't declined/denied by user or guard)
-                bool hasExecError = observations.Any(o =>
-                    (o.Contains("Execution failed", StringComparison.OrdinalIgnoreCase) ||
-                     o.Contains(" failed:", StringComparison.OrdinalIgnoreCase)) &&
-                    !o.Contains("declined", StringComparison.OrdinalIgnoreCase) &&
-                    !o.Contains("denied", StringComparison.OrdinalIgnoreCase));
-
-                if (hasExecError)
+                if (round == 1)
                 {
-                    planMessages.Add(new("assistant", planResp.Content));
-                    planMessages.Add(new("user", $"One or more steps failed with the following error(s):\n{string.Join("\n\n", observations)}\n\nOutput a corrected JSON plan (`{{\"status_note\":\"...\",\"steps\":[...]}}`) to fix the error and complete the goal (do NOT repeat steps that already succeeded unless rewriting a failed script)."));
-
-                    var retryPlanResp = await _model.CompleteAsync(planMessages, tier, ct);
-                    await _sessions.RecordTokensAsync(plannerSession, retryPlanResp.EstimatedTokens, ct: ct);
-                    var (retrySteps, retryNote) = ParsePlanWithStatus(retryPlanResp.Content);
-                    if (retrySteps.Count > 0)
-                    {
-                        if (!string.IsNullOrWhiteSpace(retryNote))
-                            await onStatusAsync(retryNote);
-                        var retryLimit = Math.Min(retrySteps.Count, _guard.MaxWorkerStepsPerTask);
-                        for (int i = 0; i < retryLimit; i++)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            var step = retrySteps[i];
-                            var skillName = step.Skill.Trim();
-                            onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerStep", "Worker running {0} ({1}/{2})...", skillName, i + 1, retryLimit));
-                            await _worker.RunStepAsync(
-                                conversationId, userPrompt, skillName, step.Args, targetMailId,
-                                confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
-                        }
-                    }
+                    firstRoundSteps = plannedSteps;
+                    firstRoundExecutedCount = completedSteps.Count - stepsBefore;
                 }
 
-                await _sessions.CompleteTaskSessionAsync(
-                    workerSession,
-                    new SessionHandoff(goal, completedSteps, new List<string>(), new List<string>(), sources.Select(s => s.MailId).ToList()),
-                    ct);
+                var roundObs = observations.Skip(obsBefore).ToList();
 
-                // Autonomous 1-round continuation: if round 1 only performed read/list discovery (or hit stepLimit)
-                // and did not fail/decline, let Planner inspect observations and output follow-up action steps (or steps: [] if done).
-                bool wasDeclinedOrDenied = observations.Any(o =>
+                // Sync any concurrent notifications (e.g. arriving OTP mail / reminder) between Planner <-> Worker rounds
+                var latestMsgs = await _store.GetChatMessagesAsync(conversationId, 10, ct);
+                foreach (var n in latestMsgs.Where(m =>
+                             m.Role == "notification" &&
+                             m.CreatedAt >= lastNotifCheckUtc &&
+                             !string.IsNullOrWhiteSpace(m.Content) &&
+                             seenNotifIds.Add(m.Id)))
+                {
+                    var note = $"[Concurrent notification arrived during round {round} ({n.CreatedAt.ToLocalTime():HH:mm:ss})]: {n.Content}";
+                    observations.Add(note);
+                    roundObs.Add(note);
+                }
+                lastNotifCheckUtc = DateTimeOffset.UtcNow;
+
+                wasDeclinedOrDenied = roundObs.Any(o =>
                     o.Contains("declined", StringComparison.OrdinalIgnoreCase) ||
                     o.Contains("denied", StringComparison.OrdinalIgnoreCase));
-                bool hadReadOrHitLimit = plannedSteps.Count > stepLimit ||
-                    completedSteps.Any(s =>
-                        s.EndsWith(":list", StringComparison.OrdinalIgnoreCase) ||
-                        s.EndsWith(":read", StringComparison.OrdinalIgnoreCase) ||
-                        s.EndsWith(":read_dom", StringComparison.OrdinalIgnoreCase) ||
-                        s.EndsWith(":scan", StringComparison.OrdinalIgnoreCase));
+                if (wasDeclinedOrDenied)
+                    break;
 
-                if (!wasDeclinedOrDenied && hadReadOrHitLimit && completedSteps.Count > 0)
+                if (round >= maxRounds)
                 {
-                    planMessages.Add(new("assistant", planResp.Content));
-                    planMessages.Add(new("user", $"Round 1 observations:\n{string.Join("\n\n", observations)}\n\nIf the goal (`{goal}`) requires follow-up execution steps based on the observations above (e.g. deleting/updating the discovered items — note: `manage_schedule` delete supports comma-separated IDs in `id`), output the remaining JSON steps (`{{\"status_note\":\"...\",\"steps\":[...]}}`). If the goal is already satisfied or requires user confirmation first, output `{{\"status_note\":\"\",\"steps\":[]}}`."));
-
-                    var followResp = await _model.CompleteAsync(planMessages, tier, ct);
-                    await _sessions.RecordTokensAsync(plannerSession, followResp.EstimatedTokens, ct: ct);
-                    var (followSteps, followNote) = ParsePlanWithStatus(followResp.Content);
-                    if (followSteps.Count > 0)
-                    {
-                        if (!string.IsNullOrWhiteSpace(followNote))
-                            await onStatusAsync(followNote);
-                        var followLimit = Math.Min(followSteps.Count, _guard.MaxWorkerStepsPerTask);
-                        for (int i = 0; i < followLimit; i++)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            var step = followSteps[i];
-                            var skillName = step.Skill.Trim();
-                            onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerStep", "Worker running {0} ({1}/{2})...", skillName, i + 1, followLimit));
-                            await _worker.RunStepAsync(
-                                conversationId, userPrompt, skillName, step.Args, targetMailId,
-                                confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
-                        }
-                    }
+                    reachedRoundLimit = true;
+                    break;
                 }
 
-                if (plannedSteps.Count >= 2 && completedSteps.Count == stepLimit)
-                {
-                    await _workflowCache.RecordObservedPlanAsync(
-                        conversationId,
-                        goal,
-                        userPrompt,
-                        plannedSteps.Select(s => new CachedWorkflowStep(s.Skill, s.Args)).ToList(),
-                        ct,
-                        prefFacts);
-                }
+                // Feed Worker's round report back to Planner for next-round decision (self-repair, follow-up, or done)
+                planMessages.Add(new("assistant", planResp.Content));
+                planMessages.Add(new("user", PlannerPrompts.BuildPlannerRoundFeedbackPrompt(goal, round, maxRounds, roundObs)));
+            }
+
+            await _sessions.CompleteTaskSessionAsync(
+                workerSession,
+                new SessionHandoff(goal, completedSteps, new List<string>(), new List<string>(), sources.Select(s => s.MailId).ToList()),
+                ct);
+
+            // Cache clean single-round multi-step workflows for 2-bit branch prediction
+            if (roundsExecuted <= 2 && firstRoundSteps is { Count: >= 2 } &&
+                firstRoundExecutedCount == Math.Min(firstRoundSteps.Count, _guard.MaxWorkerStepsPerTask) &&
+                !wasDeclinedOrDenied &&
+                !observations.Any(o => o.Contains("Execution failed", StringComparison.OrdinalIgnoreCase) || o.Contains(" failed:", StringComparison.OrdinalIgnoreCase)))
+            {
+                await _workflowCache.RecordObservedPlanAsync(
+                    conversationId,
+                    goal,
+                    userPrompt,
+                    firstRoundSteps.Select(s => new CachedWorkflowStep(s.Skill, s.Args)).ToList(),
+                    ct,
+                    prefFacts);
             }
         }
-
-        var mainSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Main", ct: ct);
-
-        var activeStylePrompt = _tts.GetActiveStylePrompt() ?? _styles.GetActiveStylePrompt();
-        var finalSysPrompt = PlannerPrompts.BuildFinalReplySystemPrompt(
-            activeStylePrompt,
-            _tts.IsEnabled,
-            _tts.ChatMode,
-            includeTaskStatus: true,
-            _tts.TargetLang,
-            replyLang);
-
-        var finalMessages = new List<ModelMessage>(2 + historyMessages.Count)
-        {
-            new("system", finalSysPrompt)
-        };
-        finalMessages.AddRange(historyMessages);
-        finalMessages.Add(new("user", PlannerPrompts.BuildFinalReplyUserPrompt(userPrompt, observations)));
-
-        var finalResp = await _model.CompleteAsync(finalMessages, tier, ct);
-
-        WorkerAgent.CleanupTempScreenshots(observations);
-        await _sessions.RecordTokensAsync(mainSession, finalResp.EstimatedTokens, ct: ct);
-        var (cleanFinal0, finalChoices) = WorkerAgent.ExtractAndStripChoices(finalResp.Content);
-        var (cleanFinal1, finalTtsText) = WorkerAgent.ExtractAndStripTtsText(cleanFinal0);
-        var (cleanFinal, isTaskDone) = ExtractAndStripTaskStatus(cleanFinal1, finalChoices.Count > 0);
-        if (finalChoices.Count > 0)
-            onChoices?.Invoke(finalChoices);
-        if (!string.IsNullOrWhiteSpace(finalTtsText))
-            onDirectTtsText?.Invoke(finalTtsText);
-        await onReplyAsync(cleanFinal, sources);
-        onTaskCompleted?.Invoke(isTaskDone);
-        _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, completedSteps, observations, cleanFinal);
 
         await _sessions.CompleteTaskSessionAsync(
             plannerSession,
             new SessionHandoff(goal, completedSteps, new List<string>(), new List<string>(), sources.Select(s => s.MailId).ToList()),
             ct);
+
+        return new PlannerReport(
+            Goal: goal,
+            CompletedSteps: completedSteps,
+            Observations: observations,
+            Sources: sources,
+            RoundsExecuted: roundsExecuted,
+            ReachedRoundLimit: reachedRoundLimit,
+            WasDeclinedOrDenied: wasDeclinedOrDenied);
     }
 
     public async Task<TriageResult> TriageMailEventAsync(MailItem mail, string conversationId, CancellationToken ct)
@@ -417,35 +371,21 @@ public sealed class PlannerAgent
         return new TriageResult(urgent, title, summary, reRemindMinutes, actions);
     }
 
-    /// <summary>從回覆中抽離 `[TASK_STATUS: done|waiting]` 標記；若模型未輸出，則有選項按鈕時視為等待中。</summary>
-    private static (string CleanText, bool IsDone) ExtractAndStripTaskStatus(string raw, bool hasChoices)
-    {
-        var text = (raw ?? "").Trim();
-        var m = System.Text.RegularExpressions.Regex.Match(
-            text,
-            @"(?:^|\r?\n)\s*\[TASK_STATUS:\s*(done|waiting)\s*\]\s*(?=$|\r?\n)",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        if (!m.Success)
-            return (text, !hasChoices);
-
-        var isDone = m.Groups[1].Value.Equals("done", StringComparison.OrdinalIgnoreCase);
-        var clean = (text[..m.Index] + text[(m.Index + m.Length)..]).Trim();
-        return (clean, isDone);
-    }
-
-
     private sealed record PlannedStep(string Skill, JsonElement Args);
 
-    /// <summary>解析 Planner 回傳的步驟清單與狀態說明。</summary>
-    private (List<PlannedStep> Steps, string? StatusNote) ParsePlanWithStatus(string raw)
+    /// <summary>解析 Planner 回傳的步驟清單、狀態說明與是否完成旗標。</summary>
+    private (List<PlannedStep> Steps, string? StatusNote, bool Done) ParsePlanWithStatus(string raw)
     {
         var list = new List<PlannedStep>();
         string? statusNote = null;
+        bool done = false;
         try
         {
             using var doc = JsonDocument.Parse(ExtractJson(raw));
             if (doc.RootElement.TryGetProperty("status_note", out var sn))
                 statusNote = sn.GetString()?.Trim();
+            if (doc.RootElement.TryGetProperty("done", out var dn) && dn.ValueKind == JsonValueKind.True)
+                done = true;
             if (doc.RootElement.TryGetProperty("steps", out var stepsEl) && stepsEl.ValueKind == JsonValueKind.Array)
             {
                 foreach (var s in stepsEl.EnumerateArray())
@@ -461,15 +401,13 @@ public sealed class PlannerAgent
         {
             _logger.LogWarning(ex, "Failed to parse Planner JSON: {Raw}", raw);
         }
-        return (list, string.IsNullOrWhiteSpace(statusNote) ? null : statusNote);
+        return (list, statusNote, done);
     }
 
-    /// <summary>擷取文字中最外層 `{...}` JSON 區段，容錯模型附加的說明文字。</summary>
     private static string ExtractJson(string raw)
     {
-        var s = raw.Trim();
-        var first = s.IndexOf('{');
-        var last = s.LastIndexOf('}');
-        return (first >= 0 && last > first) ? s[first..(last + 1)] : s;
+        var start = raw.IndexOf('{');
+        var end = raw.LastIndexOf('}');
+        return start >= 0 && end > start ? raw[start..(end + 1)] : raw;
     }
 }

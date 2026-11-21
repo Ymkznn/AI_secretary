@@ -70,8 +70,24 @@ public sealed record AutoStateRuleRecord(
     int PredictorCounter, // 0..3 (2-bit saturating counter)
     int HitCount,
     int MissCount,
-    string Status, // "Cold" | "Hot" | "Disabled"
-    DateTimeOffset LastSeenAt);
+    string Status, // "Cold" | "Hot" | "Ignored" | "Muted" | "Disabled"
+    DateTimeOffset LastSeenAt,
+    DateTimeOffset? CooldownUntil = null,
+    string? ProposalText = null);
+
+public sealed record BaselineUsageSnapshot(
+    long InputTokens,
+    long OutputTokens,
+    long CacheTokens,
+    long Predictions,
+    long Hits,
+    long Mispredictions,
+    long EstimatedTokensSaved,
+    DateTimeOffset RecordedAt)
+{
+    public long TotalTokens => InputTokens + OutputTokens + CacheTokens;
+    public double HitRatePercent => Predictions == 0 ? 0.0 : Math.Round(Hits * 100.0 / Predictions, 1);
+}
 
 public sealed record BranchTelemetryStats(
     int TotalWorkflows,

@@ -48,13 +48,16 @@ public sealed class MailSyncService
         var mode = string.IsNullOrWhiteSpace(source) ? "all" : source.Trim().ToLowerInvariant();
         int ewsCount = 0;
         int gmailCount = 0;
+        var newMails = new List<MailItem>();
         var notes = new List<string>();
 
         if ((mode is "all" or "ews" or "outlook") && (_mailBroker.IsConfigured || mode != "all"))
         {
             try
             {
-                ewsCount = await PollEwsOnceAsync(conversationId, onNotifyAsync, ct);
+                var ewsNew = await PollEwsOnceAsync(conversationId, onNotifyAsync, ct);
+                ewsCount = ewsNew.Count;
+                newMails.AddRange(ewsNew);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -67,7 +70,9 @@ public sealed class MailSyncService
         {
             try
             {
-                gmailCount = await PollGmailOnceAsync(conversationId, onNotifyAsync, ct);
+                var gmailNew = await PollGmailOnceAsync(conversationId, onNotifyAsync, ct);
+                gmailCount = gmailNew.Count;
+                newMails.AddRange(gmailNew);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -79,21 +84,29 @@ public sealed class MailSyncService
         var summary = $"Mail sync completed: EWS={ewsCount}, Gmail={gmailCount}.";
         if (notes.Count > 0)
             summary += " (" + string.Join("; ", notes) + ")";
+        if (newMails.Count > 0)
+        {
+            var lines = newMails
+                .OrderByDescending(m => m.ReceivedAt)
+                .Take(10)
+                .Select(m => $"- id={m.Id} | from={m.SenderName} | subject=\"{m.Subject}\" | at={m.ReceivedAt.ToLocalTime():MM-dd HH:mm} | snippet={m.Snippet}");
+            summary += "\nNew emails:\n" + string.Join("\n", lines);
+        }
         return summary;
     }
 
-    private async Task<int> PollEwsOnceAsync(
+    private async Task<List<MailItem>> PollEwsOnceAsync(
         string conversationId,
         Func<string, MailItem, string, string, int, List<NotificationButtonOption>?, Task> onNotifyAsync,
         CancellationToken ct)
     {
         var cursor = await _store.GetMailSyncCursorAsync(ct);
         var mails = await _mailBroker.FetchRecentMailsAsync(cursor, ct);
-        if (mails.Count == 0) return 0;
+        var processed = new List<MailItem>();
+        if (mails.Count == 0) return processed;
 
         var newest = cursor ?? DateTimeOffset.MinValue;
         var seenInBatch = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        int processed = 0;
 
         foreach (var mail in mails.OrderByDescending(m => m.ReceivedAt))
         {
@@ -106,7 +119,7 @@ public sealed class MailSyncService
             if (!isNew) continue;
             if (!seenInBatch.Add($"{mail.SenderEmail}|{mail.Subject}")) continue;
 
-            processed++;
+            processed.Add(mail);
             if (decision == MailRuleDecision.NeedsAiTriage)
             {
                 _ = Task.Run(async () =>
@@ -138,14 +151,15 @@ public sealed class MailSyncService
         return processed;
     }
 
-    private async Task<int> PollGmailOnceAsync(
+    private async Task<List<MailItem>> PollGmailOnceAsync(
         string conversationId,
         Func<string, MailItem, string, string, int, List<NotificationButtonOption>?, Task> onNotifyAsync,
         CancellationToken ct)
     {
+        var processed = new List<MailItem>();
         var mailSkill = _skillRegistry.FindByCapability("mail");
         if (!_gmail.IsAuthorized || (mailSkill is not null && !mailSkill.IsEnabled))
-            return 0;
+            return processed;
 
         var cursorRaw = await _store.GetSyncValueAsync("gmail_sync_cursor", ct);
         DateTimeOffset? cursor = DateTimeOffset.TryParse(cursorRaw, out var c) ? c : null;
@@ -155,18 +169,17 @@ public sealed class MailSyncService
         {
             if (!cursor.HasValue)
                 await _store.SetSyncValueAsync("gmail_sync_cursor", DateTimeOffset.UtcNow.ToString("O"), ct);
-            return 0;
+            return processed;
         }
 
         if (!cursor.HasValue)
         {
             var baseline = mails.Max(m => m.ReceivedAt);
             await _store.SetSyncValueAsync("gmail_sync_cursor", baseline.ToString("O"), ct);
-            return 0;
+            return processed;
         }
 
         var newest = cursor.Value;
-        int processed = 0;
         foreach (var mail in mails.OrderByDescending(m => m.ReceivedAt))
         {
             if (mail.ReceivedAt > newest) newest = mail.ReceivedAt;
@@ -178,7 +191,7 @@ public sealed class MailSyncService
                 new MailEventRecord(eventId, mail.Id, decision.ToString(), decision == MailRuleDecision.Ignore, DateTimeOffset.UtcNow), ct);
             if (!isNew) continue;
 
-            processed++;
+            processed.Add(mail);
             if (decision == MailRuleDecision.NeedsAiTriage)
             {
                 _ = Task.Run(async () =>

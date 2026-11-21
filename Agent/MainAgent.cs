@@ -28,6 +28,7 @@ public sealed class MainAgent
     private readonly WorkflowCacheService _workflowCache;
     private readonly MemoryReflectionAgent _memoryReflection;
     private readonly StateMachineAgent _stateMachine;
+    private readonly SandboxService _sandbox;
     private readonly ILogger<MainAgent> _logger;
 
     public MainAgent(
@@ -45,6 +46,7 @@ public sealed class MainAgent
         WorkflowCacheService workflowCache,
         MemoryReflectionAgent memoryReflection,
         StateMachineAgent stateMachine,
+        SandboxService sandbox,
         ILogger<MainAgent> logger)
     {
         _store = store;
@@ -61,6 +63,7 @@ public sealed class MainAgent
         _workflowCache = workflowCache;
         _memoryReflection = memoryReflection;
         _stateMachine = stateMachine;
+        _sandbox = sandbox;
         _logger = logger;
     }
 
@@ -96,7 +99,7 @@ public sealed class MainAgent
         var mainSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Main", ct: ct);
 
         var recent = await _store.GetChatMessagesAsync(conversationId, 80, ct);
-        var historyMessages = BuildHistoryModelMessages(recent, userPrompt, maxMessages: 16, perMessageMaxChars: 3000, totalMaxChars: 20000);
+        var historyMessages = BuildHistoryModelMessages(recent, userPrompt, maxMessages: 32, perMessageMaxChars: 3000, totalMaxChars: 36000);
 
         var recalledFacts = await _store.RecallRelevantFactsAsync(conversationId, userPrompt, 5, ct);
         var factsContext = MainAgentPrompts.FormatFactsContext(recalledFacts);
@@ -135,9 +138,19 @@ public sealed class MainAgent
             factsContext,
             userPrompt,
             activeTasksContext,
-            activeWindowContext);
+            activeWindowContext,
+            _sandbox.RootPath,
+            _sandbox.GetTrustedPaths());
 
         // Fast path: 2-bit branch prediction for repeated read-only single-step intents (skips MainAgent routing LLM).
+        var turnStartedUtc = DateTimeOffset.UtcNow;
+        var basePromptMessages = new List<ModelMessage>(2 + historyMessages.Count)
+        {
+            new("system", effectiveSystemPrompt)
+        };
+        basePromptMessages.AddRange(historyMessages);
+        basePromptMessages.Add(new("user", dynamicUserPrompt));
+
         if (string.IsNullOrWhiteSpace(targetMailId) &&
             string.IsNullOrWhiteSpace(preferredLogicalTaskId) &&
             (activePlannerTasks is null || activePlannerTasks.Count == 0) &&
@@ -149,6 +162,7 @@ public sealed class MainAgent
                 var predSkill = predStep.Skill;
                 var predArgs = predStep.Args;
                 var predAck = await _localizer.TextAsync("DefaultDispatchAck", "Working on it...", Array.Empty<object?>(), ct);
+                var syntheticRouteJson = JsonSerializer.Serialize(new { action = "run_skill", skill = predSkill, ack = predAck });
 
                 if (onDispatchBackground is not null)
                 {
@@ -157,16 +171,20 @@ public sealed class MainAgent
 
                     onDispatchBackground(async (bgCt, bgReplyAsync, bgDirectTtsText, bgChoices) =>
                     {
-                        var (handled, summary, sources) = await _worker.ExecuteSingleSkillAsync(
+                        var report = await _worker.ExecuteSingleSkillRawAsync(
                             conversationId, userPrompt, predSkill, predArgs, targetMailId, confirmAsync,
                             async s => { onStageChanged?.Invoke("worker", s); await onStatusAsync(s); },
-                            ModelTier.Simple, bgCt, bgDirectTtsText, bgChoices);
-                        if (handled)
+                            bgCt, taskId);
+                        if (report.Handled)
                         {
                             await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: true, estimatedTokensSaved: 350, bgCt);
                             onSingleSkillFinished?.Invoke(taskId);
                             onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", predSkill));
-                            await bgReplyAsync(summary, sources);
+                            await SynthesizeFinalReplyAsync(
+                                conversationId, mainSession, basePromptMessages, syntheticRouteJson,
+                                "Worker", userPrompt, report.CompletedSteps, report.Observations, report.Sources,
+                                turnStartedUtc, includeTaskStatus: false, ModelTier.Simple,
+                                bgReplyAsync, bgDirectTtsText, bgChoices, onTaskCompleted: null, extraNote: null, bgCt);
                             return;
                         }
 
@@ -175,11 +193,18 @@ public sealed class MainAgent
                         var plannerTaskId = resolveLogicalTaskId is not null
                             ? resolveLogicalTaskId("call_planner", null, userPrompt)
                             : taskId;
-                        bool isDone = true;
-                        await _planner.ExecuteGoalAsync(
+                        var planReport = await _planner.ExecuteGoalAsync(
                             conversationId, plannerTaskId, userPrompt, userPrompt, targetMailId, confirmAsync,
                             async s => { onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
-                            bgReplyAsync, onStageChanged, ModelTier.Simple, bgCt, bgDirectTtsText, bgChoices, done => isDone = done);
+                            onStageChanged, ModelTier.Simple, bgCt);
+                        bool isDone = true;
+                        await SynthesizeFinalReplyAsync(
+                            conversationId, mainSession, basePromptMessages, syntheticRouteJson,
+                            "Planner", userPrompt, planReport.CompletedSteps, planReport.Observations, planReport.Sources,
+                            turnStartedUtc, includeTaskStatus: true, ModelTier.Simple,
+                            bgReplyAsync, bgDirectTtsText, bgChoices, done => isDone = done,
+                            planReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({planReport.RoundsExecuted})." : null,
+                            bgCt);
                         onPlannerTaskFinished?.Invoke(plannerTaskId, isDone);
                     });
                     return;
@@ -187,15 +212,19 @@ public sealed class MainAgent
 
                 await onStatusAsync(predAck);
                 onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerDispatch", "MainAgent dispatched Worker ({0}, {1})", predSkill, "Predicted"));
-                var (handledSyncPred, summarySyncPred, sourcesSyncPred) = await _worker.ExecuteSingleSkillAsync(
+                var syncReport = await _worker.ExecuteSingleSkillRawAsync(
                     conversationId, userPrompt, predSkill, predArgs, targetMailId, confirmAsync,
-                    s => onStatusAsync(s), ModelTier.Simple, ct, onDirectTtsText, onChoices);
-                if (handledSyncPred)
+                    s => onStatusAsync(s), ct, taskId);
+                if (syncReport.Handled)
                 {
                     await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: true, estimatedTokensSaved: 350, ct);
                     onSingleSkillFinished?.Invoke(taskId);
                     onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", predSkill));
-                    await onReplyAsync(summarySyncPred, sourcesSyncPred);
+                    await SynthesizeFinalReplyAsync(
+                        conversationId, mainSession, basePromptMessages, syntheticRouteJson,
+                        "Worker", userPrompt, syncReport.CompletedSteps, syncReport.Observations, syncReport.Sources,
+                        turnStartedUtc, includeTaskStatus: false, ModelTier.Simple,
+                        onReplyAsync, onDirectTtsText, onChoices, onTaskCompleted: null, extraNote: null, ct);
                     return;
                 }
 
@@ -203,13 +232,7 @@ public sealed class MainAgent
             }
         }
 
-        var routeMessages = new List<ModelMessage>(2 + historyMessages.Count)
-        {
-            new("system", effectiveSystemPrompt)
-        };
-        routeMessages.AddRange(historyMessages);
-        routeMessages.Add(new("user", dynamicUserPrompt));
-
+        var routeMessages = basePromptMessages;
         var routeResp = await _model.CompleteAsync(routeMessages, ModelTier.Simple, ct);
 
         await _sessions.RecordTokensAsync(mainSession, routeResp.EstimatedTokens, ct: ct);
@@ -259,18 +282,21 @@ public sealed class MainAgent
 
                 onDispatchBackground(async (bgCt, bgReplyAsync, bgDirectTtsText, bgChoices) =>
                 {
-                    var (handled, summary, sources) = await _worker.ExecuteSingleSkillAsync(
+                    var report = await _worker.ExecuteSingleSkillRawAsync(
                         conversationId, userPrompt, skill, args, targetMailId, confirmAsync,
                         async s => { onStageChanged?.Invoke("worker", s); await onStatusAsync(s); },
-                        tier, bgCt, bgDirectTtsText, bgChoices);
-                    if (handled)
+                        bgCt, taskId);
+                    if (report.Handled)
                     {
                         await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, bgCt);
                         await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, bgCt);
                         onSingleSkillFinished?.Invoke(taskId);
                         onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
-                        await bgReplyAsync(summary, sources);
-                        _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, new[] { skill }, new[] { summary }, summary);
+                        await SynthesizeFinalReplyAsync(
+                            conversationId, mainSession, routeMessages, routeResp.Content,
+                            "Worker", userPrompt, report.CompletedSteps, report.Observations, report.Sources,
+                            turnStartedUtc, includeTaskStatus: false, tier,
+                            bgReplyAsync, bgDirectTtsText, bgChoices, onTaskCompleted: null, extraNote: null, bgCt);
                         return;
                     }
 
@@ -278,22 +304,18 @@ public sealed class MainAgent
                     var plannerTaskId = resolveLogicalTaskId is not null
                         ? resolveLogicalTaskId("call_planner", targetTaskId, effectiveGoal)
                         : taskId;
-                    bool isDone = true;
-                    await _planner.ExecuteGoalAsync(
-                        conversationId,
-                        plannerTaskId,
-                        effectiveGoal,
-                        userPrompt,
-                        targetMailId,
-                        confirmAsync,
+                    var planReport = await _planner.ExecuteGoalAsync(
+                        conversationId, plannerTaskId, effectiveGoal, userPrompt, targetMailId, confirmAsync,
                         async s => { onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
-                        bgReplyAsync,
-                        onStageChanged,
-                        tier,
-                        bgCt,
-                        bgDirectTtsText,
-                        bgChoices,
-                        done => isDone = done);
+                        onStageChanged, tier, bgCt);
+                    bool isDone = true;
+                    await SynthesizeFinalReplyAsync(
+                        conversationId, mainSession, routeMessages, routeResp.Content,
+                        "Planner", userPrompt, planReport.CompletedSteps, planReport.Observations, planReport.Sources,
+                        turnStartedUtc, includeTaskStatus: true, tier,
+                        bgReplyAsync, bgDirectTtsText, bgChoices, done => isDone = done,
+                        planReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({planReport.RoundsExecuted})." : null,
+                        bgCt);
                     onPlannerTaskFinished?.Invoke(plannerTaskId, isDone);
                 });
                 return;
@@ -306,16 +328,19 @@ public sealed class MainAgent
                     ? onStatusAsync(s)
                     : onStatusAsync($"{dispatchNote} ({s})");
             onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerDispatch", "MainAgent dispatched Worker ({0}, {1})", skill, tier.ToString()));
-            var (handledSync, summarySync, sourcesSync) = await _worker.ExecuteSingleSkillAsync(
-                conversationId, userPrompt, skill, args, targetMailId, confirmAsync, workerStatusAsync, tier, ct, onDirectTtsText, onChoices);
-            if (handledSync)
+            var syncReport = await _worker.ExecuteSingleSkillRawAsync(
+                conversationId, userPrompt, skill, args, targetMailId, confirmAsync, workerStatusAsync, ct, taskId);
+            if (syncReport.Handled)
             {
                 await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, ct);
                 await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, ct);
                 onSingleSkillFinished?.Invoke(taskId);
                 onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
-                await onReplyAsync(summarySync, sourcesSync);
-                _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, new[] { skill }, new[] { summarySync }, summarySync);
+                await SynthesizeFinalReplyAsync(
+                    conversationId, mainSession, routeMessages, routeResp.Content,
+                    "Worker", userPrompt, syncReport.CompletedSteps, syncReport.Observations, syncReport.Sources,
+                    turnStartedUtc, includeTaskStatus: false, tier,
+                    onReplyAsync, onDirectTtsText, onChoices, onTaskCompleted: null, extraNote: null, ct);
                 return;
             }
         }
@@ -335,22 +360,18 @@ public sealed class MainAgent
 
             onDispatchBackground(async (bgCt, bgReplyAsync, bgDirectTtsText, bgChoices) =>
             {
-                bool isDone = true;
-                await _planner.ExecuteGoalAsync(
-                    conversationId,
-                    logicalTaskId,
-                    effectiveGoal,
-                    userPrompt,
-                    targetMailId,
-                    confirmAsync,
+                var planReport = await _planner.ExecuteGoalAsync(
+                    conversationId, logicalTaskId, effectiveGoal, userPrompt, targetMailId, confirmAsync,
                     async s => { onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
-                    bgReplyAsync,
-                    onStageChanged,
-                    tier,
-                    bgCt,
-                    bgDirectTtsText,
-                    bgChoices,
-                    done => isDone = done);
+                    onStageChanged, tier, bgCt);
+                bool isDone = true;
+                await SynthesizeFinalReplyAsync(
+                    conversationId, mainSession, routeMessages, routeResp.Content,
+                    "Planner", userPrompt, planReport.CompletedSteps, planReport.Observations, planReport.Sources,
+                    turnStartedUtc, includeTaskStatus: true, tier,
+                    bgReplyAsync, bgDirectTtsText, bgChoices, done => isDone = done,
+                    planReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({planReport.RoundsExecuted})." : null,
+                    bgCt);
                 onPlannerTaskFinished?.Invoke(logicalTaskId, isDone);
             });
             return;
@@ -363,23 +384,139 @@ public sealed class MainAgent
             string.Equals(s, plannerNote, StringComparison.Ordinal)
                 ? onStatusAsync(s)
                 : onStatusAsync($"{plannerNote} ({s})");
+        var syncPlanReport = await _planner.ExecuteGoalAsync(
+            conversationId, logicalTaskId, effectiveGoal, userPrompt, targetMailId, confirmAsync,
+            plannerStatusAsync, onStageChanged, tier, ct);
         bool syncDone = true;
-        await _planner.ExecuteGoalAsync(
-            conversationId,
-            logicalTaskId,
-            effectiveGoal,
-            userPrompt,
-            targetMailId,
-            confirmAsync,
-            plannerStatusAsync,
-            onReplyAsync,
-            onStageChanged,
-            tier,
-            ct,
-            onDirectTtsText,
-            onChoices,
-            done => syncDone = done);
+        await SynthesizeFinalReplyAsync(
+            conversationId, mainSession, routeMessages, routeResp.Content,
+            "Planner", userPrompt, syncPlanReport.CompletedSteps, syncPlanReport.Observations, syncPlanReport.Sources,
+            turnStartedUtc, includeTaskStatus: true, tier,
+            onReplyAsync, onDirectTtsText, onChoices, done => syncDone = done,
+            syncPlanReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({syncPlanReport.RoundsExecuted})." : null,
+            ct);
         onPlannerTaskFinished?.Invoke(logicalTaskId, syncDone);
+    }
+
+    /// <summary>
+    /// 作為唯一對外窗口，由 MainAgent 統一消化 Worker / Planner 回報與中途背景通知，
+    /// 並直接接續已熱快取的 MainAgent 對話前綴產生最終給使用者的自然語言回覆（重用 Prompt Cache）。
+    /// </summary>
+    private async Task SynthesizeFinalReplyAsync(
+        string conversationId,
+        AgentSessionRecord mainSession,
+        IReadOnlyList<ModelMessage> cachedPrefixMessages,
+        string routingAssistantJson,
+        string sourceLabel,
+        string userPrompt,
+        IReadOnlyList<string> completedSteps,
+        List<string> observations,
+        List<MailSourceRef> sources,
+        DateTimeOffset turnStartedUtc,
+        bool includeTaskStatus,
+        ModelTier tier,
+        Func<string, List<MailSourceRef>, Task> onReplyAsync,
+        Action<string>? onDirectTtsText,
+        Action<IReadOnlyList<string>>? onChoices,
+        Action<bool>? onTaskCompleted,
+        string? extraNote,
+        CancellationToken ct)
+    {
+        // Sync any background notifications (mail triage, reminders, watchers) delivered while Worker/Planner ran
+        var latestMsgs = await _store.GetChatMessagesAsync(conversationId, 10, ct);
+        foreach (var n in latestMsgs.Where(m =>
+                     m.Role == "notification" &&
+                     m.CreatedAt >= turnStartedUtc &&
+                     !string.IsNullOrWhiteSpace(m.Content)))
+        {
+            var note = $"[Concurrent notification already shown to user during this turn ({n.CreatedAt.ToLocalTime():HH:mm:ss})]: {n.Content}";
+            if (!observations.Any(o => o.Contains(n.Content, StringComparison.Ordinal)))
+                observations.Add(note);
+        }
+
+        var synthesisPrompt = PlannerPrompts.BuildMainAgentReportSynthesisPrompt(
+            sourceLabel,
+            completedSteps,
+            observations,
+            includeTaskStatus,
+            _tts.IsEnabled,
+            _tts.ChatMode,
+            _tts.TargetLang,
+            GetReplyLanguage(),
+            extraNote);
+
+        var finalMessages = new List<ModelMessage>(cachedPrefixMessages.Count + 2);
+        finalMessages.AddRange(cachedPrefixMessages);
+        finalMessages.Add(new("assistant", routingAssistantJson));
+        finalMessages.Add(new("user", synthesisPrompt));
+
+        var finalResp = await _model.CompleteAsync(finalMessages, tier, ct);
+        WorkerAgent.CleanupTempScreenshots(observations);
+        await _sessions.RecordTokensAsync(mainSession, finalResp.EstimatedTokens, ct: ct);
+
+        var (clean0, finalChoices) = WorkerAgent.ExtractAndStripChoices(finalResp.Content);
+        var (clean1, finalTtsText) = WorkerAgent.ExtractAndStripTtsText(clean0);
+        var (cleanFinal, isTaskDone) = ExtractAndStripTaskStatus(clean1, finalChoices.Count > 0);
+
+        if (finalChoices.Count > 0)
+            onChoices?.Invoke(finalChoices);
+        if (!string.IsNullOrWhiteSpace(finalTtsText))
+            onDirectTtsText?.Invoke(finalTtsText);
+        await onReplyAsync(cleanFinal, sources);
+        onTaskCompleted?.Invoke(isTaskDone);
+
+        if (completedSteps.Count > 0)
+            _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, completedSteps, observations, cleanFinal);
+    }
+
+    /// <summary>供排程非靜默技能執行完畢後，統一透過 MainAgent 以角色語氣摘要後推播給使用者。</summary>
+    public async Task<string> SummarizeScheduledSkillAsync(
+        string conversationId,
+        string prompt,
+        WorkerReport report,
+        CancellationToken ct = default)
+    {
+        if (!report.Handled || report.Observations.Count == 0)
+            return "";
+
+        var mainSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Main", ct: ct);
+        var activeStylePrompt = _tts.GetActiveStylePrompt() ?? _styles.GetActiveStylePrompt();
+        var prefFacts = await _store.RecallRelevantUserPrefFactsAsync(conversationId, prompt, 5, ct);
+        var prefContext = MainAgentPrompts.FormatPreferencesContext(prefFacts);
+        var sys = PlannerPrompts.BuildFinalReplySystemPrompt(
+            activeStylePrompt,
+            ttsEnabled: false,
+            _tts.ChatMode,
+            includeTaskStatus: false,
+            _tts.TargetLang,
+            GetReplyLanguage());
+
+        var resp = await _model.CompleteAsync(new[]
+        {
+            new ModelMessage("system", sys),
+            new ModelMessage("user", PlannerPrompts.BuildSingleSkillUserPrompt(prefContext, prompt, report.Observations))
+        }, ModelTier.Simple, ct);
+
+        WorkerAgent.CleanupTempScreenshots(report.Observations);
+        await _sessions.RecordTokensAsync(mainSession, resp.EstimatedTokens, ct: ct);
+        var (clean0, _) = WorkerAgent.ExtractAndStripChoices(resp.Content);
+        var (clean1, _) = WorkerAgent.ExtractAndStripTtsText(clean0);
+        return clean1;
+    }
+
+    private static (string CleanText, bool IsDone) ExtractAndStripTaskStatus(string raw, bool hasChoices)
+    {
+        var text = (raw ?? "").Trim();
+        var m = System.Text.RegularExpressions.Regex.Match(
+            text,
+            @"(?:^|\r?\n)\s*\[TASK_STATUS:\s*(done|waiting)\s*\]\s*(?=$|\r?\n)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!m.Success)
+            return (text, !hasChoices);
+
+        var isDone = m.Groups[1].Value.Equals("done", StringComparison.OrdinalIgnoreCase);
+        var clean = (text[..m.Index] + text[(m.Index + m.Length)..]).Trim();
+        return (clean, isDone);
     }
 
     /// <summary>
@@ -564,15 +701,15 @@ public sealed class MainAgent
             var rawContent = m.Role == "notification"
                 ? $"[System Notification] {m.Content}"
                 : m.Content;
-            var keepAttachments = m.Role == "user" && i >= eligible.Count - 6 && IsFollowedByError(eligible, i);
+            // Keep historical messages immutable so prefix cache never invalidates as messages age.
             var content = AttachmentExtractor.AttachmentPattern.Replace(
                 rawContent,
                 match =>
                 {
                     var name = Path.GetFileName(match.Groups[1].Value.Trim());
-                    if (name.StartsWith("screen_", StringComparison.OrdinalIgnoreCase))
-                        return $"[History screenshot: {name}]";
-                    return keepAttachments ? match.Value : $"[History attachment: {name}]";
+                    return name.StartsWith("screen_", StringComparison.OrdinalIgnoreCase)
+                        ? $"[History screenshot: {name}]"
+                        : $"[History attachment: {name}]";
                 });
             contents.Add((role, TruncatePreservingAttachments(content, perMessageMaxChars)));
         }
@@ -595,9 +732,10 @@ public sealed class MainAgent
 
         if (startIdx < 0)
         {
-            // Re-anchor with headroom (~60% of both budgets) so the same prefix can be reused for several turns.
-            var targetMessages = Math.Max(1, (int)Math.Ceiling(maxMessages * 0.6));
-            var targetChars = (int)(totalMaxChars * 0.6);
+            // Re-anchor with generous headroom (~50% of both budgets) so the exact same prefix
+            // stays cache-hot for ~8+ turns before advancing in one batch.
+            var targetMessages = Math.Max(1, (int)Math.Ceiling(maxMessages * 0.5));
+            var targetChars = (int)(totalMaxChars * 0.5);
             startIdx = eligible.Count - 1;
             int sum = contents[startIdx].Content.Length;
             while (startIdx > 0

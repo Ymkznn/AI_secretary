@@ -304,6 +304,7 @@ public sealed class SecretaryController : IDisposable
             _boostedPollArgsJson = string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson;
             _boostedPollUntilUtc = DateTimeOffset.UtcNow.AddSeconds(Math.Clamp(secs, 15, 300));
         };
+        _stateMachine.ProposalRequested += OnStateMachineProposal;
         _activity.WindowFocused += (target, url) =>
             _ = _stateMachine.HandleWindowFocusAsync(ConversationId, target, url, _appCts.Token);
         _activity.Start();
@@ -627,6 +628,25 @@ public sealed class SecretaryController : IDisposable
         return (model, endpoint, inTok, outTok, cacheTok);
     }
 
+    public async Task<BaselineUsageSnapshot?> GetBaselineUsageInfoAsync()
+    {
+        var ct = _appCts.Token;
+        var recordedRaw = await _store.GetSyncValueAsync("baseline_recorded_at", ct);
+        if (string.IsNullOrWhiteSpace(recordedRaw) || !DateTimeOffset.TryParse(recordedRaw, out var recordedAt))
+            return null;
+
+        long ReadCounter(string? raw) => long.TryParse(raw, out var v) ? v : 0L;
+        return new BaselineUsageSnapshot(
+            InputTokens: ReadCounter(await _store.GetSyncValueAsync("baseline_tokens_input", ct)),
+            OutputTokens: ReadCounter(await _store.GetSyncValueAsync("baseline_tokens_output", ct)),
+            CacheTokens: ReadCounter(await _store.GetSyncValueAsync("baseline_tokens_cache", ct)),
+            Predictions: ReadCounter(await _store.GetSyncValueAsync("baseline_branch_predictions", ct)),
+            Hits: ReadCounter(await _store.GetSyncValueAsync("baseline_branch_hits", ct)),
+            Mispredictions: ReadCounter(await _store.GetSyncValueAsync("baseline_branch_mispredictions", ct)),
+            EstimatedTokensSaved: ReadCounter(await _store.GetSyncValueAsync("baseline_branch_saved", ct)),
+            RecordedAt: recordedAt);
+    }
+
     public async Task<(string SimpleEp, string SimpleKey, string SimpleModel, string ComplexEp, string ComplexKey, string ComplexModel)> GetLlmProfilesAsync()
     {
         return (
@@ -713,6 +733,13 @@ public sealed class SecretaryController : IDisposable
 
     public async Task SendUserPromptAsync(string prompt, string? targetMailId = null, string? replyToLogicalTaskId = null)
     {
+        if (!string.IsNullOrWhiteSpace(replyToLogicalTaskId) &&
+            replyToLogicalTaskId.StartsWith("state-propose:", StringComparison.Ordinal))
+        {
+            await HandleStateMachineProposalResponseAsync(replyToLogicalTaskId, prompt);
+            return;
+        }
+
         _lastUserActivityUtc = DateTimeOffset.UtcNow;
         var taskId = Guid.NewGuid().ToString("N");
         var appCt = _appCts.Token;
@@ -1322,6 +1349,50 @@ public sealed class SecretaryController : IDisposable
     {
         await _store.DeleteCalendarEventAsync(eventId, _appCts.Token);
         AgentsChanged?.Invoke();
+    }
+
+    private void OnStateMachineProposal(StateMachineProposal proposal)
+    {
+        if (IsDndActive() || Volatile.Read(ref _mainTurnActiveCount) > 0)
+            return;
+
+        var logicalId = $"state-propose:{proposal.TriggerKey}";
+        UpsertPinnedConfirmation(logicalId, proposal.Title, proposal.ProposalMessage, proposal.Choices);
+    }
+
+    private async Task HandleStateMachineProposalResponseAsync(string logicalId, string choice)
+    {
+        var triggerKey = logicalId["state-propose:".Length..];
+        RemovePinnedConfirmation(logicalId);
+        ClearChoices(removePinnedChatChoice: false);
+
+        var trimmed = (choice ?? "").Trim();
+        string replyText;
+        if (string.Equals(trimmed, StateMachineAgent.ChoiceSnooze, StringComparison.OrdinalIgnoreCase))
+        {
+            await _stateMachine.SnoozeProposalAsync(triggerKey, TimeSpan.FromHours(3), _appCts.Token);
+            replyText = "好，這次先不打擾你，等幾小時後或你需要的時候再說。";
+        }
+        else if (string.Equals(trimmed, StateMachineAgent.ChoiceMute, StringComparison.OrdinalIgnoreCase))
+        {
+            await _stateMachine.MuteProposalAsync(triggerKey, _appCts.Token);
+            replyText = "了解，這頁以後不主動問了；如果你改天自己又叫我處理，我再重新記起來。";
+        }
+        else
+        {
+            replyText = await _stateMachine.AcceptProposalAsync(ConversationId, triggerKey, _appCts.Token);
+        }
+
+        var msg = new ChatMessageRecord
+        {
+            ConversationId = ConversationId,
+            Role = "assistant",
+            Content = replyText,
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        await _store.UpsertChatMessageAsync(msg, _appCts.Token);
+        StateChanged?.Invoke();
+        ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReply", "AI Secretary Reply"), replyText);
     }
 
     private void UpsertPinnedConfirmation(string logicalTaskId, string goal, string? replySummary, IReadOnlyList<string>? choices)
@@ -1942,7 +2013,7 @@ public sealed class SecretaryController : IDisposable
                 return;
             }
 
-            var (ok, reply, _) = await _worker.ExecuteSingleSkillAsync(
+            var report = await _worker.ExecuteSingleSkillRawAsync(
                 ConversationId,
                 prompt,
                 r.SkillName!,
@@ -1950,10 +2021,13 @@ public sealed class SecretaryController : IDisposable
                 r.RelatedMailId,
                 confirmAsync: (_, _) => Task.FromResult(false),
                 onStatusAsync: _ => Task.CompletedTask,
-                ModelTier.Simple,
                 ct);
 
-            if (ok && !string.IsNullOrWhiteSpace(reply)
+            var reply = report.Handled
+                ? await _mainAgent.SummarizeScheduledSkillAsync(ConversationId, prompt, report, ct)
+                : "";
+
+            if (report.Handled && !string.IsNullOrWhiteSpace(reply)
                 && !reply.Trim().Equals("NO_NOTIFY", StringComparison.OrdinalIgnoreCase))
             {
                 await PushPetMessageAsync($"⏰ {r.Title}：\n{reply.Trim()}", ct);

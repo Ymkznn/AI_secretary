@@ -7,10 +7,11 @@ using AiSecretary.Desktop.Services;
 using Brushes = System.Windows.Media.Brushes;
 using RichTextBox = System.Windows.Controls.RichTextBox;
 using TextBox = System.Windows.Controls.TextBox;
+using UiAppearance = Wpf.Ui.Controls.ControlAppearance;
 
 namespace AiSecretary.Desktop;
 
-public partial class ChatHistoryWindow : Window
+public partial class ChatHistoryWindow : Wpf.Ui.Controls.FluentWindow
 {
     private readonly SecretaryController _controller;
     private bool _isDark;
@@ -18,8 +19,13 @@ public partial class ChatHistoryWindow : Window
 
     public ChatHistoryWindow(SecretaryController controller)
     {
+        FluentThemeHelper.EnsureSystemAccent();
         InitializeComponent();
         _controller = controller;
+
+        _isDark = ThemeHelper.IsDarkEffective("System");
+        FluentThemeHelper.Apply(this, _isDark);
+        SourceInitialized += (_, _) => FluentThemeHelper.Apply(this, _isDark);
 
         _controller.StateChanged += OnStateChanged;
         _controller.ThemeChanged += OnThemeChanged;
@@ -51,25 +57,7 @@ public partial class ChatHistoryWindow : Window
     private void ApplyTheme(string mode)
     {
         _isDark = ThemeHelper.IsDarkEffective(mode);
-        Win11BackdropHelper.Apply(this, _isDark);
-
-        Background = Brush(_isDark ? "#0F172A" : "#E8EEF5");
-        HeaderBorder.Background = Brush(_isDark ? "#1E293B" : "#FFFFFF");
-        HeaderBorder.BorderBrush = Brush(_isDark ? "#334155" : "#CBD5E1");
-        HeaderTitle.Foreground = Brush(_isDark ? "#F8FAFC" : "#0F172A");
-        HeaderSubtitle.Foreground = Brush(_isDark ? "#94A3B8" : "#64748B");
-
-        InputBorder.Background = Brush(_isDark ? "#1E293B" : "#FFFFFF");
-        InputBorder.BorderBrush = Brush(_isDark ? "#334155" : "#CBD5E1");
-        InputBoxFrame.Background = Brush(_isDark ? "#0F172A" : "#F8FAFC");
-        InputBoxFrame.BorderBrush = Brush(_isDark ? "#334155" : "#CBD5E1");
-        ChatInputBox.Foreground = Brush(_isDark ? "#F8FAFC" : "#0F172A");
-        ChatInputBox.CaretBrush = Brush(_isDark ? "#F8FAFC" : "#0F172A");
-
-        ScrollBottomBtn.Background = Brush(_isDark ? "#334155" : "#E2E8F0");
-        ScrollBottomBtn.Foreground = Brush(_isDark ? "#F8FAFC" : "#0F172A");
-        ScrollBottomBtn.BorderThickness = new Thickness(0);
-
+        FluentThemeHelper.Apply(this, _isDark);
         UpdateSendStopButton();
     }
 
@@ -78,20 +66,17 @@ public partial class ChatHistoryWindow : Window
         if (_controller.IsMainTurnActive)
         {
             SendStopBtn.Content = "停止";
-            SendStopBtn.Background = Brush("#DC2626");
-            SendStopBtn.Foreground = Brushes.White;
+            SendStopBtn.Appearance = UiAppearance.Danger;
             HeaderSubtitle.Text = "AI 秘書處理中…";
         }
         else
         {
             SendStopBtn.Content = "傳送";
-            SendStopBtn.Background = Brush("#06C755");
-            SendStopBtn.Foreground = Brushes.White;
+            SendStopBtn.Appearance = UiAppearance.Primary;
             HeaderSubtitle.Text = _controller.HasRunningTasks
                 ? "背景任務執行中（可繼續對話）"
                 : "即時同步桌面寵物對話";
         }
-        SendStopBtn.BorderThickness = new Thickness(0);
     }
 
     private async Task RefreshMessagesAsync(bool scrollToBottom)
@@ -109,7 +94,7 @@ public partial class ChatHistoryWindow : Window
             MessagesPanel.Children.Add(new TextBlock
             {
                 Text = "尚無對話紀錄，在下方輸入訊息即可開始對話。",
-                Foreground = Brush(_isDark ? "#94A3B8" : "#64748B"),
+                Opacity = 0.65,
                 HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
                 Margin = new Thickness(0, 32, 0, 0)
             });
@@ -147,25 +132,25 @@ public partial class ChatHistoryWindow : Window
             stack.Children.Add(new TextBlock
             {
                 Text = timeText,
-                FontSize = 10.5,
-                Foreground = Brush(_isDark ? "#64748B" : "#64748B"),
+                FontSize = 11,
+                Opacity = 0.55,
                 VerticalAlignment = VerticalAlignment.Bottom,
                 Margin = new Thickness(0, 0, 6, 2)
             });
 
             var bubble = new Border
             {
-                Background = Brush(_isDark ? "#16A34A" : "#8DE055"),
-                CornerRadius = new CornerRadius(14, 14, 4, 14),
+                Background = Brush(_isDark ? "#0F6CBD" : "#0078D4"),
+                CornerRadius = new CornerRadius(12, 12, 4, 12),
                 Padding = new Thickness(12, 8, 12, 8),
-                MaxWidth = 340,
+                MaxWidth = 360,
                 Child = new TextBox
                 {
                     Text = msg.Content,
                     IsReadOnly = true,
                     BorderThickness = new Thickness(0),
                     Background = Brushes.Transparent,
-                    Foreground = Brush(_isDark ? "#F8FAFC" : "#0F172A"),
+                    Foreground = Brushes.White,
                     TextWrapping = TextWrapping.Wrap,
                     FontSize = 13,
                     Padding = new Thickness(0)
@@ -186,9 +171,9 @@ public partial class ChatHistoryWindow : Window
         leftContainer.Children.Add(new TextBlock
         {
             Text = isNotification ? "AI 秘書・主動通知" : "AI 秘書",
-            FontSize = 11,
+            FontSize = 11.5,
             FontWeight = FontWeights.SemiBold,
-            Foreground = Brush(_isDark ? "#94A3B8" : "#475569"),
+            Opacity = 0.7,
             Margin = new Thickness(4, 0, 0, 3)
         });
 
@@ -213,14 +198,14 @@ public partial class ChatHistoryWindow : Window
         {
             Background = Brush(isNotification
                 ? (_isDark ? "#1E3A5F" : "#EFF6FF")
-                : (_isDark ? "#1E293B" : "#FFFFFF")),
+                : (_isDark ? "#2B2B2B" : "#FFFFFF")),
             BorderBrush = Brush(isNotification
                 ? (_isDark ? "#3B82F6" : "#BFDBFE")
-                : (_isDark ? "#334155" : "#CBD5E1")),
+                : (_isDark ? "#3D3D3D" : "#E0E0E0")),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(14, 14, 14, 4),
+            CornerRadius = new CornerRadius(12, 12, 12, 4),
             Padding = new Thickness(12, 8, 12, 8),
-            MaxWidth = 360,
+            MaxWidth = 380,
             Child = contentElement
         };
 
@@ -228,8 +213,8 @@ public partial class ChatHistoryWindow : Window
         bubbleRow.Children.Add(new TextBlock
         {
             Text = timeText,
-            FontSize = 10.5,
-            Foreground = Brush(_isDark ? "#64748B" : "#64748B"),
+            FontSize = 11,
+            Opacity = 0.55,
             VerticalAlignment = VerticalAlignment.Bottom,
             Margin = new Thickness(6, 0, 0, 2)
         });
@@ -276,9 +261,7 @@ public partial class ChatHistoryWindow : Window
     }
 
     private void ScrollBottomBtn_Click(object sender, RoutedEventArgs e)
-    {
-        ChatScroll.ScrollToEnd();
-    }
+        => ChatScroll.ScrollToEnd();
 
     private static SolidColorBrush Brush(string hex) =>
         (SolidColorBrush)new BrushConverter().ConvertFromString(hex)!;

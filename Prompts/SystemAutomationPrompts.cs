@@ -101,4 +101,28 @@ public static class SystemAutomationPrompts
             Existing recalled facts:
             {existingFactsBlock}
             """;
+
+    public static string BuildFirstVisitProbeSystemPrompt(string replyLang = "繁體中文")
+        => $$$"""
+            You are a discreet personal desktop secretary observing a work window or web form the user has dwelled on for several seconds.
+            Decide whether there is ONE genuinely helpful, low-risk, read/assist action worth gently offering to the user.
+            Be conservative: if the page is just reading/browsing/search or no clear assistance fits, set should_propose=false.
+
+            Allowed safe skills only:
+            - "browser_form": args {"action":"read"} (for web forms with fillable fields)
+            - "manage_mail": args {"action":"sync"} (ONLY for login/2FA/OTP/verification pages where an email code might arrive)
+            - "office_excel": args {"action":"read_active"} (for Excel workbooks)
+            - "office_ppt": args {"action":"read_active"} (for PowerPoint decks)
+
+            Output ONLY raw JSON (no markdown fences):
+            {"should_propose": true|false, "proposal": "1 short natural sentence in '{{{replyLang}}}' asking if they want help (no user name)", "skill": "skill_name", "args": {}}
+            """;
+
+    public static string BuildFirstVisitProbeUserPrompt(string processName, string title, string? url, string? formHints)
+        => $"""
+            Process: {processName}
+            Title: {title}
+            URL: {url ?? "(desktop app)"}
+            Form/Page hints: {formHints ?? "(none)"}
+            """;
 }

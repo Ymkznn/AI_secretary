@@ -18,10 +18,34 @@ public static class Win11BackdropHelper
     private const int DWMSBT_MAINWINDOW = 2; // Mica
     private const int GWL_EXSTYLE = -20;
     private const int WS_EX_TOPMOST = 0x00000008;
+    private const int WS_EX_TOOLWINDOW = 0x00000080;
+    private const int WS_EX_APPWINDOW = 0x00040000;
     private const uint SWP_NOSIZE = 0x0001;
     private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOZORDER = 0x0004;
     private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_FRAMECHANGED = 0x0020;
     private static readonly IntPtr HWND_TOPMOST = new(-1);
+
+    /// <summary>
+    /// Hides a transparent overlay window (such as the desktop pet) from Alt+Tab and the taskbar switcher
+    /// by applying WS_EX_TOOLWINDOW and clearing WS_EX_APPWINDOW.
+    /// </summary>
+    public static void HideFromAltTab(Window window)
+    {
+        try
+        {
+            var hwnd = new WindowInteropHelper(window).Handle;
+            if (hwnd == IntPtr.Zero) return;
+
+            int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+            exStyle = (exStyle | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
+            _ = SetWindowLong(hwnd, GWL_EXSTYLE, exStyle);
+            _ = SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+        catch { }
+    }
 
     public static void EnsureTopmost(Window window, bool force = false)
     {
@@ -83,6 +107,9 @@ public static class Win11BackdropHelper
 
     [DllImport("user32.dll")]
     private static extern int GetWindowLong(IntPtr hwnd, int nIndex);
+
+    [DllImport("user32.dll")]
+    private static extern int SetWindowLong(IntPtr hwnd, int nIndex, int dwNewLong);
 
     [DllImport("user32.dll")]
     private static extern bool SetWindowPos(IntPtr hwnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);

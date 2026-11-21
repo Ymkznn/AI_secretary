@@ -3,21 +3,26 @@ using System.Windows.Controls;
 using System.Windows.Media;
 using AiSecretary.Desktop.Models;
 using AiSecretary.Desktop.Services;
-using Brushes = System.Windows.Media.Brushes;
-using Button = System.Windows.Controls.Button;
 using HorizontalAlignment = System.Windows.HorizontalAlignment;
+using UiAppearance = Wpf.Ui.Controls.ControlAppearance;
+using UiButton = Wpf.Ui.Controls.Button;
 
 namespace AiSecretary.Desktop;
 
-public partial class AgentMonitorWindow : Window
+public partial class AgentMonitorWindow : Wpf.Ui.Controls.FluentWindow
 {
     private readonly SecretaryController _controller;
     private bool _isDark;
 
     public AgentMonitorWindow(SecretaryController controller)
     {
+        FluentThemeHelper.EnsureSystemAccent();
         InitializeComponent();
         _controller = controller;
+
+        _isDark = ThemeHelper.IsDarkEffective("System");
+        FluentThemeHelper.Apply(this, _isDark);
+        SourceInitialized += (_, _) => FluentThemeHelper.Apply(this, _isDark);
 
         Loaded += async (_, _) =>
         {
@@ -37,13 +42,7 @@ public partial class AgentMonitorWindow : Window
     private void ApplyTheme(string mode)
     {
         _isDark = ThemeHelper.IsDarkEffective(mode);
-        Win11BackdropHelper.Apply(this, _isDark);
-        Background = BrushFrom(_isDark ? "#202020" : "#F3F3F3");
-        Foreground = BrushFrom(_isDark ? "#F1F5F9" : "#0F172A");
-        HeaderText.Foreground = Foreground;
-        StopAllBtn.Background = BrushFrom(_isDark ? "#7F1D1D" : "#FEE2E2");
-        StopAllBtn.Foreground = BrushFrom(_isDark ? "#FCA5A5" : "#B91C1C");
-        StopAllBtn.BorderBrush = BrushFrom(_isDark ? "#991B1B" : "#FCA5A5");
+        FluentThemeHelper.Apply(this, _isDark);
     }
 
     private async Task RefreshRunsAsync()
@@ -55,13 +54,15 @@ public partial class AgentMonitorWindow : Window
         var pinned = _controller.GetPinnedReminders();
         StopAllBtn.IsEnabled = _controller.HasRunningTasks;
 
+        var cardBg = BrushFrom(_isDark ? "#2B2B2B" : "#FFFFFF");
+        var cardBorder = BrushFrom(_isDark ? "#3D3D3D" : "#E0E0E0");
+
         RunsPanel.Children.Add(new TextBlock
         {
             Text = $"已排程的背景任務／置頂提醒（{schedules.Count + pinned.Count}）",
             FontWeight = FontWeights.SemiBold,
-            FontSize = 13,
-            Margin = new Thickness(2, 0, 0, 8),
-            Foreground = Foreground
+            FontSize = 13.5,
+            Margin = new Thickness(2, 0, 0, 8)
         });
 
         if (schedules.Count == 0 && pinned.Count == 0)
@@ -69,9 +70,8 @@ public partial class AgentMonitorWindow : Window
             RunsPanel.Children.Add(new TextBlock
             {
                 Text = "目前沒有待執行的排程或置頂提醒。",
-                Opacity = 0.7,
-                Margin = new Thickness(4, 0, 4, 12),
-                Foreground = Foreground
+                Opacity = 0.65,
+                Margin = new Thickness(4, 0, 4, 12)
             });
         }
         else
@@ -80,22 +80,20 @@ public partial class AgentMonitorWindow : Window
             {
                 var pcard = new Border
                 {
-                    Background = BrushFrom(_isDark ? "#1E293B" : "#FFFFFF"),
+                    Background = cardBg,
                     BorderBrush = BrushFrom(_isDark ? "#60A5FA" : "#F59E0B"),
                     BorderThickness = new Thickness(1),
                     CornerRadius = new CornerRadius(8),
-                    Padding = new Thickness(10, 8, 10, 8),
+                    Padding = new Thickness(12, 10, 12, 10),
                     Margin = new Thickness(0, 0, 0, 8)
                 };
                 var dock = new DockPanel { LastChildFill = true };
-                var dismissBtn = new Button
+                var dismissBtn = new UiButton
                 {
                     Content = "關閉",
-                    Padding = new Thickness(8, 2, 8, 2),
-                    FontSize = 11.5,
-                    Background = BrushFrom(_isDark ? "#7F1D1D" : "#FEE2E2"),
-                    Foreground = BrushFrom(_isDark ? "#FCA5A5" : "#B91C1C"),
-                    BorderBrush = BrushFrom(_isDark ? "#991B1B" : "#FCA5A5"),
+                    Appearance = UiAppearance.Danger,
+                    Padding = new Thickness(10, 4, 10, 4),
+                    FontSize = 12,
                     VerticalAlignment = VerticalAlignment.Center
                 };
                 DockPanel.SetDock(dismissBtn, Dock.Right);
@@ -103,21 +101,19 @@ public partial class AgentMonitorWindow : Window
                 dismissBtn.Click += async (_, _) => await _controller.DismissPinnedReminderAsync(pid);
                 dock.Children.Add(dismissBtn);
 
-                var info = new StackPanel { Margin = new Thickness(0, 0, 8, 0) };
+                var info = new StackPanel { Margin = new Thickness(0, 0, 10, 0) };
                 var freq = p.ReRemindMinutes > 0 ? $"每 {p.ReRemindMinutes} 分鐘於氣泡提醒" : "僅置頂不重複";
                 info.Children.Add(new TextBlock
                 {
                     Text = $"📌 {p.Title}（置頂提醒・{freq}）",
                     FontWeight = FontWeights.SemiBold,
-                    Foreground = Foreground,
                     TextWrapping = TextWrapping.Wrap
                 });
                 info.Children.Add(new TextBlock
                 {
                     Text = p.Summary,
-                    FontSize = 11.5,
-                    Opacity = 0.8,
-                    Foreground = Foreground,
+                    FontSize = 12,
+                    Opacity = 0.72,
                     TextWrapping = TextWrapping.Wrap,
                     Margin = new Thickness(0, 2, 0, 0)
                 });
@@ -130,22 +126,20 @@ public partial class AgentMonitorWindow : Window
             {
                 var scard = new Border
                 {
-                    Background = BrushFrom(_isDark ? "#1E293B" : "#FFFFFF"),
-                    BorderBrush = BrushFrom(_isDark ? "#334155" : "#E2E8F0"),
+                    Background = cardBg,
+                    BorderBrush = cardBorder,
                     BorderThickness = new Thickness(1),
                     CornerRadius = new CornerRadius(8),
-                    Padding = new Thickness(10, 8, 10, 8),
+                    Padding = new Thickness(12, 10, 12, 10),
                     Margin = new Thickness(0, 0, 0, 8)
                 };
                 var dock = new DockPanel { LastChildFill = true };
-                var delBtn = new Button
+                var delBtn = new UiButton
                 {
                     Content = "刪除",
-                    Padding = new Thickness(8, 2, 8, 2),
-                    FontSize = 11.5,
-                    Background = BrushFrom(_isDark ? "#7F1D1D" : "#FEE2E2"),
-                    Foreground = BrushFrom(_isDark ? "#FCA5A5" : "#B91C1C"),
-                    BorderBrush = BrushFrom(_isDark ? "#991B1B" : "#FCA5A5"),
+                    Appearance = UiAppearance.Danger,
+                    Padding = new Thickness(10, 4, 10, 4),
+                    FontSize = 12,
                     VerticalAlignment = VerticalAlignment.Center
                 };
                 DockPanel.SetDock(delBtn, Dock.Right);
@@ -153,7 +147,7 @@ public partial class AgentMonitorWindow : Window
                 delBtn.Click += async (_, _) => await _controller.DeleteScheduleAsync(sid);
                 dock.Children.Add(delBtn);
 
-                var info = new StackPanel { Margin = new Thickness(0, 0, 8, 0) };
+                var info = new StackPanel { Margin = new Thickness(0, 0, 10, 0) };
                 var freq = s.IntervalMinutes > 0 ? $"每 {s.IntervalMinutes} 分鐘" : "單次";
                 var wdTag = s.WorkdaysOnly ? "・僅工作日" : "";
                 var skillTag = string.IsNullOrWhiteSpace(s.SkillName) ? "提醒" : $"Skill: {s.SkillName}";
@@ -161,15 +155,13 @@ public partial class AgentMonitorWindow : Window
                 {
                     Text = $"{s.Title}（{freq}{wdTag}・{skillTag}）",
                     FontWeight = FontWeights.SemiBold,
-                    Foreground = Foreground,
                     TextWrapping = TextWrapping.Wrap
                 });
                 info.Children.Add(new TextBlock
                 {
                     Text = $"下次執行：{s.RemindAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}｜{s.Message}",
-                    FontSize = 11.5,
-                    Opacity = 0.8,
-                    Foreground = Foreground,
+                    FontSize = 12,
+                    Opacity = 0.72,
                     TextWrapping = TextWrapping.Wrap,
                     Margin = new Thickness(0, 2, 0, 0)
                 });
@@ -183,9 +175,8 @@ public partial class AgentMonitorWindow : Window
         {
             Text = $"行程表（請假 / 會議 / 週期行程）（{calendarEvents.Count}）",
             FontWeight = FontWeights.SemiBold,
-            FontSize = 13,
-            Margin = new Thickness(2, 6, 0, 8),
-            Foreground = Foreground
+            FontSize = 13.5,
+            Margin = new Thickness(2, 8, 0, 8)
         });
 
         if (calendarEvents.Count == 0)
@@ -193,9 +184,8 @@ public partial class AgentMonitorWindow : Window
             RunsPanel.Children.Add(new TextBlock
             {
                 Text = "目前沒有已登錄的行事曆行程。",
-                Opacity = 0.7,
-                Margin = new Thickness(4, 0, 4, 12),
-                Foreground = Foreground
+                Opacity = 0.65,
+                Margin = new Thickness(4, 0, 4, 12)
             });
         }
         else
@@ -204,22 +194,20 @@ public partial class AgentMonitorWindow : Window
             {
                 var ecard = new Border
                 {
-                    Background = BrushFrom(_isDark ? "#1E293B" : "#FFFFFF"),
-                    BorderBrush = BrushFrom(_isDark ? "#334155" : "#E2E8F0"),
+                    Background = cardBg,
+                    BorderBrush = cardBorder,
                     BorderThickness = new Thickness(1),
                     CornerRadius = new CornerRadius(8),
-                    Padding = new Thickness(10, 8, 10, 8),
+                    Padding = new Thickness(12, 10, 12, 10),
                     Margin = new Thickness(0, 0, 0, 8)
                 };
                 var dock = new DockPanel { LastChildFill = true };
-                var delBtn = new Button
+                var delBtn = new UiButton
                 {
                     Content = "刪除",
-                    Padding = new Thickness(8, 2, 8, 2),
-                    FontSize = 11.5,
-                    Background = BrushFrom(_isDark ? "#7F1D1D" : "#FEE2E2"),
-                    Foreground = BrushFrom(_isDark ? "#FCA5A5" : "#B91C1C"),
-                    BorderBrush = BrushFrom(_isDark ? "#991B1B" : "#FCA5A5"),
+                    Appearance = UiAppearance.Danger,
+                    Padding = new Thickness(10, 4, 10, 4),
+                    FontSize = 12,
                     VerticalAlignment = VerticalAlignment.Center
                 };
                 DockPanel.SetDock(delBtn, Dock.Right);
@@ -227,13 +215,12 @@ public partial class AgentMonitorWindow : Window
                 delBtn.Click += async (_, _) => await _controller.DeleteCalendarEventAsync(eid);
                 dock.Children.Add(delBtn);
 
-                var info = new StackPanel { Margin = new Thickness(0, 0, 8, 0) };
+                var info = new StackPanel { Margin = new Thickness(0, 0, 10, 0) };
                 var recTag = string.IsNullOrWhiteSpace(ev.Recurrence) || ev.Recurrence == "none" ? "" : $"・週期: {ev.Recurrence}";
                 info.Children.Add(new TextBlock
                 {
                     Text = $"[{ev.Category}] {ev.Title}{recTag}",
                     FontWeight = FontWeights.SemiBold,
-                    Foreground = Foreground,
                     TextWrapping = TextWrapping.Wrap
                 });
                 var timeStr = ev.AllDay
@@ -242,9 +229,8 @@ public partial class AgentMonitorWindow : Window
                 info.Children.Add(new TextBlock
                 {
                     Text = string.IsNullOrWhiteSpace(ev.Notes) ? timeStr : $"{timeStr}｜{ev.Notes}",
-                    FontSize = 11.5,
-                    Opacity = 0.8,
-                    Foreground = Foreground,
+                    FontSize = 12,
+                    Opacity = 0.72,
                     TextWrapping = TextWrapping.Wrap,
                     Margin = new Thickness(0, 2, 0, 0)
                 });
@@ -258,9 +244,8 @@ public partial class AgentMonitorWindow : Window
         {
             Text = "近期 Agent 執行紀錄",
             FontWeight = FontWeights.SemiBold,
-            FontSize = 13,
-            Margin = new Thickness(2, 6, 0, 8),
-            Foreground = Foreground
+            FontSize = 13.5,
+            Margin = new Thickness(2, 8, 0, 8)
         });
 
         if (runs.Count == 0)
@@ -268,9 +253,8 @@ public partial class AgentMonitorWindow : Window
             RunsPanel.Children.Add(new TextBlock
             {
                 Text = "目前沒有執行中或近期的 Agent 任務。",
-                Opacity = 0.7,
-                Margin = new Thickness(4, 2, 4, 0),
-                Foreground = Foreground
+                Opacity = 0.65,
+                Margin = new Thickness(4, 2, 4, 0)
             });
             return;
         }
@@ -281,10 +265,10 @@ public partial class AgentMonitorWindow : Window
 
             var card = new Border
             {
-                Background = BrushFrom(_isDark ? "#1E293B" : "#FFFFFF"),
-                BorderBrush = BrushFrom(isRunning ? "#3B82F6" : (_isDark ? "#334155" : "#E2E8F0")),
-                BorderThickness = new Thickness(1.2),
-                CornerRadius = new CornerRadius(10),
+                Background = cardBg,
+                BorderBrush = isRunning ? BrushFrom("#3B82F6") : cardBorder,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
                 Padding = new Thickness(12),
                 Margin = new Thickness(0, 0, 0, 10)
             };
@@ -294,14 +278,12 @@ public partial class AgentMonitorWindow : Window
             var top = new DockPanel { Margin = new Thickness(0, 0, 0, 8) };
             if (isRunning)
             {
-                var killBtn = new Button
+                var killBtn = new UiButton
                 {
                     Content = "強制終止",
-                    Padding = new Thickness(10, 3, 10, 3),
-                    FontSize = 11.5,
-                    Background = BrushFrom(_isDark ? "#7F1D1D" : "#FEE2E2"),
-                    Foreground = BrushFrom(_isDark ? "#FCA5A5" : "#B91C1C"),
-                    BorderBrush = BrushFrom(_isDark ? "#991B1B" : "#FCA5A5")
+                    Appearance = UiAppearance.Danger,
+                    Padding = new Thickness(10, 4, 10, 4),
+                    FontSize = 12
                 };
                 var tid = run.TaskId;
                 killBtn.Click += (_, _) => _controller.StopTask(tid);
@@ -313,12 +295,10 @@ public partial class AgentMonitorWindow : Window
             {
                 Text = $"{run.StartedAt:HH:mm:ss}  {run.Goal}",
                 FontWeight = FontWeights.SemiBold,
-                Foreground = Foreground,
                 VerticalAlignment = VerticalAlignment.Center
             });
             stack.Children.Add(top);
 
-            // Connection Graph: MainAgent ──► Planner ──► Worker
             var graph = new StackPanel
             {
                 Orientation = System.Windows.Controls.Orientation.Horizontal,
@@ -335,8 +315,8 @@ public partial class AgentMonitorWindow : Window
             stack.Children.Add(new TextBlock
             {
                 Text = $"狀態：{run.CurrentStep}",
-                FontSize = 11.5,
-                Foreground = BrushFrom(_isDark ? "#94A3B8" : "#475569")
+                FontSize = 12,
+                Opacity = 0.72
             });
 
             card.Child = stack;
@@ -351,15 +331,15 @@ public partial class AgentMonitorWindow : Window
             "Running" => (_isDark ? "#1E3A8A" : "#DBEAFE", "#3B82F6", _isDark ? "#93C5FD" : "#1D4ED8", "運作中"),
             "Done" => (_isDark ? "#14532D" : "#DCFCE7", "#22C55E", _isDark ? "#86EFAC" : "#15803D", "完成"),
             "Stopped" => (_isDark ? "#7F1D1D" : "#FEE2E2", "#EF4444", _isDark ? "#FCA5A5" : "#B91C1C", "已終止"),
-            _ => (_isDark ? "#0F172A" : "#F1F5F9", _isDark ? "#475569" : "#CBD5E1", _isDark ? "#94A3B8" : "#64748B", "待命")
+            _ => (_isDark ? "#202020" : "#F3F3F3", _isDark ? "#454545" : "#CBD5E1", _isDark ? "#A3A3A3" : "#64748B", "待命")
         };
 
         return new Border
         {
             Background = BrushFrom(bg),
             BorderBrush = BrushFrom(border),
-            BorderThickness = new Thickness(1.2),
-            CornerRadius = new CornerRadius(8),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
             Padding = new Thickness(10, 6, 10, 6),
             MinWidth = 112,
             Child = new StackPanel
@@ -378,7 +358,7 @@ public partial class AgentMonitorWindow : Window
         Text = " ──► ",
         FontWeight = FontWeights.Bold,
         FontSize = 13,
-        Foreground = BrushFrom(active ? "#3B82F6" : (_isDark ? "#475569" : "#94A3B8")),
+        Foreground = BrushFrom(active ? "#3B82F6" : (_isDark ? "#525252" : "#94A3B8")),
         VerticalAlignment = VerticalAlignment.Center,
         Margin = new Thickness(2, 0, 2, 0)
     };

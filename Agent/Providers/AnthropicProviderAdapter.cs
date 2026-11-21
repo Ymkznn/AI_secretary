@@ -33,6 +33,7 @@ public sealed class AnthropicProviderAdapter : ILlmProviderAdapter
         request.Headers.Add("api-key", apiKey);
         request.Headers.Add("x-api-key", apiKey);
         request.Headers.Add("anthropic-version", version);
+        request.Headers.Add("anthropic-beta", "prompt-caching-2024-07-31");
     }
 
     public string BuildRequestJson(IReadOnlyList<ModelMessage> messages, string model)
@@ -50,12 +51,15 @@ public sealed class AnthropicProviderAdapter : ILlmProviderAdapter
                 normalized.Add((role, m.Content));
         }
 
-        int cacheIdx = normalized.Count >= 2 ? normalized.Count - 2 : -1;
+        // Place cache breakpoints like ARTIFEX: on the last message (writes current prefix for next turn/step)
+        // AND on the second-to-last message when available (anchors the previous turn's history prefix).
+        int lastIdx = normalized.Count - 1;
+        int prevIdx = normalized.Count >= 2 ? normalized.Count - 2 : -1;
         var chatMsgs = normalized
             .Select((m, idx) => new
             {
                 role = m.Role,
-                content = BuildContent(m.Content, withCacheControl: idx == cacheIdx)
+                content = BuildContent(m.Content, withCacheControl: idx == lastIdx || idx == prevIdx)
             })
             .ToArray();
 

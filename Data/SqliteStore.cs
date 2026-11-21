@@ -244,7 +244,9 @@ public sealed class SqliteStore
                 HitCount INTEGER NOT NULL DEFAULT 0,
                 MissCount INTEGER NOT NULL DEFAULT 0,
                 Status TEXT NOT NULL DEFAULT 'Cold',
-                LastSeenAt TEXT NOT NULL
+                LastSeenAt TEXT NOT NULL,
+                CooldownUntil TEXT NULL,
+                ProposalText TEXT NULL
             );
             CREATE TABLE IF NOT EXISTS MemoryAnnotations (
                 AnnotationId TEXT PRIMARY KEY,
@@ -280,7 +282,9 @@ public sealed class SqliteStore
             "ALTER TABLE KnowledgeFacts ADD COLUMN State TEXT NOT NULL DEFAULT 'Confirmed';",
             "ALTER TABLE KnowledgeFacts ADD COLUMN ReinforceCount INTEGER NOT NULL DEFAULT 1;",
             "ALTER TABLE KnowledgeFacts ADD COLUMN ExpiresAt TEXT NULL;",
-            "ALTER TABLE KnowledgeFacts ADD COLUMN LastVerifiedAt TEXT NULL;"
+            "ALTER TABLE KnowledgeFacts ADD COLUMN LastVerifiedAt TEXT NULL;",
+            "ALTER TABLE AutoStateRules ADD COLUMN CooldownUntil TEXT NULL;",
+            "ALTER TABLE AutoStateRules ADD COLUMN ProposalText TEXT NULL;"
         })
         {
             try
@@ -2265,7 +2269,7 @@ public sealed class SqliteStore
     {
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT TriggerKey, StateName, StepsJson, PredictorCounter, HitCount, MissCount, Status, LastSeenAt FROM AutoStateRules WHERE TriggerKey = @k LIMIT 1;";
+        cmd.CommandText = "SELECT TriggerKey, StateName, StepsJson, PredictorCounter, HitCount, MissCount, Status, LastSeenAt, CooldownUntil, ProposalText FROM AutoStateRules WHERE TriggerKey = @k LIMIT 1;";
         cmd.Parameters.AddWithValue("@k", triggerKey);
         await using var r = await cmd.ExecuteReaderAsync(ct);
         if (!await r.ReadAsync(ct)) return null;
@@ -2277,14 +2281,16 @@ public sealed class SqliteStore
             HitCount: r.GetInt32(4),
             MissCount: r.GetInt32(5),
             Status: r.GetString(6),
-            LastSeenAt: DateTimeOffset.Parse(r.GetString(7)));
+            LastSeenAt: DateTimeOffset.Parse(r.GetString(7)),
+            CooldownUntil: r.IsDBNull(8) || string.IsNullOrWhiteSpace(r.GetString(8)) ? null : DateTimeOffset.Parse(r.GetString(8)),
+            ProposalText: r.IsDBNull(9) ? null : r.GetString(9));
     }
 
     public async Task<List<AutoStateRuleRecord>> GetAllAutoStateRulesAsync(CancellationToken ct = default)
     {
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT TriggerKey, StateName, StepsJson, PredictorCounter, HitCount, MissCount, Status, LastSeenAt FROM AutoStateRules ORDER BY LastSeenAt DESC LIMIT 100;";
+        cmd.CommandText = "SELECT TriggerKey, StateName, StepsJson, PredictorCounter, HitCount, MissCount, Status, LastSeenAt, CooldownUntil, ProposalText FROM AutoStateRules ORDER BY LastSeenAt DESC LIMIT 100;";
         var list = new List<AutoStateRuleRecord>();
         await using var r = await cmd.ExecuteReaderAsync(ct);
         while (await r.ReadAsync(ct))
@@ -2297,7 +2303,9 @@ public sealed class SqliteStore
                 HitCount: r.GetInt32(4),
                 MissCount: r.GetInt32(5),
                 Status: r.GetString(6),
-                LastSeenAt: DateTimeOffset.Parse(r.GetString(7))));
+                LastSeenAt: DateTimeOffset.Parse(r.GetString(7)),
+                CooldownUntil: r.IsDBNull(8) || string.IsNullOrWhiteSpace(r.GetString(8)) ? null : DateTimeOffset.Parse(r.GetString(8)),
+                ProposalText: r.IsDBNull(9) ? null : r.GetString(9)));
         }
         return list;
     }
@@ -2307,8 +2315,8 @@ public sealed class SqliteStore
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO AutoStateRules (TriggerKey, StateName, StepsJson, PredictorCounter, HitCount, MissCount, Status, LastSeenAt)
-            VALUES (@k, @state, @steps, @cnt, @hits, @miss, @status, @seen)
+            INSERT INTO AutoStateRules (TriggerKey, StateName, StepsJson, PredictorCounter, HitCount, MissCount, Status, LastSeenAt, CooldownUntil, ProposalText)
+            VALUES (@k, @state, @steps, @cnt, @hits, @miss, @status, @seen, @cd, @prop)
             ON CONFLICT(TriggerKey) DO UPDATE SET
                 StateName = excluded.StateName,
                 StepsJson = excluded.StepsJson,
@@ -2316,7 +2324,9 @@ public sealed class SqliteStore
                 HitCount = excluded.HitCount,
                 MissCount = excluded.MissCount,
                 Status = excluded.Status,
-                LastSeenAt = excluded.LastSeenAt;
+                LastSeenAt = excluded.LastSeenAt,
+                CooldownUntil = excluded.CooldownUntil,
+                ProposalText = excluded.ProposalText;
             """;
         cmd.Parameters.AddWithValue("@k", rec.TriggerKey);
         cmd.Parameters.AddWithValue("@state", rec.StateName);
@@ -2326,6 +2336,8 @@ public sealed class SqliteStore
         cmd.Parameters.AddWithValue("@miss", rec.MissCount);
         cmd.Parameters.AddWithValue("@status", rec.Status);
         cmd.Parameters.AddWithValue("@seen", rec.LastSeenAt.ToString("O"));
+        cmd.Parameters.AddWithValue("@cd", rec.CooldownUntil.HasValue ? rec.CooldownUntil.Value.ToString("O") : DBNull.Value);
+        cmd.Parameters.AddWithValue("@prop", string.IsNullOrWhiteSpace(rec.ProposalText) ? DBNull.Value : rec.ProposalText);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 

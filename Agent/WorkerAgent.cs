@@ -1,60 +1,47 @@
 using System.Text.Json;
-using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
-using AiSecretary.Desktop.Prompts;
 using AiSecretary.Desktop.Services;
 using AiSecretary.Desktop.Skills;
 
 namespace AiSecretary.Desktop.Agent;
 
+/// <summary>Worker 執行工具後回報給 MainAgent 或 Planner 的純資料結果（不含對使用者的自然語言回覆）。</summary>
+public sealed record WorkerReport(
+    bool Handled,
+    List<string> Observations,
+    List<MailSourceRef> Sources,
+    List<string> CompletedSteps);
+
 /// <summary>
-/// 執行代理（Worker）：負責派發執行內建技能（<see cref="SkillRegistry"/>）或自訂技能（<see cref="CustomSkillService"/>），
-/// 並支援由 <see cref="MainAgent"/> 直接派發的單步快速執行與結果彙整。
+/// 純工具執行代理（Worker）：只負責呼叫內建技能（<see cref="SkillRegistry"/>）或自訂技能（<see cref="CustomSkillService"/>），
+/// 絕不呼叫 LLM，也絕不直接與使用者對話；執行完畢後僅將原始結果回報給呼叫端（<see cref="PlannerAgent"/> 或 <see cref="MainAgent"/>）。
 /// </summary>
 public sealed class WorkerAgent
 {
-    private readonly SqliteStore _store;
     private readonly CustomSkillService _customSkills;
     private readonly GuardService _guard;
-    private readonly IModelGateway _model;
-    private readonly ContextSessionManager _sessions;
-    private readonly StyleService _styles;
-    private readonly TtsService _tts;
     private readonly SkillRegistry _skillRegistry;
     private readonly UiLocalizer _localizer;
-    private readonly AppSettingsService _settings;
     private readonly ILogger<WorkerAgent> _logger;
 
     public WorkerAgent(
-        SqliteStore store,
         CustomSkillService customSkills,
         GuardService guard,
-        IModelGateway model,
-        ContextSessionManager sessions,
-        StyleService styles,
-        TtsService tts,
         SkillRegistry skillRegistry,
         UiLocalizer localizer,
-        AppSettingsService settings,
         ILogger<WorkerAgent> logger)
     {
-        _store = store;
         _customSkills = customSkills;
         _guard = guard;
-        _model = model;
-        _sessions = sessions;
-        _styles = styles;
-        _tts = tts;
         _skillRegistry = skillRegistry;
         _localizer = localizer;
-        _settings = settings;
         _logger = logger;
     }
 
     /// <summary>
-    /// 執行單一技能並以使用者指定語系彙整回覆；若該技能未被處理則回傳 Handled=false 以便退回 Planner。
+    /// 執行單一技能並回傳原始結果給呼叫端（零 LLM 呼叫）；若該技能未被處理則 Handled=false。
     /// </summary>
-    public async Task<(bool Handled, string Summary, List<MailSourceRef> Sources)> ExecuteSingleSkillAsync(
+    public async Task<WorkerReport> ExecuteSingleSkillRawAsync(
         string conversationId,
         string userPrompt,
         string skillName,
@@ -62,10 +49,8 @@ public sealed class WorkerAgent
         string? targetMailId,
         Func<string, string, Task<bool>> confirmAsync,
         Func<string, Task> onStatusAsync,
-        ModelTier tier = ModelTier.Simple,
         CancellationToken ct = default,
-        Action<string>? onDirectTtsText = null,
-        Action<IReadOnlyList<string>>? onChoices = null)
+        string? taskId = null)
     {
         var sources = new List<MailSourceRef>();
         var observations = new List<string>();
@@ -73,43 +58,9 @@ public sealed class WorkerAgent
 
         await RunStepAsync(
             conversationId, userPrompt, skillName.Trim(), args, targetMailId,
-            confirmAsync, onStatusAsync, sources, observations, completedSteps, ct);
+            confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
 
-        if (observations.Count == 0)
-            return (false, "", sources);
-
-        var activeStylePrompt = _tts.GetActiveStylePrompt() ?? _styles.GetActiveStylePrompt();
-
-        var mainSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Main", ct: ct);
-        var prefFacts = await _store.RecallRelevantUserPrefFactsAsync(conversationId, userPrompt, 5, ct);
-        var prefContext = MainAgentPrompts.FormatPreferencesContext(prefFacts);
-
-        var replyLang = string.IsNullOrWhiteSpace(_settings.Current.Llm.ReplyLanguage)
-            ? "繁體中文"
-            : _settings.Current.Llm.ReplyLanguage.Trim();
-        var singleSysPrompt = PlannerPrompts.BuildFinalReplySystemPrompt(
-            activeStylePrompt,
-            _tts.IsEnabled,
-            _tts.ChatMode,
-            includeTaskStatus: false,
-            _tts.TargetLang,
-            replyLang);
-
-        var finalResp = await _model.CompleteAsync(new[]
-        {
-            new ModelMessage("system", singleSysPrompt),
-            new ModelMessage("user", PlannerPrompts.BuildSingleSkillUserPrompt(prefContext, userPrompt, observations))
-        }, tier, ct);
-
-        CleanupTempScreenshots(observations);
-        await _sessions.RecordTokensAsync(mainSession, finalResp.EstimatedTokens, ct: ct);
-        var (cleanSingle0, singleChoices) = ExtractAndStripChoices(finalResp.Content);
-        var (cleanSingle, singleTtsText) = ExtractAndStripTtsText(cleanSingle0);
-        if (singleChoices.Count > 0)
-            onChoices?.Invoke(singleChoices);
-        if (!string.IsNullOrWhiteSpace(singleTtsText))
-            onDirectTtsText?.Invoke(singleTtsText);
-        return (true, cleanSingle, sources);
+        return new WorkerReport(observations.Count > 0, observations, sources, completedSteps);
     }
 
     /// <summary>
@@ -164,6 +115,7 @@ public sealed class WorkerAgent
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            _logger.LogDebug(ex, "Worker step {Skill} failed", record.Name);
             observations.Add($"{record.Name} failed: {ex.Message}");
         }
     }
@@ -208,7 +160,7 @@ public sealed class WorkerAgent
     }
 
     /// <summary>清理執行期間產生的暫存螢幕截圖（`screen_*`）。</summary>
-    internal static void CleanupTempScreenshots(List<string> observations)
+    internal static void CleanupTempScreenshots(IReadOnlyList<string> observations)
     {
         foreach (var obs in observations)
         {
@@ -234,25 +186,23 @@ public sealed class WorkerAgent
         if (!m.Success)
             return (text, null);
 
-        var ttsText = m.Groups[1].Value.Trim();
+        var tts = m.Groups[1].Value.Trim();
         var clean = (text[..m.Index] + text[(m.Index + m.Length)..]).Trim();
-        return (clean, string.IsNullOrWhiteSpace(ttsText) ? null : ttsText);
+        return (clean, string.IsNullOrWhiteSpace(tts) ? null : tts);
     }
 
-    /// <summary>從回覆中抽離 `[CHOICES: ...]` 氣泡選項清單（最多 4 項）。</summary>
+    /// <summary>從回覆中抽離 `[CHOICES: a | b | c]` 快捷選項標記。</summary>
     internal static (string CleanText, List<string> Choices) ExtractAndStripChoices(string raw)
     {
         var text = (raw ?? "").Trim();
         var m = System.Text.RegularExpressions.Regex.Match(
             text,
-            @"(?:^|\r?\n)\s*\[CHOICES:\s*(.+?)\]\s*(?=$|\r?\n)",
+            @"(?:^|\r?\n)\s*\[CHOICES:\s*(.+?)\s*\]\s*(?=\r?\n\[(?:TTS_TEXT|TASK_STATUS):|$)",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        if (!m.Success)
-            return (text, new List<string>());
+        if (!m.Success) return (text, new List<string>());
 
         var choices = m.Groups[1].Value
-            .Split(new[] { '|', '｜' }, StringSplitOptions.RemoveEmptyEntries)
-            .Select(s => s.Trim())
+            .Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(s => !string.IsNullOrWhiteSpace(s))
             .Take(4)
             .ToList();

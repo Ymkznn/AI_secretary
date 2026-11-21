@@ -1,0 +1,57 @@
+<ui:FluentWindow x:Class="AiSecretary.Desktop.PathEditorDialog"
+                 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 Title="信任路徑"
+                 Width="500"
+                 Height="230"
+                 ResizeMode="NoResize"
+                 WindowStartupLocation="CenterOwner"
+                 ExtendsContentIntoTitleBar="True"
+                 WindowBackdropType="None"
+                 WindowCornerPreference="Round"
+                 FontFamily="Segoe UI Variable Text, Microsoft JhengHei UI, Segoe UI"
+                 FontSize="13">
+
+    <Window.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ui:ThemesDictionary Theme="Dark" />
+                <ui:ControlsDictionary />
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <ui:TitleBar x:Name="DialogTitleBar" Grid.Row="0" ShowMaximize="False" ShowMinimize="False" />
+
+        <Grid Grid.Row="1" Margin="20,6,20,18">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" Text="資料夾路徑（包含其所有子資料夾）" Margin="0,0,0,8" />
+
+            <Grid Grid.Row="1">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <ui:TextBox x:Name="PathBox" Grid.Column="0" PlaceholderText="例如：D:\Documents\Reports" Margin="0,0,8,0" />
+                <ui:Button x:Name="BrowseBtn" Grid.Column="1" Content="瀏覽…" Icon="{ui:SymbolIcon Folder24}" Click="BrowseBtn_Click" />
+            </Grid>
+
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Bottom">
+                <ui:Button x:Name="OkBtn" Content="確定" Appearance="Primary" Width="84" Margin="0,0,8,0" IsDefault="True" Click="OkBtn_Click" />
+                <ui:Button x:Name="CancelBtn" Content="取消" Width="84" IsCancel="True" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</ui:FluentWindow>

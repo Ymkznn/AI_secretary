@@ -119,7 +119,9 @@ public static class MainAgentPrompts
         string factsContext,
         string userPrompt,
         string activeTasksContext = "",
-        string activeWindowContext = "")
+        string activeWindowContext = "",
+        string? sandboxRootPath = null,
+        IReadOnlyList<string>? trustedPaths = null)
     {
         var activeWindowBlock = string.IsNullOrWhiteSpace(activeWindowContext)
             ? ""
@@ -141,9 +143,20 @@ public static class MainAgentPrompts
             </active_planner_tasks>
             """;
 
+        var accessiblePathsBlock = string.IsNullOrWhiteSpace(sandboxRootPath)
+            ? ""
+            : $"""
+
+            <accessible_paths>
+            Default writable workspace (sandbox_root): {sandboxRootPath}
+            Trusted writable folders: {(trustedPaths is { Count: > 0 } ? string.Join("; ", trustedPaths) : "(none)")}
+            FILE ACCESS RULE: Paths outside the above folders are NOT freely writable. When the user gives a file/folder outside these paths, treat it as READ-ONLY reference by default; NEVER modify/overwrite it in-place or place newly generated files in that external folder unless the user explicitly instructs you to overwrite or save there. Write all newly generated/modified outputs inside sandbox_root.
+            </accessible_paths>
+            """;
+
         return $$$"""
             now: {{{now:yyyy-MM-dd HH:mm:ss zzz}}}
-            {{{(string.IsNullOrWhiteSpace(targetMailId) ? "" : $"target_mail_id: {targetMailId}")}}}{{{handoffContext}}}{{{activeTasksBlock}}}
+            {{{(string.IsNullOrWhiteSpace(targetMailId) ? "" : $"target_mail_id: {targetMailId}")}}}{{{handoffContext}}}{{{activeTasksBlock}}}{{{accessiblePathsBlock}}}
 
             <user_preferences>
             User personal preferences and rules (must be prioritized):

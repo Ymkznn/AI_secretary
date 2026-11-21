@@ -195,6 +195,8 @@ public partial class MainWindow : Window
 
         InitializeTrayIcon();
 
+        SourceInitialized += (_, _) => Win11BackdropHelper.HideFromAltTab(this);
+
         Loaded += async (_, _) =>
         {
             await RestoreWindowPositionAsync();
@@ -1866,17 +1868,19 @@ public partial class MainWindow : Window
 
         var (model, endpoint, inTok, outTok, cacheTok) = await _controller.GetModelAndUsageInfoAsync();
         var branchStats = await _controller.GetBranchTelemetryAsync();
+        var baseline = await _controller.GetBaselineUsageInfoAsync();
         var dark = ThemeHelper.IsDarkEffective(await _controller.GetThemeModeAsync());
 
         var win = new Window
         {
             Title = "AI 秘書 — 資訊",
-            Width = 420,
+            Width = 440,
             SizeToContent = SizeToContent.Height,
             WindowStartupLocation = WindowStartupLocation.CenterScreen,
             ResizeMode = ResizeMode.NoResize,
-            Background = BrushFrom(dark ? "#0F172A" : "#F8FAFC"),
-            Foreground = BrushFrom(dark ? "#F1F5F9" : "#0F172A")
+            Background = BrushFrom(dark ? "#202020" : "#F3F3F3"),
+            Foreground = BrushFrom(dark ? "#F5F5F5" : "#1A1A1A"),
+            FontFamily = new System.Windows.Media.FontFamily("Segoe UI Variable Text, Microsoft JhengHei UI, Segoe UI")
         };
         _infoWindow = win;
         win.Closed += (_, _) => _infoWindow = null;
@@ -1888,15 +1892,15 @@ public partial class MainWindow : Window
             dp.Children.Add(new TextBlock
             {
                 Text = label,
-                Width = 115,
-                Foreground = BrushFrom(dark ? "#94A3B8" : "#64748B"),
+                Width = 128,
+                Foreground = BrushFrom(dark ? "#A3A3A3" : "#64748B"),
                 FontSize = 12.5
             });
             dp.Children.Add(new TextBlock
             {
                 Text = value,
                 FontWeight = bold ? FontWeights.SemiBold : FontWeights.Normal,
-                Foreground = BrushFrom(dark ? "#F1F5F9" : "#0F172A"),
+                Foreground = BrushFrom(dark ? "#F5F5F5" : "#1A1A1A"),
                 FontSize = 12.5,
                 TextWrapping = TextWrapping.Wrap
             });
@@ -1915,6 +1919,15 @@ public partial class MainWindow : Window
         AddRow("分支預測命中：", $"{branchStats.Hits} / {branchStats.Predictions} ({branchStats.HitRatePercent:0.0}%)");
         AddRow("預測失敗 (Miss)：", $"{branchStats.Mispredictions}");
         AddRow("估計節省 Token：", $"{branchStats.EstimatedTokensSaved:N0}", bold: true);
+
+        if (baseline is not null)
+        {
+            panel.Children.Add(new Separator { Margin = new Thickness(0, 4, 0, 10) });
+            AddRow("對照組 (Baseline)：", $"截至 {baseline.RecordedAt.ToLocalTime():yyyy-MM-dd HH:mm}", bold: true);
+            AddRow("對照輸入 / 輸出：", $"{baseline.InputTokens:N0} / {baseline.OutputTokens:N0}");
+            AddRow("對照快取 / 總計：", $"{baseline.CacheTokens:N0} / {baseline.TotalTokens:N0}", bold: true);
+            AddRow("對照預測命中：", $"{baseline.Hits} / {baseline.Predictions} ({baseline.HitRatePercent:0.0}%)，省 {baseline.EstimatedTokensSaved:N0}");
+        }
 
         var closeBtn = MakeActionButton("關閉", false);
         closeBtn.HorizontalAlignment = HorizontalAlignment.Right;

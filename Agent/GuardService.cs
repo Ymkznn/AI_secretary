@@ -57,6 +57,7 @@ public sealed class GuardService
     private readonly IReadOnlyList<Regex> _networkExfilPatterns;
 
     public int MaxWorkerStepsPerTask { get; }
+    public int MaxPlannerRounds { get; }
 
     public void BindSkillCatalog(ISkillCatalogLookup catalog) => _catalog = catalog;
 
@@ -81,6 +82,7 @@ public sealed class GuardService
         _allowedBackgroundServices = new HashSet<string>(bgServices, StringComparer.OrdinalIgnoreCase);
 
         MaxWorkerStepsPerTask = config.GetValue<int>("Guard:MaxWorkerStepsPerTask", 15);
+        MaxPlannerRounds = Math.Clamp(config.GetValue<int>("Guard:MaxPlannerRounds", 5), 1, 12);
 
         var ewsUrl = config.GetValue<string>("Ews:Url") ?? "";
         _ewsHost = Uri.TryCreate(ewsUrl, UriKind.Absolute, out var u) ? u.Host : "";
