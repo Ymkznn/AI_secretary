@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Data;
@@ -137,8 +138,9 @@ public sealed class TtsServerLifecycleTests
         var cmd = TtsService.TryGetProcessCommandLine(Environment.ProcessId);
         Assert.False(string.IsNullOrWhiteSpace(cmd));
 
-        // Verify Win32 Job Object struct alignment and JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE setup succeed live
-        var job = TtsService.CreateKillOnCloseJobObject();
+        // Verify Win32 Job Object struct alignment, BELOW_NORMAL priority, and tail-core affinity setup succeed live
+        var tailMask = TtsService.ComputeTailCpuAffinityMask(Environment.ProcessorCount, 4, (UIntPtr)Process.GetCurrentProcess().ProcessorAffinity);
+        var job = TtsService.CreateKillOnCloseJobObject(setBelowNormalPriority: true, affinityMask: tailMask);
         try
         {
             Assert.NotEqual(IntPtr.Zero, job);
@@ -147,5 +149,33 @@ public sealed class TtsServerLifecycleTests
         {
             TtsService.CloseNativeHandle(job);
         }
+    }
+
+    [Fact]
+    public void CpuOffloadHelpers_RewriteYamlToCpuFp32_AndComputeTailCoreAffinity()
+    {
+        const string sampleYaml = """
+            custom:
+              bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+              device: cuda
+              is_half: true
+              t2s_weights_path: E:\Anime\sarutobi_sana_tts\weights_36\sana_36-e15.ckpt
+              version: v2Pro
+            """;
+
+        var cpuYaml = TtsService.BuildCpuOverrideYamlContent(sampleYaml);
+        Assert.Contains("  device: cpu", cpuYaml);
+        Assert.Contains("  is_half: false", cpuYaml);
+        Assert.DoesNotContain("device: cuda", cpuYaml);
+        Assert.DoesNotContain("is_half: true", cpuYaml);
+        Assert.Contains("sana_36-e15.ckpt", cpuYaml);
+
+        // 16-thread CPU (e.g. Ryzen 7 9800X3D), 4 threads -> last 4 logical CPUs (bits 12..15 = 0xF000), leaving cores 0..11 free for games
+        var mask16 = TtsService.ComputeTailCpuAffinityMask(16, 4, new UIntPtr(0xFFFF));
+        Assert.Equal(new UIntPtr(0xF000), mask16);
+
+        // Low-core machine (4 threads) -> returns 0 (do not restrict affinity)
+        var mask4 = TtsService.ComputeTailCpuAffinityMask(4, 4, new UIntPtr(0xF));
+        Assert.Equal(UIntPtr.Zero, mask4);
     }
 }

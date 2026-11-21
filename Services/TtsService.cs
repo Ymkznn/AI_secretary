@@ -260,10 +260,18 @@ public sealed class TtsService : IDisposable
                     return;
                 }
 
+                bool cpuMode = IsCpuDeviceMode();
+                int cpuThreads = Math.Clamp(tts.CpuThreads > 0 ? tts.CpuThreads : 4, 1, Math.Max(1, Environment.ProcessorCount / 2));
+                var effectiveYamlPath = yamlPath;
+                if (cpuMode)
+                {
+                    effectiveYamlPath = WriteDerivedCpuYaml(yamlPath, group);
+                }
+
                 var psi = new ProcessStartInfo
                 {
                     FileName = python,
-                    Arguments = $"\"{apiScript}\" -a {uri.Host} -p {uri.Port} -c \"{yamlPath}\"",
+                    Arguments = $"\"{apiScript}\" -a {uri.Host} -p {uri.Port} -c \"{effectiveYamlPath}\"",
                     WorkingDirectory = root,
                     UseShellExecute = false,
                     CreateNoWindow = true,
@@ -272,9 +280,33 @@ public sealed class TtsService : IDisposable
                 };
                 psi.Environment["PYTHONUTF8"] = "1";
                 psi.Environment["PYTHONIOENCODING"] = "utf-8";
-                // Cap OpenMP/MKL threads so PyTorch inference doesn't spike all CPU cores while gaming.
-                psi.Environment.TryAdd("OMP_NUM_THREADS", "2");
-                psi.Environment.TryAdd("MKL_NUM_THREADS", "2");
+                if (cpuMode)
+                {
+                    // Prevent PyTorch from touching the RTX GPU / allocating any VRAM at all while gaming.
+                    psi.Environment["CUDA_VISIBLE_DEVICES"] = "";
+                    var threadStr = cpuThreads.ToString();
+                    psi.Environment["OMP_NUM_THREADS"] = threadStr;
+                    psi.Environment["MKL_NUM_THREADS"] = threadStr;
+                    psi.Environment["OPENBLAS_NUM_THREADS"] = threadStr;
+                    psi.Environment["TORCH_NUM_THREADS"] = threadStr;
+                }
+                else
+                {
+                    // Cap OpenMP/MKL threads so PyTorch inference doesn't spike all CPU cores while gaming.
+                    psi.Environment.TryAdd("OMP_NUM_THREADS", "2");
+                    psi.Environment.TryAdd("MKL_NUM_THREADS", "2");
+                }
+
+                UIntPtr affinityMask = UIntPtr.Zero;
+                if (cpuMode && tts.PinCpuAffinityToTailCores)
+                {
+                    try
+                    {
+                        var procAffinity = (UIntPtr)(ulong)(long)Process.GetCurrentProcess().ProcessorAffinity;
+                        affinityMask = ComputeTailCpuAffinityMask(Environment.ProcessorCount, cpuThreads, procAffinity);
+                    }
+                    catch { }
+                }
 
                 var proc = Process.Start(psi);
                 if (proc is not null)
@@ -288,7 +320,7 @@ public sealed class TtsService : IDisposable
                             CloseJobHandleLocked();
                             _serverProcess?.Dispose();
                             _serverProcess = proc;
-                            _serverJobHandle = TryAssignKillOnCloseJob(proc);
+                            _serverJobHandle = TryAssignKillOnCloseJob(proc, setBelowNormalPriority: true, affinityMask: affinityMask);
                         }
                     }
 
@@ -305,7 +337,9 @@ public sealed class TtsService : IDisposable
                     _weightsInitialized = true;
                     proc.BeginOutputReadLine();
                     proc.BeginErrorReadLine();
-                    _logger.LogInformation("Auto-started GPT-SoVITS server (PID {Pid}, voice={Group})", proc.Id, group);
+                    _logger.LogInformation(
+                        "Auto-started GPT-SoVITS server (PID {Pid}, voice={Group}, device={Device}, threads={Threads}, affinity=0x{Affinity:X})",
+                        proc.Id, group, cpuMode ? "cpu" : "yaml/cuda", cpuMode ? cpuThreads : 2, (ulong)affinityMask);
                 }
             }
             catch (Exception ex)
@@ -872,7 +906,8 @@ public sealed class TtsService : IDisposable
             temperature = tts.Temperature,
             speed_factor = tts.SpeedFactor,
             media_type = "wav",
-            streaming_mode = false
+            streaming_mode = false,
+            use_cuda_graph = !IsCpuDeviceMode()
         };
 
         using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/tts")
@@ -1049,19 +1084,104 @@ public sealed class TtsService : IDisposable
         }
     }
 
-    internal static IntPtr CreateKillOnCloseJobObject()
+    private bool IsCpuDeviceMode()
+        => string.Equals((_settings.Current.Tts.Device ?? "auto").Trim(), "cpu", StringComparison.OrdinalIgnoreCase);
+
+    internal static string BuildCpuOverrideYamlContent(string sourceYaml)
+    {
+        // Rewrite CUDA device entries to CPU and disable FP16 (is_half: false) since PyTorch CPU lacks FP16 ops.
+        var replaced = Regex.Replace(
+            sourceYaml,
+            @"(?im)^(\s*device\s*:\s*)cuda(?::\d+)?\b",
+            "${1}cpu");
+        replaced = Regex.Replace(
+            replaced,
+            @"(?im)^(\s*is_half\s*:\s*)true\b",
+            "${1}false");
+        return replaced;
+    }
+
+    private static string WriteDerivedCpuYaml(string sourceYamlPath, string group)
+    {
+        var raw = File.ReadAllText(sourceYamlPath, Encoding.UTF8);
+        var cpuYaml = BuildCpuOverrideYamlContent(raw);
+        var outDir = Path.Combine(AppPaths.UserDataRoot, "tts");
+        Directory.CreateDirectory(outDir);
+        var derivedPath = Path.Combine(outDir, $"runtime_tts_infer_{group}_cpu.yaml");
+        File.WriteAllText(derivedPath, cpuYaml, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        return derivedPath;
+    }
+
+    /// <summary>
+    /// Computes an affinity bitmask selecting the last <paramref name="threadCount"/> available logical CPUs
+    /// within <paramref name="processAffinityMask"/> (only when <paramref name="processorCount"/> &gt;= 6),
+    /// keeping lower-numbered cores (0..) uninterrupted for foreground games.
+    /// </summary>
+    internal static UIntPtr ComputeTailCpuAffinityMask(int processorCount, int threadCount, UIntPtr processAffinityMask)
+    {
+        if (processorCount < 6 || threadCount <= 0)
+            return UIntPtr.Zero;
+
+        ulong allowed = (ulong)processAffinityMask;
+        int maxBits = Math.Min(processorCount, 64);
+        int want = Math.Clamp(threadCount, 1, Math.Max(1, processorCount / 2));
+
+        ulong mask = 0;
+        int picked = 0;
+        for (int bit = maxBits - 1; bit >= 0 && picked < want; bit--)
+        {
+            ulong flag = 1UL << bit;
+            if ((allowed & flag) != 0)
+            {
+                mask |= flag;
+                picked++;
+            }
+        }
+
+        return picked > 0 ? new UIntPtr(mask) : UIntPtr.Zero;
+    }
+
+    internal static IntPtr CreateKillOnCloseJobObject(bool setBelowNormalPriority = true, UIntPtr affinityMask = default)
     {
         IntPtr job = CreateJobObject(IntPtr.Zero, null);
         if (job == IntPtr.Zero)
             return IntPtr.Zero;
 
-        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (!SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                ref info,
-                (uint)Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()))
+        uint size = (uint)Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+
+        // 1) Try full limits: KILL_ON_JOB_CLOSE + BELOW_NORMAL priority for entire child tree + optional tail-core affinity
+        if (setBelowNormalPriority || affinityMask != UIntPtr.Zero)
+        {
+            var full = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            full.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (setBelowNormalPriority)
+            {
+                full.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS;
+                full.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+            }
+            if (affinityMask != UIntPtr.Zero)
+            {
+                full.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY;
+                full.BasicLimitInformation.Affinity = affinityMask;
+            }
+            if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref full, size))
+                return job;
+        }
+
+        // 2) Fallback: KILL_ON_JOB_CLOSE + BELOW_NORMAL priority without affinity restriction
+        if (setBelowNormalPriority)
+        {
+            var prioOnly = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            prioOnly.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_PRIORITY_CLASS;
+            prioOnly.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+            if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref prioOnly, size))
+                return job;
+        }
+
+        // 3) Minimal fallback: KILL_ON_JOB_CLOSE only
+        var minimal = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        minimal.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref minimal, size))
         {
             CloseHandle(job);
             return IntPtr.Zero;
@@ -1076,11 +1196,11 @@ public sealed class TtsService : IDisposable
             CloseHandle(handle);
     }
 
-    private static IntPtr TryAssignKillOnCloseJob(Process proc)
+    private static IntPtr TryAssignKillOnCloseJob(Process proc, bool setBelowNormalPriority = true, UIntPtr affinityMask = default)
     {
         try
         {
-            var job = CreateKillOnCloseJobObject();
+            var job = CreateKillOnCloseJobObject(setBelowNormalPriority, affinityMask);
             if (job == IntPtr.Zero)
                 return IntPtr.Zero;
 
@@ -1145,7 +1265,10 @@ public sealed class TtsService : IDisposable
     private const int STATUS_BUFFER_TOO_SMALL = unchecked((int)0xC0000023);
     private const int STATUS_BUFFER_OVERFLOW = unchecked((int)0x80000005);
     private const int JobObjectExtendedLimitInformation = 9;
+    private const uint JOB_OBJECT_LIMIT_AFFINITY = 0x00000010;
+    private const uint JOB_OBJECT_LIMIT_PRIORITY_CLASS = 0x00000020;
     private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    private const uint BELOW_NORMAL_PRIORITY_CLASS = 0x00004000;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct UNICODE_STRING

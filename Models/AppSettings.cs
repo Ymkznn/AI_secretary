@@ -45,6 +45,12 @@ public sealed class TtsSettings
 {
     public bool Enabled { get; set; } = true;
     public bool AutoStartServer { get; set; } = true;
+    /// <summary>Inference device override: "auto" (use YAML as-is), "cpu" (offload GPU completely), or "cuda".</summary>
+    public string Device { get; set; } = "auto";
+    /// <summary>Max CPU threads for PyTorch/OpenMP when Device="cpu" (also used for tail-core affinity pinning).</summary>
+    public int CpuThreads { get; set; } = 4;
+    /// <summary>When Device="cpu" on >=6-thread CPUs, pin GPT-SoVITS Job Object to the last CpuThreads logical cores so games keep core 0+ uninterrupted.</summary>
+    public bool PinCpuAffinityToTailCores { get; set; } = true;
     public string SoVitsRoot { get; set; } = "";
     public string ChatMode { get; set; } = "smart";
     public string DefaultProfile { get; set; } = "default";
