@@ -239,18 +239,92 @@ public sealed class ProactiveTopicAndBackoffTests
             Assert.True(await store.DeleteFactAsync("f-know"));
             Assert.Empty(ProactiveTopicEngine.ExtractConfirmedCustomTopics(await store.GetConfirmedProactivePrefsAsync(convId)));
 
-            // 2) GetRecentNonProactiveChatTurnsAsync keeps completed real user+assistant replies, ONLY excludes TaskId="proactive"!
+            // 2) GetRecentNonProactiveChatTurnsAsync keeps user turns + assistant replies with ReplyToMessageId,
+            //    excluding both legacy (TaskId=null, ReplyToMessageId=null) and new (TaskId="proactive") proactive messages!
+            var userAsk = new ChatMessageRecord
+            {
+                ConversationId = convId,
+                Role = "user",
+                Content = "下週四前要打掉 HTB Vaccine 記得提醒我",
+                CreatedAt = now.AddMinutes(-25),
+                RevealedAt = now.AddMinutes(-25)
+            };
             await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "user", Content = "48小時前舊訊息", CreatedAt = now.AddHours(-48), RevealedAt = now.AddHours(-48) });
-            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "TODO.md 還在看呀", TaskId = "proactive", CreatedAt = now.AddMinutes(-30), RevealedAt = now.AddMinutes(-30) });
-            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "user", Content = "下週四前要打掉 HTB Vaccine 記得提醒我", CreatedAt = now.AddMinutes(-25), RevealedAt = now.AddMinutes(-25) });
-            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "設好囉，11/25 晚上八點提醒你打 HTB Vaccine！", TaskId = "task-123", CreatedAt = now.AddMinutes(-24), RevealedAt = now.AddMinutes(-24) });
-            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "又在看 TODO.md 喔", TaskId = "proactive", CreatedAt = now.AddMinutes(-10), RevealedAt = now.AddMinutes(-10) });
+            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "舊版未標記：TODO.md 還在看呀", TaskId = null, ReplyToMessageId = null, CreatedAt = now.AddMinutes(-30), RevealedAt = now.AddMinutes(-30) });
+            await store.UpsertChatMessageAsync(userAsk);
+            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "設好囉，11/25 晚上八點提醒你打 HTB Vaccine！", TaskId = "task-123", ReplyToMessageId = userAsk.Id, CreatedAt = now.AddMinutes(-24), RevealedAt = now.AddMinutes(-24) });
+            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "又在看 TODO.md 喔", TaskId = "proactive", ReplyToMessageId = null, CreatedAt = now.AddMinutes(-10), RevealedAt = now.AddMinutes(-10) });
 
             var turns = await store.GetRecentNonProactiveChatTurnsAsync(convId, now.AddHours(-24), 6);
             Assert.Equal(2, turns.Count);
             Assert.Contains("下週四前要打掉 HTB Vaccine", turns[0]);
             Assert.Contains("設好囉，11/25 晚上八點提醒你打 HTB Vaccine", turns[1]);
             Assert.DoesNotContain(turns, s => s.Contains("TODO.md"));
+        }
+        finally
+        {
+            CleanupDb(tempDb);
+        }
+    }
+
+    [Fact]
+    public async Task GetRecentNonProactiveChatTurns_ExcludesAssistantMessagesWithNullReplyToMessageId()
+    {
+        var (store, tempDb) = CreateTempStore();
+        try
+        {
+            const string convId = "conv-replyto-filter";
+            var now = DateTimeOffset.UtcNow;
+
+            var userMsg = new ChatMessageRecord
+            {
+                ConversationId = convId,
+                Role = "user",
+                Content = "幫我查一下 EMS 進度",
+                CreatedAt = now.AddMinutes(-20),
+                RevealedAt = now.AddMinutes(-20)
+            };
+            await store.UpsertChatMessageAsync(userMsg);
+
+            // Real assistant reply linked via ReplyToMessageId -> MUST be included
+            await store.UpsertChatMessageAsync(new ChatMessageRecord
+            {
+                ConversationId = convId,
+                Role = "assistant",
+                Content = "查到了，包裹已經到東京國際交換局。",
+                TaskId = "t-ems",
+                ReplyToMessageId = userMsg.Id,
+                CreatedAt = now.AddMinutes(-19),
+                RevealedAt = now.AddMinutes(-19)
+            });
+
+            // Unsolicited assistant messages with ReplyToMessageId = null (legacy proactive, scheduled push, proposal) -> MUST be excluded
+            await store.UpsertChatMessageAsync(new ChatMessageRecord
+            {
+                ConversationId = convId,
+                Role = "assistant",
+                Content = "TODO.md 還在看呀",
+                TaskId = null,
+                ReplyToMessageId = null,
+                CreatedAt = now.AddMinutes(-15),
+                RevealedAt = now.AddMinutes(-15)
+            });
+            await store.UpsertChatMessageAsync(new ChatMessageRecord
+            {
+                ConversationId = convId,
+                Role = "assistant",
+                Content = "⏰ 排程提醒：記得喝水",
+                TaskId = "sched-99",
+                ReplyToMessageId = null,
+                CreatedAt = now.AddMinutes(-10),
+                RevealedAt = now.AddMinutes(-10)
+            });
+
+            var turns = await store.GetRecentNonProactiveChatTurnsAsync(convId, now.AddHours(-24), 6);
+            Assert.Equal(2, turns.Count);
+            Assert.Contains("幫我查一下 EMS 進度", turns[0]);
+            Assert.Contains("包裹已經到東京國際交換局", turns[1]);
+            Assert.DoesNotContain(turns, s => s.Contains("TODO.md") || s.Contains("排程提醒"));
         }
         finally
         {

@@ -1662,9 +1662,10 @@ public sealed class SqliteStore
     }
 
     /// <summary>
-    /// Returns up to <paramref name="limit"/> recent real conversation turns (user prompts AND real completed assistant replies)
-    /// since <paramref name="sinceUtc"/> in chronological order, strictly excluding prior proactive idle check-ins (TaskId = 'proactive')
-    /// so completed work remains usable topic material while self-imitation is cut off.
+    /// Returns up to <paramref name="limit"/> recent real conversation turns (user prompts AND assistant replies
+    /// explicitly replying to a user prompt via <c>ReplyToMessageId IS NOT NULL</c>) since <paramref name="sinceUtc"/>
+    /// in chronological order. Automatically excludes legacy &amp; new proactive check-ins, scheduled pushes, and
+    /// StateMachine proposals whose <c>ReplyToMessageId</c> is NULL.
     /// </summary>
     public async Task<List<string>> GetRecentNonProactiveChatTurnsAsync(
         string conversationId,
@@ -1680,7 +1681,7 @@ public sealed class SqliteStore
                 SELECT Role, Content, CreatedAt, RevealedAt
                 FROM ChatMessages
                 WHERE ConversationId = $conv
-                  AND Role IN ('user', 'assistant')
+                  AND (Role = 'user' OR (Role = 'assistant' AND ReplyToMessageId IS NOT NULL AND trim(ReplyToMessageId) <> ''))
                   AND COALESCE(TaskId, '') <> 'proactive'
                   AND COALESCE(RevealedAt, CreatedAt) >= $since
                   AND trim(COALESCE(Content, '')) <> ''
