@@ -463,4 +463,33 @@ public sealed class OtpCorrelatorAndVaultTests
         Assert.Contains(handle, safeMail.Snippet);
         Assert.Contains(handle, safeMail.Body);
     }
+
+    [Fact]
+    public void SecretVault_HandlesAlwaysContainHexLetter_AndBareSuffixIsDetected()
+    {
+        var vault = new SecretVaultService();
+        for (int i = 0; i < 40; i++)
+        {
+            var h = vault.StoreOtp($"{100000 + i}", "tenso.com", "tenso", $"m-{i}");
+            Assert.True(SecretVaultService.IsOtpHandle(h));
+            Assert.Contains(h[4..], c => c is >= 'a' and <= 'f');
+            Assert.True(vault.TryMatchHandleOrBareSuffix(h, out var m1));
+            Assert.Equal(h, m1);
+            Assert.True(vault.TryMatchHandleOrBareSuffix(h[4..], out var m2));
+            Assert.Equal(h, m2);
+        }
+        // Real 6-digit numeric OTP must NOT be confused with a handle suffix
+        Assert.False(vault.TryMatchHandleOrBareSuffix("777665", out _));
+    }
+
+    [Theory]
+    [InlineData("sync_mail", "sync")]
+    [InlineData("get_mail_detail", "detail")]
+    [InlineData("get_gmail_detail", "detail")]
+    [InlineData("read_gmail", "list")]
+    [InlineData("manage_mail", "list")]
+    public void ManageMailSkill_InfersLegacyAliasDefaultAction(string requestedAlias, string expectedAction)
+    {
+        Assert.Equal(expectedAction, Skills.ManageMailSkill.InferDefaultAction(requestedAlias));
+    }
 }

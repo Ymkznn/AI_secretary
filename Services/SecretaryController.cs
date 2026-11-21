@@ -79,6 +79,7 @@ public sealed class SecretaryController : IDisposable
     private DateTimeOffset? _dndUntil;
     private bool _dndAllowUrgent = true;
     private DateTimeOffset _boostedPollUntilUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastOtpImmediateSyncUtc = DateTimeOffset.MinValue;
     private string? _boostedPollSkill;
     private string _boostedPollArgsJson = "{}";
     private sealed class ActivePlannerTaskState
@@ -350,7 +351,38 @@ public sealed class SecretaryController : IDisposable
         _activity.WindowFocused += (target, url) =>
             _ = _stateMachine.HandleWindowFocusAsync(ConversationId, target, url, _appCts.Token);
         _activity.BrowserPageSignalReceived += sig =>
+        {
+            if (sig.OtpFieldPresent)
+            {
+                // Fast-poll mail every 6s for up to 90s while user is on an OTP page (auto-cleared on OTP arrival; zero LLM).
+                _boostedPollSkill = "manage_mail";
+                _boostedPollArgsJson = """{"action":"sync","source":"all"}""";
+                var targetUntil = DateTimeOffset.UtcNow.AddSeconds(90);
+                if (_boostedPollUntilUtc < targetUntil)
+                    _boostedPollUntilUtc = targetUntil;
+
+                // Trigger a throttled immediate mail sync so mail-first / just-arrived OTPs match right away.
+                var nowUtc = DateTimeOffset.UtcNow;
+                if (nowUtc - _lastOtpImmediateSyncUtc > TimeSpan.FromSeconds(10))
+                {
+                    _lastOtpImmediateSyncUtc = nowUtc;
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await _mailSync.SyncOnceAsync(
+                                ConversationId,
+                                "all",
+                                (eventId, mail, title, summary, mins, actions) =>
+                                    PushProactiveNotificationAsync(ConversationId, eventId, mail, title, summary, _appCts.Token, mins, actions),
+                                _appCts.Token);
+                        }
+                        catch { }
+                    }, _appCts.Token);
+                }
+            }
             _otpDetector.OnPageSignal(sig.Url, sig.Title, sig.Headings, sig.OtpFieldPresent, sig.OtpFieldFocused, sig.CapturedAt);
+        };
         _otpDetector.SituationDetected += OnOtpSituationDetected;
         _activity.Start();
 

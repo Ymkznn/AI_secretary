@@ -48,8 +48,9 @@ public sealed class ManageMailSkill : IBasicSkill
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
-        var action = (ctx.GetArg("action") ?? "list").Trim().ToLowerInvariant();
-        var source = (ctx.GetArg("source") ?? DefaultSource).Trim().ToLowerInvariant();
+        var requested = (ctx.RequestedSkillName ?? "").Trim().ToLowerInvariant();
+        var action = (ctx.GetArg("action") ?? InferDefaultAction(requested)).Trim().ToLowerInvariant();
+        var source = (ctx.GetArg("source") ?? InferDefaultSource(requested)).Trim().ToLowerInvariant();
 
         switch (action)
         {
@@ -71,6 +72,23 @@ public sealed class ManageMailSkill : IBasicSkill
                 break;
         }
     }
+
+    internal static string InferDefaultAction(string? requestedSkillName)
+        => (requestedSkillName ?? "").Trim().ToLowerInvariant() switch
+        {
+            "sync_mail" => "sync",
+            "get_mail_detail" or "get_gmail_detail" => "detail",
+            _ => "list"
+        };
+
+    private string InferDefaultSource(string? requestedSkillName)
+        => (requestedSkillName ?? "").Trim().ToLowerInvariant() switch
+        {
+            "read_gmail" or "get_gmail_detail" => "gmail",
+            "read_inbox" or "get_mail_detail" => "outlook",
+            "sync_mail" => "all",
+            _ => DefaultSource
+        };
 
     private async Task ListFoldersAsync(SkillExecutionContext ctx)
     {
@@ -138,15 +156,21 @@ public sealed class ManageMailSkill : IBasicSkill
         }
         else
         {
+            var otpHandles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var m in collected.Take(15))
             {
-                VaultOtpIfPresent(m);
+                var h = VaultOtpIfPresent(m);
+                if (!string.IsNullOrWhiteSpace(h))
+                    otpHandles.Add(h);
                 ctx.Sources.Add(new MailSourceRef(m.Id, m.Subject, m.SenderName, m.Subject, m.ReceivedAt));
             }
 
             var lines = collected.Take(15).Select(m =>
                 $"- id={m.Id} | from={m.SenderName} | subject=\"{_vault.RedactKnownSecrets(m.Subject)}\" | at={m.ReceivedAt.ToLocalTime():MM-dd HH:mm} | snippet={_vault.RedactKnownSecrets(m.Snippet)}");
-            ctx.Observations.Add($"{skillName}: {collected.Count} email(s) (source={source}):\n" + string.Join("\n", lines));
+            var otpNote = otpHandles.Count > 0
+                ? $"\n[VAULT NOTE] {string.Join(", ", otpHandles)} is/are opaque SecretVault handle(s), NOT the actual OTP digits. NEVER tell the user the hex characters are the code and NEVER pass them to browser_form; ONLY pass the exact handle verbatim to fill_otp(handle=\"...\")."
+                : "";
+            ctx.Observations.Add($"{skillName}: {collected.Count} email(s) (source={source}):\n" + string.Join("\n", lines) + otpNote);
         }
         ctx.CompletedSteps.Add($"{skillName}:list:{source}");
     }
@@ -192,23 +216,27 @@ public sealed class ManageMailSkill : IBasicSkill
             return;
         }
 
-        VaultOtpIfPresent(mail);
+        var otpHandle = VaultOtpIfPresent(mail);
         ctx.Sources.Add(new MailSourceRef(mail.Id, mail.Subject, mail.SenderName, mail.Subject, mail.ReceivedAt));
         var body = string.IsNullOrWhiteSpace(mail.Body) ? mail.Snippet : mail.Body;
         body = _vault.RedactKnownSecrets(body);
         if (body.Length > 4000) body = body[..4000] + "\n...(truncated)";
-        ctx.Observations.Add($"manage_mail: id={mail.Id} from={mail.SenderName} subject=\"{_vault.RedactKnownSecrets(mail.Subject)}\" at={mail.ReceivedAt.ToLocalTime():yyyy-MM-dd HH:mm}\n{body}");
+        var otpNote = !string.IsNullOrWhiteSpace(otpHandle)
+            ? $"\n[VAULT NOTE] {otpHandle} is an opaque SecretVault handle, NOT the actual OTP digits. NEVER tell the user the hex characters are the code and NEVER pass it to browser_form; ONLY pass handle=\"{otpHandle}\" to fill_otp."
+            : "";
+        ctx.Observations.Add($"manage_mail: id={mail.Id} from={mail.SenderName} subject=\"{_vault.RedactKnownSecrets(mail.Subject)}\" at={mail.ReceivedAt.ToLocalTime():yyyy-MM-dd HH:mm}\n{body}{otpNote}");
         ctx.CompletedSteps.Add($"manage_mail:detail:{mail.Id}");
     }
 
-    private void VaultOtpIfPresent(MailItem mail)
+    private string? VaultOtpIfPresent(MailItem mail)
     {
         if (!OtpExtractor.TryExtractFromMail(mail, out var rawCode))
-            return;
+            return null;
         var regDomain = OtpExtractor.ExtractRegistrableDomain(OtpExtractor.ExtractSenderDomain(mail.SenderEmail));
         var handle = _vault.StoreOtp(rawCode, regDomain, mail.SenderName, mail.Id);
         _skills.LastObservedOtpHandle = handle;
         _skills.LastObservedOtpHint = mail.Subject;
+        return handle;
     }
 
     private async Task SyncAsync(SkillExecutionContext ctx, string source)

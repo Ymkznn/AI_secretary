@@ -12,10 +12,12 @@ namespace AiSecretary.Desktop.Skills;
 public sealed class BrowserFormSkill : IBasicSkill
 {
     private readonly BrowserFormBridgeService _bridge;
+    private readonly SecretVaultService _vault;
 
-    public BrowserFormSkill(BrowserFormBridgeService bridge)
+    public BrowserFormSkill(BrowserFormBridgeService bridge, SecretVaultService vault)
     {
         _bridge = bridge;
+        _vault = vault;
     }
 
     public string Name => "browser_form";
@@ -130,6 +132,17 @@ public sealed class BrowserFormSkill : IBasicSkill
         {
             ctx.Observations.Add("browser_form: fill requires at least one valid entry in fills.");
             return;
+        }
+
+        // Guard: NEVER allow browser_form to type an opaque SecretVault OTP handle (or stripped hex suffix) into a webpage!
+        foreach (var f in fills)
+        {
+            if (_vault.TryMatchHandleOrBareSuffix(f.Value, out var matchedHandle))
+            {
+                ctx.MarkFailed();
+                ctx.Observations.Add($"browser_form: REFUSED — '{f.Value}' is an opaque SecretVault OTP handle ({matchedHandle}), NOT the real verification digits. Call fill_otp(handle=\"{matchedHandle}\") instead.");
+                return;
+            }
         }
 
         // Re-read the live form first: re-tags the DOM (data-aisec-id may be lost after a re-render) and lets us

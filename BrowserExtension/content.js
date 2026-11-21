@@ -317,18 +317,20 @@
     return rect.width > 0 && rect.height > 0;
   }
 
-  const STRICT_OTP_HINT_RE = /otp|code|verify|verification|one[-_ ]?time|passcode|驗證碼|認證碼|動態密碼|認証コード/i;
-  const LOOSE_OTP_HINT_RE = /otp|one[-_ ]?time|code|verify|verification|token|auth|pin|passcode|2fa|mfa|驗證|認證|動態密碼|認証/i;
+  const STRICT_OTP_HINT_RE = /otp|code|verify|verification|one[-_ ]?time|passcode|auth[-_ ]?code|confirm[-_ ]?code|2fa|mfa|驗證碼|認證碼|確認碼|動態密碼|認証|確認コード|ワンタイム/i;
+  const LOOSE_OTP_HINT_RE = /otp|one[-_ ]?time|code|verify|verification|token|auth|pin|passcode|2fa|mfa|驗證|認證|確認碼|動態密碼|認証|確認コード/i;
 
   function isStrictOtpInput(el) {
     if (!el || (el.tagName || '').toLowerCase() !== 'input') return false;
     const ac = (el.getAttribute('autocomplete') || '').toLowerCase().trim();
     if (ac === 'one-time-code') return true;
+    const type = (el.type || 'text').toLowerCase();
     const maxLen = Number(el.maxLength || 0);
     const inputMode = (el.getAttribute('inputmode') || el.inputMode || '').toLowerCase().trim();
     const lbl = findLabel(el, el.ownerDocument);
     const meta = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${lbl}`;
-    return STRICT_OTP_HINT_RE.test(meta) && maxLen >= 4 && maxLen <= 8 && inputMode === 'numeric';
+    if (!STRICT_OTP_HINT_RE.test(meta)) return false;
+    return (maxLen >= 4 && maxLen <= 8) || inputMode === 'numeric' || type === 'tel' || type === 'number';
   }
 
   function isStrictMultiBoxOtp(singleCharBoxes) {

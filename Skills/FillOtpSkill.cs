@@ -31,11 +31,11 @@ public sealed class FillOtpSkill : IBasicSkill
     public string StatusText => "Filling verification code...";
     public string MainAgentSpec => """
             fill_otp
-               - Purpose: Fill an OTP/verification code into the active browser verification page via Extension DOM (or UIA fallback), never auto-submitting.
-               - Args: {"handle": "optional otp#xxxxxx handle; omit to use latest vaulted OTP", "service_hint": "optional window/service keyword"}
+               - Purpose: Fill a vaulted OTP/verification code into the active browser verification page via Extension DOM (or UIA fallback), never auto-submitting. ALWAYS use `fill_otp` (NEVER `browser_form`) for any OTP or `otp#xxxxxx` vault handle.
+               - Args: {"handle": "exact otp#xxxxxx handle verbatim (do NOT strip 'otp#'); omit to use latest vaulted OTP", "service_hint": "optional window/service keyword"}
             
         """;
-    public string PlannerSpec => """fill_otp: Fill OTP into active verification page via Extension DOM (or UIA fallback), never submits. args: {"handle":"optional otp#xxxxxx","service_hint":"optional"}""";
+    public string PlannerSpec => """fill_otp: ALWAYS use fill_otp (NEVER browser_form) to fill any OTP or otp#xxxxxx vault handle (pass exact "otp#xxxxxx" verbatim, never strip prefix), never submits. args: {"handle":"optional otp#xxxxxx","service_hint":"optional"}""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {

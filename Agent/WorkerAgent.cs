@@ -104,6 +104,7 @@ public sealed class WorkerAgent
         var ctx = new SkillExecutionContext
         {
             SkillName = record.Name,
+            RequestedSkillName = skillName,
             ConversationId = conversationId,
             UserPrompt = userPrompt,
             Args = args,

@@ -202,7 +202,23 @@ public sealed class ApiServerHost : IAsyncDisposable
                 ? Results.Ok(new { status = "Active" })
                 : Results.NotFound(new { error = "Watcher not found." }));
 
-        _app.MapGet("/api/browser/last-window", () => Results.Ok(_controller.GetLastExternalWindow()));
+        _app.MapGet("/api/browser/last-window", () =>
+        {
+            var t = _controller.GetLastExternalWindow();
+            return t is null
+                ? Results.Ok((object?)null)
+                : Results.Ok(new
+                {
+                    hwnd = t.Hwnd.ToInt64(),
+                    t.ProcessId,
+                    t.ProcessName,
+                    t.Title,
+                    t.CapturedAt,
+                    t.IsFormLike,
+                    t.FormFieldLabels,
+                    t.VisibleInputCount
+                });
+        });
         _app.MapPost("/api/browser/open-login", async (HttpContext ctx) =>
         {
             string? url = ctx.Request.Query["url"].FirstOrDefault();

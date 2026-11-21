@@ -16,6 +16,8 @@ public enum StepOutcome
 public sealed class SkillExecutionContext
 {
     public string SkillName { get; init; } = "";
+    /// <summary>Original skill name or legacy alias invoked (e.g. "sync_mail", "read_gmail") before canonical resolution.</summary>
+    public string? RequestedSkillName { get; init; }
     public required string ConversationId { get; init; }
     public required string UserPrompt { get; init; }
     public required JsonElement Args { get; init; }

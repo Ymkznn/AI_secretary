@@ -89,7 +89,7 @@ async function reportPageSignal(tab, forceResend = false) {
           .slice(0, 12);
 
         // Deterministic OTP field detection (structure only — NEVER reads .value or password values).
-        const otpHintRe = /otp|code|verify|verification|one[-_ ]?time|passcode|驗證碼|認證碼|動態密碼|認証コード/i;
+        const otpHintRe = /otp|code|verify|verification|one[-_ ]?time|passcode|auth[-_ ]?code|confirm[-_ ]?code|2fa|mfa|驗證碼|認證碼|確認碼|動態密碼|認証|確認コード|ワンタイム/i;
         const getLabelFor = (el) => {
           try {
             if (el.id) {
@@ -105,10 +105,12 @@ async function reportPageSignal(tab, forceResend = false) {
           if ((el.tagName || '').toLowerCase() !== 'input') return false;
           const ac = (el.getAttribute('autocomplete') || '').toLowerCase().trim();
           if (ac === 'one-time-code') return true;
+          const type = (el.type || 'text').toLowerCase();
           const maxLen = Number(el.maxLength || 0);
           const inputMode = (el.getAttribute('inputmode') || el.inputMode || '').toLowerCase().trim();
           const meta = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${getLabelFor(el)}`;
-          return otpHintRe.test(meta) && maxLen >= 4 && maxLen <= 8 && inputMode === 'numeric';
+          if (!otpHintRe.test(meta)) return false;
+          return (maxLen >= 4 && maxLen <= 8) || inputMode === 'numeric' || type === 'tel' || type === 'number';
         };
 
         const visibleTextInputs = allInputs.filter(el => (el.tagName || '').toLowerCase() === 'input');
@@ -135,10 +137,11 @@ async function reportPageSignal(tab, forceResend = false) {
             const target = ev.target;
             if (!target || (target.tagName || '').toLowerCase() !== 'input') return;
             const ac = (target.getAttribute('autocomplete') || '').toLowerCase().trim();
+            const tp = (target.type || 'text').toLowerCase();
             const ml = Number(target.maxLength || 0);
             const im = (target.getAttribute('inputmode') || '').toLowerCase().trim();
             const meta = `${target.name || ''} ${target.id || ''} ${target.placeholder || ''} ${target.getAttribute('aria-label') || ''}`;
-            if (ac === 'one-time-code' || ml === 1 || (otpHintRe.test(meta) && ml >= 4 && ml <= 8 && im === 'numeric')) {
+            if (ac === 'one-time-code' || ml === 1 || (otpHintRe.test(meta) && ((ml >= 4 && ml <= 8) || im === 'numeric' || tp === 'tel' || tp === 'number'))) {
               try { chrome.runtime.sendMessage({ type: 'OTP_FIELD_FOCUSED' }); } catch {}
             }
           }, true);

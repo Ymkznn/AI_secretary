@@ -45,6 +45,39 @@ public sealed class SecretVaultService
         => !string.IsNullOrWhiteSpace(value) && HandlePattern.IsMatch(value.Trim());
 
     /// <summary>
+    /// Detects whether <paramref name="rawValue"/> is an <c>otp#xxxxxx</c> vault handle OR the stripped 6-char hex
+    /// suffix of a known active/recently-consumed vault handle (e.g. if an LLM mistakenly stripped the <c>otp#</c> prefix).
+    /// </summary>
+    public bool TryMatchHandleOrBareSuffix(string? rawValue, out string matchedHandle)
+    {
+        matchedHandle = "";
+        if (string.IsNullOrWhiteSpace(rawValue)) return false;
+        var clean = rawValue.Trim();
+        if (IsOtpHandle(clean))
+        {
+            matchedHandle = clean.ToLowerInvariant();
+            return true;
+        }
+        if (clean.Length != 6) return false;
+
+        var candidate = $"otp#{clean.ToLowerInvariant()}";
+        if (!HandlePattern.IsMatch(candidate)) return false;
+
+        var now = _utcNow();
+        lock (_lock)
+        {
+            PruneExpiredLocked(now);
+            if (_entries.ContainsKey(candidate) ||
+                _recentlyConsumed.Any(c => string.Equals(c.Handle, candidate, StringComparison.OrdinalIgnoreCase)))
+            {
+                matchedHandle = candidate;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Stores an OTP code in memory and returns an opaque handle (<c>otp#&lt;6 hex&gt;</c>).
     /// If the same <paramref name="mailId"/> already has an active unexpired handle for the same code, reuses that handle.
     /// </summary>
@@ -92,7 +125,9 @@ public sealed class SecretVaultService
             {
                 RandomNumberGenerator.Fill(buf);
                 handle = $"otp#{Convert.ToHexString(buf).ToLowerInvariant()}";
-            } while (_entries.ContainsKey(handle) || _recentlyConsumed.Any(c => string.Equals(c.Handle, handle, StringComparison.OrdinalIgnoreCase)));
+            } while (!handle[4..].Any(c => c is >= 'a' and <= 'f') ||
+                     _entries.ContainsKey(handle) ||
+                     _recentlyConsumed.Any(c => string.Equals(c.Handle, handle, StringComparison.OrdinalIgnoreCase)));
 
             var meta = new SecretMetadata(
                 Handle: handle,
