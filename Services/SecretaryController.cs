@@ -2785,8 +2785,12 @@ public sealed class SecretaryController : IDisposable
     public Task<List<StandingWatcherRecord>> GetWatchersAsync(CancellationToken ct = default)
         => _store.GetWatchersAsync(null, ct);
 
-    public Task<bool> DeleteWatcherAsync(string watcherId, CancellationToken ct = default)
-        => _store.DeleteWatcherAsync(watcherId, ct);
+    public async Task<bool> DeleteWatcherAsync(string watcherId, CancellationToken ct = default)
+    {
+        var ok = await _store.DeleteWatcherAsync(watcherId, ct);
+        if (ok) AgentsChanged?.Invoke();
+        return ok;
+    }
 
     public async Task<bool> SetWatcherStatusAsync(string watcherId, string status, CancellationToken ct = default)
     {
@@ -2794,7 +2798,37 @@ public sealed class SecretaryController : IDisposable
         var w = all.FirstOrDefault(x => x.WatcherId == watcherId);
         if (w is null) return false;
         await _store.UpdateWatcherStateAsync(watcherId, w.LastSnapshot, w.LastCheckedAt, DateTimeOffset.UtcNow, 0, status, ct);
+        AgentsChanged?.Invoke();
         return true;
+    }
+
+    public async Task<(bool Ok, string Message)> CheckWatcherNowAsync(string watcherId, CancellationToken ct = default)
+    {
+        var all = await _store.GetWatchersAsync(null, ct);
+        var w = all.FirstOrDefault(x => x.WatcherId == watcherId);
+        if (w is null) return (false, "找不到指定的監控項目。");
+
+        var res = await _watchers.EvaluateOneWatcherAsync(w, async (watcher, alertMsg) =>
+        {
+            WatcherTriggered?.Invoke(watcher, alertMsg);
+            await PushPetMessageAsync($"🔔 {alertMsg}", ct);
+        }, ct);
+        AgentsChanged?.Invoke();
+        return res;
+    }
+
+    public Task<List<AutonomyPolicyRecord>> GetAutonomyPoliciesAsync(CancellationToken ct = default)
+        => _store.GetAllAutonomyPoliciesAsync(ct);
+
+    public async Task<bool> DeleteAutonomyPolicyAsync(string actionClass, string domain, CancellationToken ct = default)
+    {
+        var ok = await _store.DeleteAutonomyPolicyAsync(actionClass, domain, ct);
+        if (ok)
+        {
+            await _store.InsertLearningEventAsync("AutonomyPolicy", $"{actionClass}:{domain}", "reset", "Custom", "Default", "user reset policy in monitor window", ct);
+            AgentsChanged?.Invoke();
+        }
+        return ok;
     }
 
     public async Task<string> SuggestFormFillAsync(BrowserFormContext form, CancellationToken ct = default)

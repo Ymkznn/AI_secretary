@@ -3,10 +3,10 @@
                  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
                  Title="AI 秘書 — Agent 運作詳情"
-                 Width="640"
-                 Height="500"
-                 MinWidth="520"
-                 MinHeight="380"
+                 Width="720"
+                 Height="600"
+                 MinWidth="560"
+                 MinHeight="420"
                  WindowStartupLocation="CenterScreen"
                  ExtendsContentIntoTitleBar="True"
                  WindowBackdropType="None"
@@ -39,15 +39,30 @@
 
             <DockPanel Grid.Row="0" Margin="0,0,0,12" LastChildFill="False">
                 <TextBlock x:Name="HeaderText"
-                           Text="Agent 執行連線圖（MainAgent → Planner → Worker）"
+                           Text="運作總覽與背景排程（各區塊可點擊折疊）"
                            FontSize="15"
                            FontWeight="SemiBold"
                            VerticalAlignment="Center" />
-                <ui:Button x:Name="StopAllBtn"
-                           DockPanel.Dock="Right"
-                           Content="全部強制終止"
-                           Appearance="Danger"
-                           Click="StopAllBtn_Click" />
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                    <ui:Button x:Name="ExpandAllBtn"
+                               Content="全部展開"
+                               Appearance="Secondary"
+                               Padding="10,5"
+                               FontSize="12"
+                               Margin="0,0,6,0"
+                               Click="ExpandAllBtn_Click" />
+                    <ui:Button x:Name="CollapseAllBtn"
+                               Content="全部折疊"
+                               Appearance="Secondary"
+                               Padding="10,5"
+                               FontSize="12"
+                               Margin="0,0,8,0"
+                               Click="CollapseAllBtn_Click" />
+                    <ui:Button x:Name="StopAllBtn"
+                               Content="全部強制終止"
+                               Appearance="Danger"
+                               Click="StopAllBtn_Click" />
+                </StackPanel>
             </DockPanel>
 
             <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">

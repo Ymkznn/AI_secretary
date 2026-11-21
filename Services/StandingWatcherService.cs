@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiSecretary.Desktop.Agent;
@@ -115,20 +117,24 @@ public sealed class StandingWatcherService
 
             if (triggered)
             {
+                var displayValue = string.IsNullOrWhiteSpace(w.ThresholdValue)
+                    ? BuildReadableDiffSummary(w.LastSnapshot, currentValue)
+                    : FormatSnapshotPreview(currentValue, 300);
                 var alertMsg = string.IsNullOrWhiteSpace(w.ThresholdValue)
-                    ? await _localizer.TextAsync("WatcherChanged", "'{0}' detected a new change:\n{1}", new object?[] { w.Title, currentValue }, ct)
-                    : await _localizer.TextAsync("WatcherMatched", "'{0}' matched condition (current: {1}, threshold: {2})\n{3}", new object?[] { w.Title, currentValue, w.ThresholdValue, w.Url }, ct);
+                    ? await _localizer.TextAsync("WatcherChanged", "'{0}' detected a new change:\n{1}", new object?[] { w.Title, displayValue }, ct)
+                    : await _localizer.TextAsync("WatcherMatched", "'{0}' matched condition (current: {1}, threshold: {2})\n{3}", new object?[] { w.Title, displayValue, w.ThresholdValue, w.Url }, ct);
                 _blackboard.CompleteTask(bbId, "watcher", bbGoal, alertMsg, succeeded: true, recordInRecent: true);
                 bbCompleted = true;
                 await onTriggeredAsync(w, alertMsg);
             }
             else
             {
-                _blackboard.CompleteTask(bbId, "watcher", bbGoal, $"Watcher '{w.Title}' checked (no trigger): {currentValue}", succeeded: true, recordInRecent: false, dedupeKey: $"watcher_idle:{w.WatcherId}");
+                var preview = FormatSnapshotPreview(currentValue, 140);
+                _blackboard.CompleteTask(bbId, "watcher", bbGoal, $"Watcher '{w.Title}' checked (no trigger): {preview}", succeeded: true, recordInRecent: false, dedupeKey: $"watcher_idle:{w.WatcherId}");
                 bbCompleted = true;
             }
 
-            return (true, currentValue);
+            return (true, FormatSnapshotPreview(currentValue, 200));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -178,14 +184,16 @@ public sealed class StandingWatcherService
             return extracted is null ? ("error", $"JSON path not found: {w.SelectorOrPath}") : ("ok", extracted);
         }
 
-        // http_text: match regex pattern (with capture group 1 if present) on decoded text
+        // Wildcard "*": clean full-page structured text + SHA-256 hash so changes anywhere on the page
+        // (e.g. parcel tracking tables deep below navigation menus) are reliably detected and diffed.
+        if (string.IsNullOrWhiteSpace(w.SelectorOrPath) || w.SelectorOrPath == "*")
+            return ("ok", ExtractWildcardPageSnapshot(body));
+
+        // http_text with explicit regex selector: match pattern (with capture group 1 if present) on decoded text
         var plain = Regex.Replace(body, @"<(script|style|noscript)\b[^>]*>[\s\S]*?</\1>", " ", RegexOptions.IgnoreCase);
         plain = Regex.Replace(plain, @"<[^>]+>", " ");
         plain = WebUtility.HtmlDecode(plain);
         plain = Regex.Replace(plain, @"\s+", " ").Trim();
-
-        if (string.IsNullOrWhiteSpace(w.SelectorOrPath) || w.SelectorOrPath == "*")
-            return ("ok", plain.Length > 300 ? plain[..300] : plain);
 
         var m = Regex.Match(plain, w.SelectorOrPath, RegexOptions.IgnoreCase);
         if (!m.Success)
@@ -195,11 +203,120 @@ public sealed class StandingWatcherService
         return ("ok", val);
     }
 
+    internal static string ExtractWildcardPageSnapshot(string html)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+            return "sha256:0000000000000000\n";
+
+        // 1) Strip comments, head, scripts, styles, noscript, svg, and hidden inputs
+        var cleaned = Regex.Replace(html, @"<!--[\s\S]*?-->", " ");
+        cleaned = Regex.Replace(cleaned, @"<(head|script|style|noscript|svg)\b[^>]*>[\s\S]*?</\1>", " ", RegexOptions.IgnoreCase);
+        cleaned = Regex.Replace(cleaned, @"<input\b[^>]*>", " ", RegexOptions.IgnoreCase);
+
+        // 2) Try stripping chrome boilerplate (header/nav/footer/aside); keep stripped version if substantive text remains
+        var withoutChrome = Regex.Replace(cleaned, @"<(header|nav|footer|aside)\b[^>]*>[\s\S]*?</\1>", " ", RegexOptions.IgnoreCase);
+        var candidate = StripHtmlToStructuredLines(withoutChrome);
+        var text = candidate.Length >= 80 ? candidate : StripHtmlToStructuredLines(cleaned);
+
+        // 3) Compute SHA-256 over the ENTIRE normalized text so even changes past 12k chars trigger reliably
+        var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(text));
+        var hashPrefix = Convert.ToHexString(hashBytes[..8]).ToLowerInvariant();
+        var bodySlice = text.Length > 12000 ? text[..12000] : text;
+        return $"sha256:{hashPrefix}\n{bodySlice}";
+    }
+
+    private static string StripHtmlToStructuredLines(string html)
+    {
+        // Preserve table cells as " | " and row/block boundaries as newlines so diffs read cleanly
+        var s = Regex.Replace(html, @"</(td|th)\s*>", " | ", RegexOptions.IgnoreCase);
+        s = Regex.Replace(s, @"<(br|/tr|/p|/div|/li|/h[1-6]|/section|/article|/table)\b[^>]*>", "\n", RegexOptions.IgnoreCase);
+        s = Regex.Replace(s, @"<[^>]+>", " ");
+        s = WebUtility.HtmlDecode(s);
+
+        var lines = s.Split('\n');
+        var kept = new List<string>(lines.Length);
+        foreach (var raw in lines)
+        {
+            var line = Regex.Replace(raw, @"[ \t\r]+", " ").Trim();
+            line = Regex.Replace(line, @"(\s*\|\s*){2,}", " | ").Trim(' ', '|');
+            if (!string.IsNullOrWhiteSpace(line))
+                kept.Add(line);
+        }
+        return string.Join("\n", kept);
+    }
+
+    internal static string BuildReadableDiffSummary(string? previousSnapshot, string currentValue, int maxChars = 600)
+    {
+        if (!currentValue.StartsWith("sha256:", StringComparison.Ordinal))
+            return FormatSnapshotPreview(currentValue, maxChars);
+
+        var curBody = StripHashHeader(currentValue);
+        var prevBody = previousSnapshot is not null && previousSnapshot.StartsWith("sha256:", StringComparison.Ordinal)
+            ? StripHashHeader(previousSnapshot)
+            : "";
+
+        var prevLines = new HashSet<string>(
+            prevBody.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
+            StringComparer.Ordinal);
+
+        var added = new List<string>();
+        foreach (var line in curBody.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!prevLines.Contains(line))
+            {
+                added.Add($"• {line}");
+                if (added.Count >= 12) break;
+            }
+        }
+
+        var summary = added.Count > 0
+            ? string.Join("\n", added)
+            : "網頁內容有變更（部分區塊已移除或更新）。";
+
+        return summary.Length > maxChars ? summary[..maxChars] + "…" : summary;
+    }
+
+    public static string FormatSnapshotPreview(string? snapshot, int maxChars = 160)
+    {
+        if (string.IsNullOrWhiteSpace(snapshot)) return "(尚未取得快照)";
+        var body = snapshot.StartsWith("sha256:", StringComparison.Ordinal)
+            ? StripHashHeader(snapshot)
+            : snapshot;
+        var flat = Regex.Replace(body, @"\s*\n+\s*", " · ").Trim();
+        if (string.IsNullOrWhiteSpace(flat)) return "(空白內容)";
+        return flat.Length > maxChars ? flat[..maxChars] + "…" : flat;
+    }
+
+    private static string StripHashHeader(string snapshot)
+    {
+        var nl = snapshot.IndexOf('\n');
+        return nl >= 0 && nl + 1 < snapshot.Length ? snapshot[(nl + 1)..] : "";
+    }
+
+    private static string ExtractHashLine(string snapshot)
+    {
+        var nl = snapshot.IndexOf('\n');
+        return nl >= 0 ? snapshot[..nl] : snapshot;
+    }
+
     public static bool ShouldTrigger(string conditionType, string? thresholdValue, string? previousSnapshot, string currentValue)
     {
         var cond = conditionType.Trim().ToLowerInvariant();
         if (cond == "changed")
-            return previousSnapshot is not null && !string.Equals(previousSnapshot, currentValue, StringComparison.Ordinal);
+        {
+            if (previousSnapshot is null)
+                return false;
+
+            // Silent one-time baseline upgrade when migrating legacy 300-char snapshots to full-page sha256 snapshots.
+            bool curHashed = currentValue.StartsWith("sha256:", StringComparison.Ordinal);
+            bool prevHashed = previousSnapshot.StartsWith("sha256:", StringComparison.Ordinal);
+            if (curHashed && !prevHashed)
+                return false;
+            if (curHashed && prevHashed)
+                return !string.Equals(ExtractHashLine(previousSnapshot), ExtractHashLine(currentValue), StringComparison.Ordinal);
+
+            return !string.Equals(previousSnapshot, currentValue, StringComparison.Ordinal);
+        }
 
         if (cond == "contains")
         {

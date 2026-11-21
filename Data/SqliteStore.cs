@@ -2692,6 +2692,40 @@ public sealed class SqliteStore
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    public async Task<List<AutonomyPolicyRecord>> GetAllAutonomyPoliciesAsync(CancellationToken ct = default)
+    {
+        var list = new List<AutonomyPolicyRecord>();
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT ActionClass, Domain, Level, Accepted, Rejected, UpdatedAt
+            FROM AutonomyPolicies
+            ORDER BY UpdatedAt DESC;
+            """;
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            list.Add(new AutonomyPolicyRecord(
+                ActionClass: r.GetString(0),
+                Domain: r.GetString(1),
+                Level: r.GetInt32(2),
+                Accepted: r.GetInt32(3),
+                Rejected: r.GetInt32(4),
+                UpdatedAt: DateTimeOffset.Parse(r.GetString(5))));
+        }
+        return list;
+    }
+
+    public async Task<bool> DeleteAutonomyPolicyAsync(string actionClass, string domain, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM AutonomyPolicies WHERE ActionClass = @ac AND Domain = @dom;";
+        cmd.Parameters.AddWithValue("@ac", actionClass);
+        cmd.Parameters.AddWithValue("@dom", domain);
+        return await cmd.ExecuteNonQueryAsync(ct) > 0;
+    }
+
     public async Task<bool> DeleteWorkflowCacheAsync(string workflowId, CancellationToken ct = default)
     {
         await using var conn = await OpenAsync(ct);
