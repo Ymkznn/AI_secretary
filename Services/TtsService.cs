@@ -164,6 +164,13 @@ public sealed class TtsService : IDisposable
         return profiles.TryGetValue(group, out var g) ? g : null;
     }
 
+    public string? GetActiveStyleFilePath()
+    {
+        if (!IsEnabled) return null;
+        return GetActiveProfileSettings()?.StylePromptPath
+               ?? FindVoiceAsset(GetWeightGroup(_voiceProfile), "*.md");
+    }
+
     public string? GetActiveStylePrompt()
     {
         if (!IsEnabled) return null;

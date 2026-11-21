@@ -2248,17 +2248,13 @@ public sealed class SecretaryController : IDisposable
     private readonly object _proactiveStateLock = new();
     private readonly List<ProactiveTopicKind> _recentProactiveTopics = new();
     private List<string>? _recentCustomSharesCache;
-    private int _unansweredProactiveCount;
     private int _nextProactiveIdleMinutes = -1;
     private ProactiveAwarenessLevel _lastAwarenessLevel = ProactiveAwarenessLevel.Normal;
     private string _lastAwarenessSource = "default";
 
-    /// <summary>Resets proactive exponential backoff back to base interval on any user interaction.</summary>
     private void MarkUserInteraction()
     {
         _lastUserActivityUtc = DateTimeOffset.UtcNow;
-        Interlocked.Exchange(ref _unansweredProactiveCount, 0);
-        RollNextProactiveMinutes();
     }
 
     private int RollNextProactiveMinutes()
@@ -2266,10 +2262,49 @@ public sealed class SecretaryController : IDisposable
         var sched = _settings.Current.Scheduler;
         int min = Math.Clamp(sched.ProactiveIdleMinMinutes > 0 ? sched.ProactiveIdleMinMinutes : sched.ProactiveIdleMinutes, 5, 180);
         int max = Math.Clamp(sched.ProactiveIdleMaxMinutes > 0 ? sched.ProactiveIdleMaxMinutes : sched.ProactiveIdleMinutes, min, 180);
-        int unanswered = Volatile.Read(ref _unansweredProactiveCount);
-        _nextProactiveIdleMinutes = ProactiveBackoffCalculator.ComputeNextIntervalMinutes(
-            min, max, unanswered, sched.ProactiveBackoffMaxMinutes);
+        _nextProactiveIdleMinutes = min == max ? min : Random.Shared.Next(min, max + 1);
         return _nextProactiveIdleMinutes;
+    }
+
+    public Task<List<KnowledgeFactRecord>> GetKnowledgeFactsAsync(int limit = 60)
+        => _store.GetAllKnowledgeFactsAsync(ConversationId, limit, _appCts.Token);
+
+    public async Task AddProactiveTopicFactAsync(string summary, string detail)
+    {
+        var cleanSummary = (summary ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(cleanSummary)) return;
+        var cleanDetail = string.IsNullOrWhiteSpace(detail) ? cleanSummary : detail.Trim();
+        var now = DateTimeOffset.UtcNow;
+        var fact = new KnowledgeFactRecord(
+            FactId: $"fact_{Guid.NewGuid():N}"[..16],
+            ConversationId: ConversationId,
+            Category: "user_pref",
+            Summary: cleanSummary,
+            Detail: cleanDetail,
+            Evidence: "added via monitor UI",
+            Confidence: "observed",
+            Tags: new List<string> { ProactiveTopicEngine.CustomTopicTag },
+            CreatedAt: now,
+            UpdatedAt: now,
+            MemoryKey: $"{ProactiveTopicEngine.CustomTopicTag}:{Guid.NewGuid():N}"[..32],
+            State: "Confirmed",
+            ReinforceCount: 1);
+        await _store.UpsertFactAsync(fact, _appCts.Token);
+        AgentsChanged?.Invoke();
+    }
+
+    public async Task UpdateKnowledgeFactAsync(string factId, string summary, string detail)
+    {
+        if (string.IsNullOrWhiteSpace(factId) || string.IsNullOrWhiteSpace(summary)) return;
+        await _store.UpdateFactAsync(factId, summary.Trim(), string.IsNullOrWhiteSpace(detail) ? summary.Trim() : detail.Trim(), category: null, evidence: null, _appCts.Token);
+        AgentsChanged?.Invoke();
+    }
+
+    public async Task DeleteKnowledgeFactAsync(string factId)
+    {
+        if (string.IsNullOrWhiteSpace(factId)) return;
+        await _store.DeleteFactAsync(factId, _appCts.Token);
+        AgentsChanged?.Invoke();
     }
 
     public (bool Enabled, int MinMinutes, int MaxMinutes) GetProactiveChatSettings()
@@ -2340,8 +2375,7 @@ public sealed class SecretaryController : IDisposable
             "llm" => "人設判讀",
             _ => "預設"
         };
-        var interval = _nextProactiveIdleMinutes > 0 ? $"{_nextProactiveIdleMinutes}m" : "-";
-        return $"{_presence.FormatStatusLabel()}｜主動度：{lvl}（{src}）｜下輪 {interval}";
+        return $"{_presence.FormatStatusLabel()}｜主動度：{lvl}（{src}）";
     }
     public void NotifyDisplayPowerState(bool isOn) => _presence.NotifyDisplayPowerState(isOn);
 
@@ -2475,7 +2509,7 @@ public sealed class SecretaryController : IDisposable
             _lastAwarenessSource = result.AwarenessSource;
         }
 
-        // Skip (or suppressed) does NOT count as unanswered check-in.
+        // Skip (or suppressed): stay silent and wait for next normal check-in interval.
         if (result is null || result.Skipped || string.IsNullOrWhiteSpace(result.Reply) || HasRunningTasks || IsDndActive())
         {
             RollNextProactiveMinutes();
@@ -2493,7 +2527,6 @@ public sealed class SecretaryController : IDisposable
         if (result.SelectedTopic == ProactiveTopicKind.CustomUserTopic && !string.IsNullOrWhiteSpace(result.SharedSummary))
             await AppendRecentCustomShareAsync(result.SharedSummary, ct);
 
-        Interlocked.Increment(ref _unansweredProactiveCount);
         RollNextProactiveMinutes();
 
         var proactiveNow = DateTimeOffset.UtcNow;

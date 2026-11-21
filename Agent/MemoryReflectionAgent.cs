@@ -2,6 +2,7 @@ using System.Text.Json;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
 using AiSecretary.Desktop.Prompts;
+using AiSecretary.Desktop.Services;
 using Microsoft.Extensions.Logging;
 
 namespace AiSecretary.Desktop.Agent;
@@ -17,6 +18,8 @@ public sealed class MemoryReflectionAgent : IDisposable
     private readonly IModelGateway _model;
     private readonly SkillRuntime _skills;
     private readonly GuardService _guard;
+    private readonly TtsService _tts;
+    private readonly StyleService _styles;
     private readonly ILogger<MemoryReflectionAgent> _logger;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
@@ -25,12 +28,16 @@ public sealed class MemoryReflectionAgent : IDisposable
         IModelGateway model,
         SkillRuntime skills,
         GuardService guard,
+        TtsService tts,
+        StyleService styles,
         ILogger<MemoryReflectionAgent> logger)
     {
         _store = store;
         _model = model;
         _skills = skills;
         _guard = guard;
+        _tts = tts;
+        _styles = styles;
         _logger = logger;
     }
 
@@ -180,6 +187,23 @@ public sealed class MemoryReflectionAgent : IDisposable
             {
                 case "record":
                     if (string.IsNullOrWhiteSpace(summary) || string.IsNullOrWhiteSpace(detail)) continue;
+                    bool isAwarenessOp =
+                        string.Equals(memKey, ProactiveTopicEngine.AwarenessTag, StringComparison.OrdinalIgnoreCase) ||
+                        (parsedTags is not null && parsedTags.Any(t => string.Equals(t, ProactiveTopicEngine.AwarenessTag, StringComparison.OrdinalIgnoreCase)));
+                    if (isAwarenessOp)
+                    {
+                        var styleScope = ProactiveTopicEngine.ResolveStyleScopeKey(
+                            _tts.GetActiveStyleFilePath() ?? _styles.ActiveStylePath,
+                            _tts.GetActiveStylePrompt() ?? _styles.GetActiveStylePrompt());
+                        memKey = ProactiveTopicEngine.BuildAwarenessMemoryKey(styleScope);
+                        category = "user_pref";
+                        parsedTags ??= new List<string>();
+                        if (!parsedTags.Any(t => string.Equals(t, ProactiveTopicEngine.AwarenessTag, StringComparison.OrdinalIgnoreCase)))
+                            parsedTags.Add(ProactiveTopicEngine.AwarenessTag);
+                        var scopeTag = ProactiveTopicEngine.BuildStyleScopeTag(styleScope);
+                        if (!parsedTags.Any(t => string.Equals(t, scopeTag, StringComparison.OrdinalIgnoreCase)))
+                            parsedTags.Add(scopeTag);
+                    }
                     await _skills.RecordFactAsync(
                         conversationId: conversationId,
                         summary: summary,

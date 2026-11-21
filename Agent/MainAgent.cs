@@ -1003,20 +1003,22 @@ public sealed class MainAgent
     }
 
     /// <summary>
-    /// Resolves effective proactive screen-awareness level with strict precedence:
-    /// Verbal override (Confirmed user_pref tagged proactive_awareness) > cached LLM classification by SHA-256 > default Normal.
+    /// Resolves effective proactive screen-awareness level per style file with strict precedence:
+    /// Verbal override bound to <paramref name="styleScopeKey"/> > cached LLM classification by SHA-256 > default Normal.
     /// </summary>
     internal static async Task<(ProactiveAwarenessLevel Level, string Source)> ResolveProactiveAwarenessAsync(
         SqliteStore store,
         IModelGateway model,
         string conversationId,
+        string styleScopeKey,
         string activeStylePrompt,
         IReadOnlyList<KnowledgeFactRecord> confirmedProactivePrefs,
         ILogger? logger,
         CancellationToken ct)
     {
-        // 1) Verbal override ALWAYS wins (zero LLM calls needed when overridden).
-        var (overrideLevel, overrideSrc) = ProactiveTopicEngine.ResolveEffectiveAwareness(confirmedProactivePrefs, llmClassifiedLevel: null);
+        // 1) Per-style-file verbal override ALWAYS wins (zero LLM calls needed when overridden).
+        var (overrideLevel, overrideSrc) = ProactiveTopicEngine.ResolveEffectiveAwareness(
+            confirmedProactivePrefs, styleScopeKey, llmClassifiedLevel: null);
         if (overrideSrc == "override")
             return (overrideLevel, "override");
 
@@ -1026,7 +1028,7 @@ public sealed class MainAgent
         var cachedRaw = await store.GetSyncValueAsync(cacheKey, ct);
         var cachedLevel = ProactiveTopicEngine.TryParseAwarenessLevel(cachedRaw);
         if (cachedLevel.HasValue)
-            return ProactiveTopicEngine.ResolveEffectiveAwareness(confirmedProactivePrefs, cachedLevel);
+            return ProactiveTopicEngine.ResolveEffectiveAwareness(confirmedProactivePrefs, styleScopeKey, cachedLevel);
 
         // 3) First time seeing this style hash: classify once with Simple LLM (language-agnostic); default Normal on failure.
         try
@@ -1060,7 +1062,7 @@ public sealed class MainAgent
             if (parsed.HasValue)
             {
                 await store.SetSyncValueAsync(cacheKey, ProactiveTopicEngine.ToCanonicalString(parsed.Value), ct);
-                return ProactiveTopicEngine.ResolveEffectiveAwareness(confirmedProactivePrefs, parsed.Value);
+                return ProactiveTopicEngine.ResolveEffectiveAwareness(confirmedProactivePrefs, styleScopeKey, parsed.Value);
             }
         }
         catch (Exception ex)
@@ -1073,7 +1075,7 @@ public sealed class MainAgent
 
     /// <summary>
     /// 依目前啟用的角色語氣設定與程式抽選出的單一話題，產生一句主動關心搭話或允許跳過（{"skip": true}）。
-    /// 不再將歷史中的自家主動搭話送入模型，徹底切斷自我模仿。
+    /// 僅濾除先前的自家主動搭話（TaskId = 'proactive'），保留真正完成的對話／任務紀錄供 OngoingThread 延續。
     /// </summary>
     public async Task<ProactiveGenerationResult?> GenerateProactiveStyleLineAsync(
         string conversationId,
@@ -1089,14 +1091,18 @@ public sealed class MainAgent
         if (string.IsNullOrWhiteSpace(activeStylePrompt))
             return null;
 
+        var styleScopeKey = ProactiveTopicEngine.ResolveStyleScopeKey(
+            _tts.GetActiveStyleFilePath() ?? _styles.ActiveStylePath,
+            activeStylePrompt);
+
         var nowLocal = DateTimeOffset.Now;
         var confirmedPrefs = await _store.GetConfirmedProactivePrefsAsync(conversationId, ct);
         var (awarenessLevel, awarenessSource) = await ResolveProactiveAwarenessAsync(
-            _store, _model, conversationId, activeStylePrompt, confirmedPrefs, _logger, ct);
+            _store, _model, conversationId, styleScopeKey, activeStylePrompt, confirmedPrefs, _logger, ct);
 
-        // OngoingThread sources strictly exclude assistant messages:
-        // 1) last 24h user-only messages (max 3), 2) pending confirmations, 3) recent significant Blackboard results.
-        var userMsgs24h = await _store.GetRecentUserOnlyMessagesAsync(conversationId, DateTimeOffset.UtcNow.AddHours(-24), 3, ct);
+        // OngoingThread keeps real completed conversation turns (user + non-proactive assistant replies)
+        // while strictly excluding prior proactive idle check-ins (TaskId = 'proactive').
+        var recentTurns24h = await _store.GetRecentNonProactiveChatTurnsAsync(conversationId, DateTimeOffset.UtcNow.AddHours(-24), 6, ct);
         var bbSnap = _blackboard.GetSnapshot(maxRecentResults: 4, maxAge: TimeSpan.FromHours(6));
         var bbHighlights = bbSnap.RecentResults
             .Where(r => r.IsSignificant && !string.IsNullOrWhiteSpace(r.Summary))
@@ -1106,7 +1112,7 @@ public sealed class MainAgent
 
         var ctx = new ProactiveTopicContext(
             Now: nowLocal,
-            RecentUserMessages24h: userMsgs24h,
+            RecentConversationTurns24h: recentTurns24h,
             PendingConfirmations: pendingConfirmations,
             RecentBlackboardResults: bbHighlights,
             PinnedReminders: pinnedReminders,
@@ -1151,7 +1157,8 @@ public sealed class MainAgent
                     SelectedTopic: selection.Topic,
                     SharedSummary: null,
                     AwarenessLevel: awarenessLevel,
-                    AwarenessSource: awarenessSource);
+                    AwarenessSource: awarenessSource,
+                    StyleScopeKey: styleScopeKey);
             }
 
             var reply = doc.RootElement.TryGetProperty("reply", out var r) ? r.GetString()?.Trim() : null;
@@ -1171,7 +1178,8 @@ public sealed class MainAgent
                     SelectedTopic: selection.Topic,
                     SharedSummary: null,
                     AwarenessLevel: awarenessLevel,
-                    AwarenessSource: awarenessSource);
+                    AwarenessSource: awarenessSource,
+                    StyleScopeKey: styleScopeKey);
             }
 
             if (selection.Topic == ProactiveTopicKind.CustomUserTopic && string.IsNullOrWhiteSpace(sharedSummary))
@@ -1184,7 +1192,8 @@ public sealed class MainAgent
                 SelectedTopic: selection.Topic,
                 SharedSummary: sharedSummary,
                 AwarenessLevel: awarenessLevel,
-                AwarenessSource: awarenessSource);
+                AwarenessSource: awarenessSource,
+                StyleScopeKey: styleScopeKey);
         }
         catch (Exception ex)
         {

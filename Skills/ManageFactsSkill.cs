@@ -1,4 +1,5 @@
 using AiSecretary.Desktop.Agent;
+using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -8,10 +9,14 @@ namespace AiSecretary.Desktop.Skills;
 public sealed class ManageFactsSkill : IBasicSkill
 {
     private readonly SkillRuntime _skills;
+    private readonly TtsService _tts;
+    private readonly StyleService _styles;
 
-    public ManageFactsSkill(SkillRuntime skills)
+    public ManageFactsSkill(SkillRuntime skills, TtsService tts, StyleService styles)
     {
         _skills = skills;
+        _tts = tts;
+        _styles = styles;
     }
 
     public string Name => "manage_facts";
@@ -80,10 +85,16 @@ public sealed class ManageFactsSkill : IBasicSkill
         var confidence = ctx.GetArg("confidence") ?? "observed";
         var tags = ctx.GetStringArrayArg("tags");
         string? memoryKey = null;
-        if (tags is not null && tags.Any(t => string.Equals(t, Services.ProactiveTopicEngine.AwarenessTag, StringComparison.OrdinalIgnoreCase)))
+        if (tags is not null && tags.Any(t => string.Equals(t, ProactiveTopicEngine.AwarenessTag, StringComparison.OrdinalIgnoreCase)))
         {
-            memoryKey = Services.ProactiveTopicEngine.AwarenessTag;
+            var styleScope = ProactiveTopicEngine.ResolveStyleScopeKey(
+                _tts.GetActiveStyleFilePath() ?? _styles.ActiveStylePath,
+                _tts.GetActiveStylePrompt() ?? _styles.GetActiveStylePrompt());
+            memoryKey = ProactiveTopicEngine.BuildAwarenessMemoryKey(styleScope);
             category = "user_pref";
+            var scopeTag = ProactiveTopicEngine.BuildStyleScopeTag(styleScope);
+            if (!tags.Any(t => string.Equals(t, scopeTag, StringComparison.OrdinalIgnoreCase)))
+                tags.Add(scopeTag);
         }
 
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));

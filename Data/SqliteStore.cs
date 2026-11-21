@@ -1613,24 +1613,75 @@ public sealed class SqliteStore
     }
 
     /// <summary>
-    /// Returns up to <paramref name="limit"/> recent user-authored messages since <paramref name="sinceUtc"/>
-    /// in chronological order, strictly excluding all assistant messages to prevent proactive self-imitation.
+    /// Returns all recent non-expired KnowledgeFacts (newest first) for UI management (view/add/edit/delete).
     /// </summary>
-    public async Task<List<string>> GetRecentUserOnlyMessagesAsync(
+    public async Task<List<KnowledgeFactRecord>> GetAllKnowledgeFactsAsync(
         string conversationId,
-        DateTimeOffset sinceUtc,
-        int limit = 3,
+        int limit = 60,
         CancellationToken ct = default)
     {
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT Content
+            SELECT FactId, ConversationId, Category, Summary, Detail, Evidence, Confidence, TagsJson, CreatedAt, UpdatedAt,
+                   COALESCE(MemoryKey, ''), COALESCE(State, 'Confirmed'), COALESCE(ReinforceCount, 1), ExpiresAt, LastVerifiedAt
+            FROM KnowledgeFacts
+            WHERE ConversationId = $conv
+              AND (ExpiresAt IS NULL OR ExpiresAt > $now)
+            ORDER BY UpdatedAt DESC
+            LIMIT $limit;
+            """;
+        cmd.Parameters.AddWithValue("$conv", conversationId);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 200));
+
+        var list = new List<KnowledgeFactRecord>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var tagsJson = reader.IsDBNull(7) ? "[]" : reader.GetString(7);
+            var tags = JsonSerializer.Deserialize<List<string>>(tagsJson) ?? new List<string>();
+            list.Add(new KnowledgeFactRecord(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                reader.GetString(6),
+                tags,
+                DateTimeOffset.Parse(reader.GetString(8)),
+                DateTimeOffset.Parse(reader.GetString(9)),
+                MemoryKey: reader.GetString(10),
+                State: reader.GetString(11),
+                ReinforceCount: reader.GetInt32(12),
+                ExpiresAt: reader.IsDBNull(13) ? null : DateTimeOffset.Parse(reader.GetString(13)),
+                LastVerifiedAt: reader.IsDBNull(14) ? null : DateTimeOffset.Parse(reader.GetString(14))));
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// Returns up to <paramref name="limit"/> recent real conversation turns (user prompts AND real completed assistant replies)
+    /// since <paramref name="sinceUtc"/> in chronological order, strictly excluding prior proactive idle check-ins (TaskId = 'proactive')
+    /// so completed work remains usable topic material while self-imitation is cut off.
+    /// </summary>
+    public async Task<List<string>> GetRecentNonProactiveChatTurnsAsync(
+        string conversationId,
+        DateTimeOffset sinceUtc,
+        int limit = 6,
+        CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT Role, Content
             FROM (
-                SELECT Content, CreatedAt, RevealedAt
+                SELECT Role, Content, CreatedAt, RevealedAt
                 FROM ChatMessages
                 WHERE ConversationId = $conv
-                  AND Role = 'user'
+                  AND Role IN ('user', 'assistant')
+                  AND COALESCE(TaskId, '') <> 'proactive'
                   AND COALESCE(RevealedAt, CreatedAt) >= $since
                   AND trim(COALESCE(Content, '')) <> ''
                 ORDER BY COALESCE(RevealedAt, CreatedAt) DESC, CreatedAt DESC
@@ -1640,15 +1691,16 @@ public sealed class SqliteStore
             """;
         cmd.Parameters.AddWithValue("$conv", conversationId);
         cmd.Parameters.AddWithValue("$since", sinceUtc.ToString("O"));
-        cmd.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 10));
+        cmd.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 12));
 
         var list = new List<string>();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
-            var c = reader.GetString(0)?.Trim();
+            var role = reader.GetString(0);
+            var c = reader.GetString(1)?.Trim();
             if (!string.IsNullOrWhiteSpace(c))
-                list.Add(c);
+                list.Add($"[{role}] {c}");
         }
         return list;
     }

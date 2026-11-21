@@ -60,6 +60,7 @@ public partial class AgentMonitorWindow : Wpf.Ui.Controls.FluentWindow
         var calendarEvents = await _controller.GetCalendarEventsAsync();
         var pinned = _controller.GetPinnedReminders();
         var learnedRules = await _controller.GetLearnedStateRulesAsync();
+        var knowledgeFacts = await _controller.GetKnowledgeFactsAsync(60);
         var autonomyPolicies = await _controller.GetAutonomyPoliciesAsync();
         var learningEvents = await _controller.GetRecentLearningEventsAsync(15);
 
@@ -369,6 +370,94 @@ public partial class AgentMonitorWindow : Wpf.Ui.Controls.FluentWindow
             }
         });
 
+        // 7b) 長期記憶、口頭覆寫與自訂主動話題（KnowledgeFacts — 可自由新增／編輯／刪除）
+        AddCollapsibleSection("knowledge_facts", "💡 記憶偏好與自訂話題（KnowledgeFacts）", knowledgeFacts.Count, defaultExpanded: false, body =>
+        {
+            var topBar = new StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            var addTopicBtn = MakeActionBtn("＋ 新增主動話題", UiAppearance.Primary, compact: true);
+            addTopicBtn.Click += async (_, _) =>
+            {
+                var input = ShowFactEditDialog("新增常駐主動話題", "", "");
+                if (input is not null)
+                    await _controller.AddProactiveTopicFactAsync(input.Value.Summary, input.Value.Detail);
+            };
+            topBar.Children.Add(addTopicBtn);
+            body.Children.Add(topBar);
+
+            if (knowledgeFacts.Count == 0)
+            {
+                body.Children.Add(MakeEmptyNote("尚未記錄任何長期記憶、口頭覆寫或自訂主動話題。"));
+                return;
+            }
+
+            foreach (var f in knowledgeFacts)
+            {
+                var fcard = MakeCard(cardBg, cardBorder, compact: true);
+                var dock = new DockPanel { LastChildFill = true };
+
+                var btnPanel = new StackPanel
+                {
+                    Orientation = System.Windows.Controls.Orientation.Horizontal,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                var factCopy = f;
+                var editBtn = MakeActionBtn("編輯", UiAppearance.Secondary, compact: true);
+                editBtn.Margin = new Thickness(0, 0, 6, 0);
+                editBtn.Click += async (_, _) =>
+                {
+                    var edited = ShowFactEditDialog("編輯記憶／主動話題", factCopy.Summary, factCopy.Detail);
+                    if (edited is not null)
+                        await _controller.UpdateKnowledgeFactAsync(factCopy.FactId, edited.Value.Summary, edited.Value.Detail);
+                };
+                var delBtn = MakeActionBtn("刪除", UiAppearance.Danger, compact: true);
+                delBtn.Click += async (_, _) => await _controller.DeleteKnowledgeFactAsync(factCopy.FactId);
+                btnPanel.Children.Add(editBtn);
+                btnPanel.Children.Add(delBtn);
+                DockPanel.SetDock(btnPanel, Dock.Right);
+                dock.Children.Add(btnPanel);
+
+                bool isCustomTopic = f.Tags.Any(t => string.Equals(t, ProactiveTopicEngine.CustomTopicTag, StringComparison.OrdinalIgnoreCase)) ||
+                                     string.Equals(f.Category, ProactiveTopicEngine.CustomTopicTag, StringComparison.OrdinalIgnoreCase);
+                bool isAwareness = f.Tags.Any(t => string.Equals(t, ProactiveTopicEngine.AwarenessTag, StringComparison.OrdinalIgnoreCase)) ||
+                                   f.MemoryKey.StartsWith(ProactiveTopicEngine.AwarenessTag, StringComparison.OrdinalIgnoreCase);
+                var kindTag = isCustomTopic ? "[自訂話題]" : isAwareness ? "[主動度覆寫]" : $"[{f.Category}]";
+                var stateTag = string.Equals(f.State, "Candidate", StringComparison.OrdinalIgnoreCase)
+                    ? $"（候選 {f.ReinforceCount}次）"
+                    : "";
+
+                var info = new StackPanel { Margin = new Thickness(0, 0, 10, 0) };
+                info.Children.Add(new TextBlock
+                {
+                    Text = $"{kindTag}{stateTag} {f.Summary}",
+                    FontWeight = FontWeights.SemiBold,
+                    TextWrapping = TextWrapping.Wrap
+                });
+                var metaParts = new List<string>();
+                if (!string.IsNullOrWhiteSpace(f.Detail) && !string.Equals(f.Detail, f.Summary, StringComparison.Ordinal))
+                    metaParts.Add(f.Detail.Length > 140 ? f.Detail[..140] + "…" : f.Detail);
+                if (!string.IsNullOrWhiteSpace(f.MemoryKey))
+                    metaParts.Add($"key={f.MemoryKey}");
+                if (f.Tags.Count > 0)
+                    metaParts.Add($"tags={string.Join(",", f.Tags)}");
+                info.Children.Add(new TextBlock
+                {
+                    Text = string.Join(" ｜ ", metaParts),
+                    FontSize = 11.5,
+                    Opacity = 0.72,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 2, 0, 0)
+                });
+
+                dock.Children.Add(info);
+                fcard.Child = dock;
+                body.Children.Add(fcard);
+            }
+        });
+
         // 8) 驗證碼與動作自治等級（Autonomy Policies）
         AddCollapsibleSection("autonomy_policies", "🛡️ 驗證碼與動作自治等級（Autonomy）", autonomyPolicies.Count, defaultExpanded: false, body =>
         {
@@ -633,6 +722,70 @@ public partial class AgentMonitorWindow : Wpf.Ui.Controls.FluentWindow
             _sectionExpanded[key] = false;
             exp.IsExpanded = false;
         }
+    }
+
+    private (string Summary, string Detail)? ShowFactEditDialog(string title, string initialSummary, string initialDetail)
+    {
+        var dlg = new Window
+        {
+            Title = title,
+            Width = 440,
+            Height = 270,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = this,
+            ResizeMode = ResizeMode.NoResize,
+            Background = BrushFrom(_isDark ? "#202020" : "#F8FAFC"),
+            Foreground = BrushFrom(_isDark ? "#F3F4F6" : "#111827")
+        };
+
+        var root = new StackPanel { Margin = new Thickness(16) };
+        root.Children.Add(new TextBlock { Text = "標題／摘要", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 4) });
+        var summaryBox = new System.Windows.Controls.TextBox
+        {
+            Text = initialSummary,
+            Margin = new Thickness(0, 0, 0, 10),
+            Padding = new Thickness(6, 4, 6, 4)
+        };
+        root.Children.Add(summaryBox);
+
+        root.Children.Add(new TextBlock { Text = "詳細說明（選填）", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 4) });
+        var detailBox = new System.Windows.Controls.TextBox
+        {
+            Text = initialDetail,
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.Wrap,
+            Height = 76,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Margin = new Thickness(0, 0, 0, 12),
+            Padding = new Thickness(6, 4, 6, 4)
+        };
+        root.Children.Add(detailBox);
+
+        var btns = new StackPanel
+        {
+            Orientation = System.Windows.Controls.Orientation.Horizontal,
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Right
+        };
+        var cancelBtn = MakeActionBtn("取消", UiAppearance.Secondary, compact: true);
+        cancelBtn.Margin = new Thickness(0, 0, 8, 0);
+        cancelBtn.Click += (_, _) => { dlg.DialogResult = false; dlg.Close(); };
+
+        var okBtn = MakeActionBtn("儲存", UiAppearance.Primary, compact: true);
+        okBtn.Click += (_, _) =>
+        {
+            if (string.IsNullOrWhiteSpace(summaryBox.Text)) return;
+            dlg.DialogResult = true;
+            dlg.Close();
+        };
+
+        btns.Children.Add(cancelBtn);
+        btns.Children.Add(okBtn);
+        root.Children.Add(btns);
+        dlg.Content = root;
+
+        return dlg.ShowDialog() == true
+            ? (summaryBox.Text.Trim(), detailBox.Text.Trim())
+            : null;
     }
 
     private void StopAllBtn_Click(object sender, RoutedEventArgs e) => _controller.StopAllTasks();

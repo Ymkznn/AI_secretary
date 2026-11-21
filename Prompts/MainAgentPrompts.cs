@@ -233,7 +233,7 @@ public static class MainAgentPrompts
         switch (selection.Topic)
         {
             case Services.ProactiveTopicKind.OngoingThread:
-                sb.AppendLine("ongoing_items (user-side & task highlights only):");
+                sb.AppendLine("ongoing_items (recent real conversation / completed work & task highlights — excludes prior idle check-ins):");
                 foreach (var item in selection.OngoingThreadItems)
                     sb.AppendLine($"- {item}");
                 break;

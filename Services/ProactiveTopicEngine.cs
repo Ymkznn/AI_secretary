@@ -30,7 +30,7 @@ public sealed record ProactiveActivitySnapshot(
 
 public sealed record ProactiveTopicContext(
     DateTimeOffset Now,
-    IReadOnlyList<string> RecentUserMessages24h,
+    IReadOnlyList<string> RecentConversationTurns24h,
     IReadOnlyList<string> PendingConfirmations,
     IReadOnlyList<string> RecentBlackboardResults,
     IReadOnlyList<string> PinnedReminders,
@@ -56,14 +56,14 @@ public sealed record ProactiveGenerationResult(
     ProactiveTopicKind SelectedTopic,
     string? SharedSummary,
     ProactiveAwarenessLevel AwarenessLevel,
-    string AwarenessSource);
+    string AwarenessSource,
+    string StyleScopeKey);
 
 /// <summary>
 /// Language-agnostic proactive idle check-in engine:
 /// - Programmatically picks ONE topic with weighted randomness and soft recency decay (lowers weight after being picked instead of hard-banning).
 /// - Passes window/tab title directly ONLY when CurrentActivity is picked (incognito stays redacted).
-/// - Resolves effective awareness strictly by precedence: verbal override > cached LLM classification > default Normal.
-/// - Computes exponential backoff intervals on consecutive unanswered check-ins.
+/// - Resolves effective awareness strictly per style file: verbal override for this style file > cached LLM classification by SHA-256 > default Normal.
 /// </summary>
 public static class ProactiveTopicEngine
 {
@@ -84,6 +84,34 @@ public static class ProactiveTopicEngine
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(normalized));
         return Convert.ToHexString(bytes).ToLowerInvariant();
     }
+
+    /// <summary>
+    /// Derives a stable per-style-file identifier (e.g. "sana_style_prompt") so verbal awareness overrides
+    /// bind strictly to that specific persona file and never leak across different personas.
+    /// </summary>
+    public static string ResolveStyleScopeKey(string? styleFilePath, string? stylePromptFallback = null)
+    {
+        if (!string.IsNullOrWhiteSpace(styleFilePath))
+        {
+            var stem = Path.GetFileNameWithoutExtension(styleFilePath.Trim());
+            if (!string.IsNullOrWhiteSpace(stem))
+            {
+                var clean = Regex.Replace(stem.ToLowerInvariant(), @"[^a-z0-9_\-\u4e00-\u9fff\u3040-\u30ff]+", "_").Trim('_');
+                if (!string.IsNullOrWhiteSpace(clean))
+                    return clean;
+            }
+        }
+
+        return string.IsNullOrWhiteSpace(stylePromptFallback)
+            ? "default"
+            : ComputeStyleHash(stylePromptFallback)[..12];
+    }
+
+    public static string BuildAwarenessMemoryKey(string styleScopeKey)
+        => $"{AwarenessTag}:{(string.IsNullOrWhiteSpace(styleScopeKey) ? "default" : styleScopeKey.Trim().ToLowerInvariant())}";
+
+    public static string BuildStyleScopeTag(string styleScopeKey)
+        => $"style:{(string.IsNullOrWhiteSpace(styleScopeKey) ? "default" : styleScopeKey.Trim().ToLowerInvariant())}";
 
     public static ProactiveAwarenessLevel? TryParseAwarenessLevel(string? text)
     {
@@ -122,23 +150,28 @@ public static class ProactiveTopicEngine
     };
 
     /// <summary>
-    /// Strict precedence: Verbal override (Confirmed user_pref tagged proactive_awareness) > cached LLM classification > default Normal.
+    /// Strict per-style-file precedence:
+    /// Verbal override bound to <paramref name="styleScopeKey"/> > cached LLM classification > default Normal.
     /// </summary>
     public static (ProactiveAwarenessLevel Level, string Source) ResolveEffectiveAwareness(
         IReadOnlyList<KnowledgeFactRecord> confirmedFacts,
+        string styleScopeKey,
         ProactiveAwarenessLevel? llmClassifiedLevel)
     {
+        var expectedMemKey = BuildAwarenessMemoryKey(styleScopeKey);
+        var expectedStyleTag = BuildStyleScopeTag(styleScopeKey);
+
         foreach (var fact in confirmedFacts)
         {
             if (!string.Equals(fact.State, "Confirmed", StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            bool isAwarenessOverride =
-                fact.Tags.Any(t => string.Equals(t, AwarenessTag, StringComparison.OrdinalIgnoreCase)) ||
-                string.Equals(fact.MemoryKey, AwarenessTag, StringComparison.OrdinalIgnoreCase) ||
-                fact.MemoryKey.StartsWith(AwarenessTag + ":", StringComparison.OrdinalIgnoreCase);
+            bool matchesKey = string.Equals(fact.MemoryKey, expectedMemKey, StringComparison.OrdinalIgnoreCase);
+            bool matchesTaggedPair =
+                fact.Tags.Any(t => string.Equals(t, AwarenessTag, StringComparison.OrdinalIgnoreCase)) &&
+                fact.Tags.Any(t => string.Equals(t, expectedStyleTag, StringComparison.OrdinalIgnoreCase));
 
-            if (!isAwarenessOverride)
+            if (!matchesKey && !matchesTaggedPair)
                 continue;
 
             var parsed = TryParseAwarenessLevel(fact.Detail) ?? TryParseAwarenessLevel(fact.Summary);
@@ -317,8 +350,8 @@ public static class ProactiveTopicEngine
     private static List<string> BuildOngoingThreadItems(ProactiveTopicContext ctx)
     {
         var items = new List<string>();
-        foreach (var msg in ctx.RecentUserMessages24h.Where(s => !string.IsNullOrWhiteSpace(s)).Take(3))
-            items.Add($"[user_recent] {Compact(msg, 180)}");
+        foreach (var turn in ctx.RecentConversationTurns24h.Where(s => !string.IsNullOrWhiteSpace(s)).Take(6))
+            items.Add(Compact(turn, 200));
         foreach (var c in ctx.PendingConfirmations.Where(s => !string.IsNullOrWhiteSpace(s)).Take(3))
             items.Add($"[awaiting_confirmation] {Compact(c, 160)}");
         foreach (var b in ctx.RecentBlackboardResults.Where(s => !string.IsNullOrWhiteSpace(s)).Take(3))
@@ -340,28 +373,5 @@ public static class ProactiveTopicEngine
     {
         var single = Regex.Replace(text.Trim(), @"\s+", " ");
         return single.Length <= maxLen ? single : single[..maxLen] + "…";
-    }
-}
-
-/// <summary>
-/// Exponential backoff interval calculator for unanswered proactive check-ins (e.g. 15 -> 30 -> 60 min).
-/// Skips do NOT advance unanswered count; any user interaction resets unanswered count to 0.
-/// </summary>
-public static class ProactiveBackoffCalculator
-{
-    public static int ComputeNextIntervalMinutes(
-        int baseMinMinutes,
-        int baseMaxMinutes,
-        int unansweredCount,
-        int backoffCapMinutes = 60,
-        Random? rng = null)
-    {
-        int min = Math.Clamp(baseMinMinutes, 1, 180);
-        int max = Math.Clamp(baseMaxMinutes, min, 180);
-        int cap = Math.Max(max, Math.Clamp(backoffCapMinutes, 15, 1440));
-        int baseRoll = min == max ? min : (rng ?? Random.Shared).Next(min, max + 1);
-        int shift = Math.Clamp(unansweredCount, 0, 10);
-        long scaled = (long)baseRoll << shift;
-        return (int)Math.Min(scaled, cap);
     }
 }

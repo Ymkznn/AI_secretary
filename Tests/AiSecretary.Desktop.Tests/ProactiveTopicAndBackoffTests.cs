@@ -13,13 +13,14 @@ public sealed class ProactiveTopicAndBackoffTests
 {
     private sealed class StubModelGateway : IModelGateway
     {
-        private readonly string _reply;
+        private readonly Queue<string> _replies;
         public int Calls { get; private set; }
-        public StubModelGateway(string reply) => _reply = reply;
+        public StubModelGateway(params string[] replies) => _replies = new Queue<string>(replies);
         public Task<ModelResponse> CompleteAsync(IReadOnlyList<ModelMessage> messages, LlmCallOptions options, CancellationToken ct = default)
         {
             Calls++;
-            return Task.FromResult(new ModelResponse(_reply, 50));
+            var next = _replies.Count > 1 ? _replies.Dequeue() : _replies.Peek();
+            return Task.FromResult(new ModelResponse(next, 50));
         }
     }
 
@@ -54,7 +55,7 @@ public sealed class ProactiveTopicAndBackoffTests
 
         ProactiveTopicContext MakeCtx(IReadOnlyList<ProactiveTopicKind> recent) => new(
             Now: new DateTimeOffset(2026, 11, 21, 22, 0, 0, TimeSpan.FromHours(8)),
-            RecentUserMessages24h: new[] { "幫我追蹤 EMS 單號" },
+            RecentConversationTurns24h: new[] { "[user] 幫我追蹤 EMS 單號", "[assistant] 已開始追蹤 EMS 單號" },
             PendingConfirmations: Array.Empty<string>(),
             RecentBlackboardResults: new[] { "EMS 追蹤: 已到達國際交換局" },
             PinnedReminders: new[] { "11/25 打 HTB Vaccine" },
@@ -105,7 +106,7 @@ public sealed class ProactiveTopicAndBackoffTests
         Assert.DoesNotContain("osu!", promptNonAct, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("嘆きの花", promptNonAct);
 
-        // 2) When CurrentActivity IS picked -> passes process + title directly (no coarse category masking)
+        // 2) When CurrentActivity IS picked -> passes process + title directly
         var normalPayload = ProactiveTopicEngine.FormatActivityForPrompt(activity, ProactiveAwarenessLevel.Normal);
         Assert.Equal("osu!: osu! - 水樹奈々 - 嘆きの花", normalPayload);
 
@@ -117,85 +118,75 @@ public sealed class ProactiveTopicAndBackoffTests
     }
 
     [Fact]
-    public void BackoffCalculator_DoublesOnUnanswered_CapsProperly_SkipDoesNotAdvance_AndInteractionResets()
-    {
-        // Fixed base 15m, cap 60m -> 15 -> 30 -> 60 -> 60
-        Assert.Equal(15, ProactiveBackoffCalculator.ComputeNextIntervalMinutes(15, 15, unansweredCount: 0, backoffCapMinutes: 60));
-        Assert.Equal(30, ProactiveBackoffCalculator.ComputeNextIntervalMinutes(15, 15, unansweredCount: 1, backoffCapMinutes: 60));
-        Assert.Equal(60, ProactiveBackoffCalculator.ComputeNextIntervalMinutes(15, 15, unansweredCount: 2, backoffCapMinutes: 60));
-        Assert.Equal(60, ProactiveBackoffCalculator.ComputeNextIntervalMinutes(15, 15, unansweredCount: 5, backoffCapMinutes: 60));
-
-        // Simulated lifecycle:
-        int unanswered = 0;
-        // 1st message sent -> unanswered becomes 1 -> next interval 30m
-        unanswered++;
-        Assert.Equal(30, ProactiveBackoffCalculator.ComputeNextIntervalMinutes(15, 15, unanswered, 60));
-        // Next turn returns {"skip": true} -> unanswered stays 1 (NOT incremented!) -> still 30m
-        Assert.Equal(30, ProactiveBackoffCalculator.ComputeNextIntervalMinutes(15, 15, unanswered, 60));
-        // 2nd message actually sent -> unanswered becomes 2 -> next interval 60m
-        unanswered++;
-        Assert.Equal(60, ProactiveBackoffCalculator.ComputeNextIntervalMinutes(15, 15, unanswered, 60));
-        // Any user interaction resets unanswered to 0 -> back to 15m!
-        unanswered = 0;
-        Assert.Equal(15, ProactiveBackoffCalculator.ComputeNextIntervalMinutes(15, 15, unanswered, 60));
-    }
-
-    [Fact]
-    public async Task AwarenessPrecedence_VerbalOverrideBeatsLlmClassification_AndDeletingOverrideRestoresLlm()
+    public async Task AwarenessPrecedence_IsBoundPerStyleFile_BeatsLlm_SurvivesMdEdit_AndRevertsWhenDeleted()
     {
         var (store, tempDb) = CreateTempStore();
         try
         {
             const string convId = "conv-awareness-test";
-            const string yandereStyle = "You are an obsessively devoted yandere persona who watches every move the user makes.";
-            var stubLlm = new StubModelGateway("""{"level": "high"}""");
+            const string sanaScope = "sana_style_prompt";
+            const string ruiScope = "rui_style_prompt";
+            const string sanaMdV1 = "You are an obsessively devoted yandere persona who watches every move the user makes.";
+            const string sanaMdV2 = "You are an edited gentle persona who still cares warmly.";
+            const string ruiMd = "You are a deeply possessive, vigilant persona.";
 
-            // 1) First call with NO verbal override -> classifies once via LLM ("high") and caches by SHA-256
+            var stubLlm = new StubModelGateway("""{"level": "high"}""", """{"level": "high"}""", """{"level": "normal"}""");
+
+            // 1) Classify sana V1 via LLM -> "high" (cached by SHA-256)
             var prefsEmpty = await store.GetConfirmedProactivePrefsAsync(convId);
             var (lvl1, src1) = await MainAgent.ResolveProactiveAwarenessAsync(
-                store, stubLlm, convId, yandereStyle, prefsEmpty, NullLogger.Instance, CancellationToken.None);
+                store, stubLlm, convId, sanaScope, sanaMdV1, prefsEmpty, NullLogger.Instance, CancellationToken.None);
             Assert.Equal(ProactiveAwarenessLevel.High, lvl1);
             Assert.Equal("llm", src1);
             Assert.Equal(1, stubLlm.Calls);
 
-            // 2) Second call with same style -> cache hit, 0 additional LLM calls
-            var (lvl2, src2) = await MainAgent.ResolveProactiveAwarenessAsync(
-                store, stubLlm, convId, yandereStyle, prefsEmpty, NullLogger.Instance, CancellationToken.None);
-            Assert.Equal(ProactiveAwarenessLevel.High, lvl2);
-            Assert.Equal("llm", src2);
-            Assert.Equal(1, stubLlm.Calls);
-
-            // 3) User verbally overrides ("別一直講我在幹嘛") -> stored as Confirmed user_pref with tag proactive_awareness
-            var overrideFact = new KnowledgeFactRecord(
-                FactId: "fact-override-1",
+            // 2) Verbal override bound specifically to sana_style_prompt -> "low"
+            var sanaOverride = new KnowledgeFactRecord(
+                FactId: "fact-override-sana",
                 ConversationId: convId,
                 Category: "user_pref",
-                Summary: "減少評論目前視窗（low）",
+                Summary: "佐奈減少看視窗（low）",
                 Detail: "low - user asked not to comment frequently on active windows",
                 Evidence: "user verbal instruction",
                 Confidence: "observed",
-                Tags: new List<string> { ProactiveTopicEngine.AwarenessTag },
+                Tags: new List<string> { ProactiveTopicEngine.AwarenessTag, ProactiveTopicEngine.BuildStyleScopeTag(sanaScope) },
                 CreatedAt: DateTimeOffset.UtcNow,
                 UpdatedAt: DateTimeOffset.UtcNow,
-                MemoryKey: ProactiveTopicEngine.AwarenessTag,
+                MemoryKey: ProactiveTopicEngine.BuildAwarenessMemoryKey(sanaScope),
                 State: "Confirmed",
                 ReinforceCount: 1);
-            await store.UpsertFactAsync(overrideFact);
+            await store.UpsertFactAsync(sanaOverride);
 
-            var prefsWithOverride = await store.GetConfirmedProactivePrefsAsync(convId);
-            var (lvl3, src3) = await MainAgent.ResolveProactiveAwarenessAsync(
-                store, stubLlm, convId, yandereStyle, prefsWithOverride, NullLogger.Instance, CancellationToken.None);
-            Assert.Equal(ProactiveAwarenessLevel.Low, lvl3);
-            Assert.Equal("override", src3);
-            Assert.Equal(1, stubLlm.Calls); // Still 0 extra LLM calls!
+            var prefsWithSanaOverride = await store.GetConfirmedProactivePrefsAsync(convId);
 
-            // 4) User deletes the override fact in "我學到的事" -> automatically reverts to cached LLM classification ("high")
-            await store.DeleteFactAsync("fact-override-1");
+            // 2a) For sana: verbal override beats LLM classification ("low")
+            var (sanaOverridden, srcSana) = await MainAgent.ResolveProactiveAwarenessAsync(
+                store, stubLlm, convId, sanaScope, sanaMdV1, prefsWithSanaOverride, NullLogger.Instance, CancellationToken.None);
+            Assert.Equal(ProactiveAwarenessLevel.Low, sanaOverridden);
+            Assert.Equal("override", srcSana);
+
+            // 2b) For rui (DIFFERENT persona file): sana's override MUST NOT affect rui!
+            var (ruiLevel, srcRui) = await MainAgent.ResolveProactiveAwarenessAsync(
+                store, stubLlm, convId, ruiScope, ruiMd, prefsWithSanaOverride, NullLogger.Instance, CancellationToken.None);
+            Assert.Equal(ProactiveAwarenessLevel.High, ruiLevel);
+            Assert.Equal("llm", srcRui);
+            Assert.Equal(2, stubLlm.Calls);
+
+            // 3) User edits sana_style_prompt.md (sanaMdV2) while override still exists -> override stays intact!
+            var (sanaEditedStillOverridden, srcEdited) = await MainAgent.ResolveProactiveAwarenessAsync(
+                store, stubLlm, convId, sanaScope, sanaMdV2, prefsWithSanaOverride, NullLogger.Instance, CancellationToken.None);
+            Assert.Equal(ProactiveAwarenessLevel.Low, sanaEditedStillOverridden);
+            Assert.Equal("override", srcEdited);
+            Assert.Equal(2, stubLlm.Calls); // Didn't waste an LLM call while override is active
+
+            // 4) User deletes sana's override -> automatically classifies the edited sanaMdV2 ("normal")!
+            await store.DeleteFactAsync("fact-override-sana");
             var prefsAfterDelete = await store.GetConfirmedProactivePrefsAsync(convId);
-            var (lvl4, src4) = await MainAgent.ResolveProactiveAwarenessAsync(
-                store, stubLlm, convId, yandereStyle, prefsAfterDelete, NullLogger.Instance, CancellationToken.None);
-            Assert.Equal(ProactiveAwarenessLevel.High, lvl4);
-            Assert.Equal("llm", src4);
+            var (sanaReverted, srcReverted) = await MainAgent.ResolveProactiveAwarenessAsync(
+                store, stubLlm, convId, sanaScope, sanaMdV2, prefsAfterDelete, NullLogger.Instance, CancellationToken.None);
+            Assert.Equal(ProactiveAwarenessLevel.Normal, sanaReverted);
+            Assert.Equal("llm", srcReverted);
+            Assert.Equal(3, stubLlm.Calls);
         }
         finally
         {
@@ -204,7 +195,7 @@ public sealed class ProactiveTopicAndBackoffTests
     }
 
     [Fact]
-    public async Task CustomTopicAndOngoingThread_RespectConfirmedOnly_ExcludeAssistantMessages_AndIncludeRecentShares()
+    public async Task CustomTopicCrudAndOngoingTurns_KeepCompletedAssistantReplies_ExcludeProactiveSelfCheckIns()
     {
         var (store, tempDb) = CreateTempStore();
         try
@@ -212,7 +203,7 @@ public sealed class ProactiveTopicAndBackoffTests
             const string convId = "conv-pool-test";
             var now = DateTimeOffset.UtcNow;
 
-            // Insert Candidate (one-off joke) vs Confirmed (ongoing new knowledge)
+            // 1) Candidate (one-off joke) vs Confirmed (ongoing new knowledge)
             await store.UpsertFactAsync(new KnowledgeFactRecord(
                 "f-joke", convId, "user_pref", "冷笑話", "使用者隨口問過一次冷笑話",
                 null, "inferred", new List<string> { "proactive_topic" },
@@ -227,11 +218,16 @@ public sealed class ProactiveTopicAndBackoffTests
             Assert.Single(topics);
             Assert.Equal("f-know", topics[0].FactId);
 
-            // Verify recent 5 shared summaries are embedded in CustomUserTopic prompt with DO NOT repeat warning
+            // Edit + verify updated + Delete custom topic (full CRUD)
+            Assert.True(await store.UpdateFactAsync("f-know", "分享資安冷知識", "偏資安或網路冷知識", null, null));
+            var afterEdit = await store.GetAllKnowledgeFactsAsync(convId);
+            Assert.Contains(afterEdit, f => f.FactId == "f-know" && f.Summary == "分享資安冷知識");
+
+            // Recent 5 shared summaries embedded in CustomUserTopic prompt with DO NOT repeat warning
             var selectedCustom = new SelectedProactiveTopic(
                 Topic: ProactiveTopicKind.CustomUserTopic,
                 ActivityPayload: null,
-                SelectedCustomTopic: topics[0],
+                SelectedCustomTopic: afterEdit.First(f => f.FactId == "f-know"),
                 RecentSharedSummaries: new[] { "事實1", "事實2", "事實3", "事實4", "事實5" },
                 OngoingThreadItems: Array.Empty<string>(),
                 ReminderItems: Array.Empty<string>());
@@ -240,18 +236,21 @@ public sealed class ProactiveTopicAndBackoffTests
             Assert.Contains("事實1", customPrompt);
             Assert.Contains("事實5", customPrompt);
 
-            // Verify GetRecentUserOnlyMessagesAsync excludes ALL assistant/proactive messages and returns max 3 from last 24h
+            Assert.True(await store.DeleteFactAsync("f-know"));
+            Assert.Empty(ProactiveTopicEngine.ExtractConfirmedCustomTopics(await store.GetConfirmedProactivePrefsAsync(convId)));
+
+            // 2) GetRecentNonProactiveChatTurnsAsync keeps completed real user+assistant replies, ONLY excludes TaskId="proactive"!
             await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "user", Content = "48小時前舊訊息", CreatedAt = now.AddHours(-48), RevealedAt = now.AddHours(-48) });
             await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "TODO.md 還在看呀", TaskId = "proactive", CreatedAt = now.AddMinutes(-30), RevealedAt = now.AddMinutes(-30) });
-            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "user", Content = "使用者訊息A", CreatedAt = now.AddMinutes(-25), RevealedAt = now.AddMinutes(-25) });
-            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "一般助理回覆", CreatedAt = now.AddMinutes(-24), RevealedAt = now.AddMinutes(-24) });
-            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "user", Content = "使用者訊息B", CreatedAt = now.AddMinutes(-10), RevealedAt = now.AddMinutes(-10) });
+            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "user", Content = "下週四前要打掉 HTB Vaccine 記得提醒我", CreatedAt = now.AddMinutes(-25), RevealedAt = now.AddMinutes(-25) });
+            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "設好囉，11/25 晚上八點提醒你打 HTB Vaccine！", TaskId = "task-123", CreatedAt = now.AddMinutes(-24), RevealedAt = now.AddMinutes(-24) });
+            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "又在看 TODO.md 喔", TaskId = "proactive", CreatedAt = now.AddMinutes(-10), RevealedAt = now.AddMinutes(-10) });
 
-            var userOnly = await store.GetRecentUserOnlyMessagesAsync(convId, now.AddHours(-24), 3);
-            Assert.Equal(2, userOnly.Count);
-            Assert.Equal("使用者訊息A", userOnly[0]);
-            Assert.Equal("使用者訊息B", userOnly[1]);
-            Assert.DoesNotContain(userOnly, s => s.Contains("TODO.md") || s.Contains("一般助理回覆"));
+            var turns = await store.GetRecentNonProactiveChatTurnsAsync(convId, now.AddHours(-24), 6);
+            Assert.Equal(2, turns.Count);
+            Assert.Contains("下週四前要打掉 HTB Vaccine", turns[0]);
+            Assert.Contains("設好囉，11/25 晚上八點提醒你打 HTB Vaccine", turns[1]);
+            Assert.DoesNotContain(turns, s => s.Contains("TODO.md"));
         }
         finally
         {
