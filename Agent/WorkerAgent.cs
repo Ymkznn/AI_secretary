@@ -101,7 +101,6 @@ public sealed class WorkerAgent
             return StepOutcome.Denied;
         }
 
-        int obsBefore = observations.Count;
         var ctx = new SkillExecutionContext
         {
             SkillName = record.Name,
@@ -121,21 +120,7 @@ public sealed class WorkerAgent
         try
         {
             await handler.ExecuteAsync(ctx);
-            if (ctx.Outcome != StepOutcome.Ok)
-                return ctx.Outcome;
-
-            // Secondary guard only for explicit skill-prefix denial/decline messages produced by skills themselves
-            for (int i = obsBefore; i < observations.Count; i++)
-            {
-                var obs = observations[i];
-                if (obs.StartsWith($"{record.Name}:", StringComparison.OrdinalIgnoreCase) &&
-                    (obs.Contains("user declined", StringComparison.OrdinalIgnoreCase) ||
-                     obs.Contains("denied by Guard", StringComparison.OrdinalIgnoreCase)))
-                {
-                    return StepOutcome.Denied;
-                }
-            }
-            return StepOutcome.Ok;
+            return ctx.Outcome;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -174,15 +159,11 @@ public sealed class WorkerAgent
             var extraArgs = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("args", out var a) && a.ValueKind == JsonValueKind.String
                 ? a.GetString()
                 : null;
-            var output = await _customSkills.ExecuteAsync(skill, extraArgs, taskId, ct);
+            var (outcome, output) = await _customSkills.ExecuteAsync(skill, extraArgs, taskId, ct);
             observations.Add($"custom:{skill.Name} output:\n{output}");
-            completedSteps.Add($"custom:{skill.Name}");
-            if (output.StartsWith("Execution failed", StringComparison.OrdinalIgnoreCase))
-                return StepOutcome.Failed;
-            if (output.Contains("declined", StringComparison.OrdinalIgnoreCase) ||
-                output.Contains("denied", StringComparison.OrdinalIgnoreCase))
-                return StepOutcome.Denied;
-            return StepOutcome.Ok;
+            if (outcome == StepOutcome.Ok)
+                completedSteps.Add($"custom:{skill.Name}");
+            return outcome;
         }
         catch (Exception ex)
         {

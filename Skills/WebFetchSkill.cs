@@ -37,12 +37,13 @@ public sealed class WebFetchSkill : IBasicSkill
         var skillName = ctx.EffectiveName(Name);
         var url = ctx.GetArg("url") ?? "";
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
-        var res = await WebFetchAsync(url, ctx.Ct, skillName);
+        var res = await WebFetchAsync(url, ctx.Ct, skillName, ctx);
         ctx.Observations.Add(res);
-        ctx.CompletedSteps.Add(skillName);
+        if (ctx.Outcome == StepOutcome.Ok)
+            ctx.CompletedSteps.Add(skillName);
     }
 
-    public async Task<string> WebFetchAsync(string url, CancellationToken ct = default, string? skillName = null)
+    public async Task<string> WebFetchAsync(string url, CancellationToken ct = default, string? skillName = null, SkillExecutionContext? ctx = null)
     {
         var check = _guard.CheckSkillExecution(string.IsNullOrWhiteSpace(skillName) ? Name : skillName);
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
@@ -50,12 +51,14 @@ public sealed class WebFetchSkill : IBasicSkill
         if (!Uri.TryCreate(url?.Trim(), UriKind.Absolute, out var uri) ||
             (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
         {
+            ctx?.MarkFailed();
             return "web_fetch: only http:// and https:// URLs are supported.";
         }
 
         if (string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase) ||
             uri.Host.EndsWith(".local", StringComparison.OrdinalIgnoreCase))
         {
+            ctx?.MarkDenied();
             return "web_fetch: local/intranet host access is blocked.";
         }
 
@@ -63,10 +66,14 @@ public sealed class WebFetchSkill : IBasicSkill
         {
             var addrs = await Dns.GetHostAddressesAsync(uri.Host, ct);
             if (addrs.Any(IsPrivateOrLoopback))
+            {
+                ctx?.MarkDenied();
                 return "web_fetch: private/loopback IP access is blocked.";
+            }
         }
         catch (Exception ex)
         {
+            ctx?.MarkFailed();
             return $"web_fetch: DNS resolution failed: {ex.Message}";
         }
 
@@ -77,7 +84,10 @@ public sealed class WebFetchSkill : IBasicSkill
 
         using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
         if (!resp.IsSuccessStatusCode)
+        {
+            ctx?.MarkFailed();
             return $"web_fetch failed: HTTP {(int)resp.StatusCode} {resp.ReasonPhrase}";
+        }
 
         await using var stream = await resp.Content.ReadAsStreamAsync(ct);
         using var ms = new MemoryStream();

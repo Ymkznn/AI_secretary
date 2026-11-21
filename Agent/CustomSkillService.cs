@@ -61,7 +61,7 @@ public sealed class CustomSkillService
     /// <summary>
     /// 驗證並建立自訂技能：檢查命名規範與內建技能衝突，高風險指令由 GuardService 直接拒絕，低風險則請使用者確認後寫入資料庫。
     /// </summary>
-    public async Task<(bool Ok, string Message)> CreateAsync(
+    public async Task<(Skills.StepOutcome Outcome, string Message)> CreateAsync(
         string name,
         string description,
         string command,
@@ -70,20 +70,20 @@ public sealed class CustomSkillService
     {
         var cleanName = name.Trim().Replace(" ", "_").ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(cleanName) || string.IsNullOrWhiteSpace(description) || string.IsNullOrWhiteSpace(command))
-            return (false, "Skill name, description, and command cannot be empty.");
+            return (Skills.StepOutcome.Failed, "Skill name, description, and command cannot be empty.");
 
         // 限制為小寫蛇形命名，避免特殊字元或過長名稱
         if (!Regex.IsMatch(cleanName, @"^[a-z][a-z0-9_]{1,47}$"))
-            return (false, "Custom skill name must be 2-48 chars, lowercase letters/digits/underscores starting with a letter.");
+            return (Skills.StepOutcome.Failed, "Custom skill name must be 2-48 chars, lowercase letters/digits/underscores starting with a letter.");
 
         // 禁止覆蓋或冒名內建技能
         var registry = _services.GetRequiredService<SkillRegistry>();
         if (registry.ContainsBasic(cleanName))
-            return (false, $"Skill name '{cleanName}' collides with a built-in skill.");
+            return (Skills.StepOutcome.Failed, $"Skill name '{cleanName}' collides with a built-in skill.");
 
         var guardCheck = _guard.CheckCommandExecution($"custom_create:{cleanName}", command);
         if (!guardCheck.Allowed && !guardCheck.RequiresUserConfirmation)
-            return (false, $"Guard blocked: {guardCheck.Reason}");
+            return (Skills.StepOutcome.Denied, $"Guard blocked: {guardCheck.Reason}");
 
         var title = await _localizer.TextAsync("CreateSkillTitle", "Confirm Skill Creation", Array.Empty<object?>(), ct);
         var prompt = await _localizer.TextAsync(
@@ -93,24 +93,24 @@ public sealed class CustomSkillService
             ct);
         var approved = await confirmAsync(title, prompt);
         if (!approved)
-            return (false, $"User declined creating skill '{cleanName}'.");
+            return (Skills.StepOutcome.Denied, $"User declined creating skill '{cleanName}'.");
 
         var rec = new CustomSkillRecord(cleanName, description.Trim(), command.Trim(), DateTimeOffset.UtcNow);
         await _store.UpsertCustomSkillAsync(rec, ct);
         await registry.ReloadFromStoreAsync(ct);
         SkillsChanged?.Invoke();
-        return (true, $"Created and enabled skill '{cleanName}'.");
+        return (Skills.StepOutcome.Ok, $"Created and enabled skill '{cleanName}'.");
     }
 
     /// <summary>經使用者確認後刪除指定的自訂技能。</summary>
-    public async Task<(bool Ok, string Message)> DeleteAsync(
+    public async Task<(Skills.StepOutcome Outcome, string Message)> DeleteAsync(
         string name,
         Func<string, string, Task<bool>> confirmAsync,
         CancellationToken ct = default)
     {
         var existing = await FindAsync(name, ct);
         if (existing is null)
-            return (false, $"Custom skill '{name}' not found.");
+            return (Skills.StepOutcome.Failed, $"Custom skill '{name}' not found.");
 
         var title = await _localizer.TextAsync("DeleteSkillTitle", "Confirm Skill Deletion", Array.Empty<object?>(), ct);
         var prompt = await _localizer.TextAsync(
@@ -120,18 +120,19 @@ public sealed class CustomSkillService
             ct);
         var approved = await confirmAsync(title, prompt);
         if (!approved)
-            return (false, $"User declined deleting skill '{existing.Name}'.");
+            return (Skills.StepOutcome.Denied, $"User declined deleting skill '{existing.Name}'.");
 
         await _store.DeleteCustomSkillAsync(existing.Name, ct);
         await _services.GetRequiredService<SkillRegistry>().ReloadFromStoreAsync(ct);
         SkillsChanged?.Invoke();
-        return (true, $"Deleted skill '{existing.Name}'.");
+        return (Skills.StepOutcome.Ok, $"Deleted skill '{existing.Name}'.");
     }
 
     /// <summary>
     /// 執行自訂技能：授權與參數驗證委由 GuardService 處理，通過後於沙盒目錄下啟動程序並受逾時保護。
+    /// 回傳結構化 <see cref="Skills.StepOutcome"/> 與輸出字串，避免用文字比對誤判 stdout 內容。
     /// </summary>
-    public async Task<string> ExecuteAsync(
+    public async Task<(Skills.StepOutcome Outcome, string Output)> ExecuteAsync(
         CustomSkillRecord skill,
         string? extraArgs,
         string? taskId = null,
@@ -140,7 +141,7 @@ public sealed class CustomSkillService
         var (approved, denialReason) = await _guard.AuthorizeCommandAsync(
             skill.Name, skill.Command, extraArgs, _sandbox.RootPath, taskId, ct);
         if (!approved)
-            return denialReason ?? $"User declined running skill '{skill.Name}'.";
+            return (Skills.StepOutcome.Denied, denialReason ?? $"User declined running skill '{skill.Name}'.");
 
         var cfg = _settings.Current.CustomSkill;
         var timeoutSec = Math.Clamp(cfg.TimeoutSeconds, 5, 600);
@@ -181,10 +182,13 @@ public sealed class CustomSkillService
         var stderr = (await stderrTask).Trim();
 
         _logger.LogInformation("Executed custom skill {Name} (exit={Code})", skill.Name, proc.ExitCode);
-        if (proc.ExitCode != 0 && !string.IsNullOrWhiteSpace(stderr))
-            return $"Execution failed (exit={proc.ExitCode}): {stderr}";
+        if (proc.ExitCode != 0)
+        {
+            var errMsg = !string.IsNullOrWhiteSpace(stderr) ? stderr : stdout;
+            return (Skills.StepOutcome.Failed, $"Execution failed (exit={proc.ExitCode}): {errMsg}");
+        }
 
-        return string.IsNullOrWhiteSpace(stdout) ? "Completed (no output)." : stdout;
+        return (Skills.StepOutcome.Ok, string.IsNullOrWhiteSpace(stdout) ? "Completed (no output)." : stdout);
     }
 
     /// <summary>

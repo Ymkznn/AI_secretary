@@ -43,6 +43,7 @@ public sealed class FillOtpSkill : IBasicSkill
 
         if (string.IsNullOrWhiteSpace(code))
         {
+            ctx.MarkFailed();
             ctx.Observations.Add("fill_otp: no OTP code available to fill.");
             return;
         }
@@ -68,5 +69,7 @@ public sealed class FillOtpSkill : IBasicSkill
             : $"{skillName} failed: {msg}");
         if (ok)
             ctx.CompletedSteps.Add(skillName);
+        else
+            ctx.MarkFailed();
     }
 }

@@ -32,5 +32,9 @@ public sealed class LaunchAppSkill : IBasicSkill
         ctx.Observations.Add(launchRes.Message);
         if (launchRes.Success)
             ctx.CompletedSteps.Add($"{skillName}:{appName}");
+        else if (launchRes.Denied)
+            ctx.MarkDenied();
+        else
+            ctx.MarkFailed();
     }
 }

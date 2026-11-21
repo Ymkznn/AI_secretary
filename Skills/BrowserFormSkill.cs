@@ -41,6 +41,7 @@ public sealed class BrowserFormSkill : IBasicSkill
             var form = await _bridge.RequestActiveTabFormAsync(TimeSpan.FromSeconds(5), ctx.Ct);
             if (form is null)
             {
+                ctx.MarkFailed();
                 ctx.Observations.Add("browser_form: extension did not respond within 5s (ensure Chrome/Edge extension is loaded and tab refreshed).");
                 return;
             }
@@ -76,11 +77,13 @@ public sealed class BrowserFormSkill : IBasicSkill
             var dom = await _bridge.RequestActiveTabDomAsync(selector, maxChars, TimeSpan.FromSeconds(8), ctx.Ct);
             if (dom is null)
             {
+                ctx.MarkFailed();
                 ctx.Observations.Add("browser_form: extension did not respond within 8s for read_dom (ensure Chrome/Edge extension is loaded and tab refreshed).");
                 return;
             }
             if (!string.IsNullOrWhiteSpace(dom.Error))
             {
+                ctx.MarkFailed();
                 ctx.Observations.Add($"browser_form: read_dom failed on \"{dom.Title}\" ({dom.Url}): {dom.Error}");
                 return;
             }
@@ -100,6 +103,7 @@ public sealed class BrowserFormSkill : IBasicSkill
 
         if (action != "fill")
         {
+            ctx.MarkFailed();
             ctx.Observations.Add($"browser_form: unsupported action '{action}'.");
             return;
         }
@@ -154,6 +158,7 @@ public sealed class BrowserFormSkill : IBasicSkill
         var approved = await ctx.ConfirmAsync(confirmTitle, confirmBody);
         if (!approved)
         {
+            ctx.MarkDenied();
             ctx.Observations.Add("browser_form: user declined prefill.");
             return;
         }
@@ -161,6 +166,7 @@ public sealed class BrowserFormSkill : IBasicSkill
         var result = await _bridge.RequestApplyFillsAsync(fills, TimeSpan.FromSeconds(10), ctx.Ct);
         if (result is null)
         {
+            ctx.MarkFailed();
             ctx.Observations.Add("browser_form: FILL NOT VERIFIED - the browser extension did not report back within 10s. " +
                                  "Do NOT tell the user the fields were filled; ask them to check the tab / reload the extension.");
             return;

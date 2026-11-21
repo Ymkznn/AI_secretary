@@ -2576,6 +2576,23 @@ public sealed class SqliteStore
         return list;
     }
 
+    public async Task PruneOldObservabilityLogsAsync(int retentionDays = 30, CancellationToken ct = default)
+    {
+        try
+        {
+            var cutoff = DateTimeOffset.UtcNow.AddDays(-Math.Clamp(retentionDays, 1, 365)).ToString("O");
+            await using var conn = await OpenAsync(ct);
+            foreach (var table in new[] { "LlmCallLogs", "LearningEvents", "PredictionLogs" })
+            {
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = $"DELETE FROM {table} WHERE TimestampUtc < @cutoff;";
+                cmd.Parameters.AddWithValue("@cutoff", cutoff);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+        }
+        catch { }
+    }
+
     public async Task<bool> DeleteWorkflowCacheAsync(string workflowId, CancellationToken ct = default)
     {
         await using var conn = await OpenAsync(ct);

@@ -3,7 +3,7 @@ using Microsoft.Win32;
 
 namespace AiSecretary.Desktop.Services;
 
-public sealed record AppLaunchResult(bool Success, string Message, string? ResolvedTarget = null);
+public sealed record AppLaunchResult(bool Success, string Message, string? ResolvedTarget = null, bool Denied = false);
 
 /// <summary>
 /// Safely resolves and launches Windows desktop applications, Start Menu shortcuts, or web URLs.
@@ -64,12 +64,12 @@ public sealed class AppLauncherService
         if (BlockedTokens.Contains(query) ||
             BlockedTokens.Any(b => query.StartsWith(b + " ", StringComparison.OrdinalIgnoreCase)))
         {
-            return new AppLaunchResult(false, $"Security policy forbids launching system or shell command '{query}'.");
+            return new AppLaunchResult(false, $"Security policy forbids launching system or shell command '{query}'.", Denied: true);
         }
 
         if (!string.IsNullOrWhiteSpace(arguments) && !IsSafeArgument(arguments))
         {
-            return new AppLaunchResult(false, "Security policy rejected launch arguments (only safe URLs or existing local paths are allowed).");
+            return new AppLaunchResult(false, "Security policy rejected launch arguments (only safe URLs or existing local paths are allowed).", Denied: true);
         }
 
         var target = ResolveTarget(query);

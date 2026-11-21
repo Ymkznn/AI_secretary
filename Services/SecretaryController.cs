@@ -298,6 +298,7 @@ public sealed class SecretaryController : IDisposable
 
         await _workflowCache.LoadTuningAsync(_appCts.Token);
         await _workflowCache.MigrateAndCleanLegacyCachesAsync(ConversationId, _appCts.Token);
+        await _store.PruneOldObservabilityLogsAsync(30, _appCts.Token);
         _skills.SkillPollBoostRequested += (skillName, argsJson, secs) =>
         {
             _boostedPollSkill = skillName;

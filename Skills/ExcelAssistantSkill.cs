@@ -45,6 +45,7 @@ public sealed class ExcelAssistantSkill : IBasicSkill
         {
             if (!await _skills.EnsureExternalPathAccessAsync(targetPath, skillName, ctx.ConfirmAsync, ctx.Ct))
             {
+                ctx.MarkDenied();
                 ctx.Observations.Add($"{skillName}: user denied read permission for {targetPath}.");
                 return;
             }
@@ -58,6 +59,7 @@ public sealed class ExcelAssistantSkill : IBasicSkill
                 targetPath, sheetName, range, listSheetsOnly: action == "list_sheets", ctx.Ct);
             if (!ok)
             {
+                ctx.MarkFailed();
                 ctx.Observations.Add(summary);
                 return;
             }
@@ -65,6 +67,7 @@ public sealed class ExcelAssistantSkill : IBasicSkill
             if (string.IsNullOrWhiteSpace(targetPath) &&
                 !await _skills.EnsureExternalPathAccessAsync(filePath, skillName, ctx.ConfirmAsync, ctx.Ct))
             {
+                ctx.MarkDenied();
                 ctx.Observations.Add($"{skillName}: user denied read permission for {filePath}.");
                 return;
             }
@@ -79,12 +82,14 @@ public sealed class ExcelAssistantSkill : IBasicSkill
             var (ok, filePath, summary) = await _office.InspectExcelSelectionAsync(ctx.Ct);
             if (!ok)
             {
+                ctx.MarkFailed();
                 ctx.Observations.Add(summary);
                 return;
             }
 
             if (!await _skills.EnsureExternalPathAccessAsync(filePath, skillName, ctx.ConfirmAsync, ctx.Ct))
             {
+                ctx.MarkDenied();
                 ctx.Observations.Add($"{skillName}: user denied read permission for {filePath}.");
                 return;
             }
@@ -96,6 +101,7 @@ public sealed class ExcelAssistantSkill : IBasicSkill
 
         if (action != "write_cells")
         {
+            ctx.MarkFailed();
             ctx.Observations.Add($"{skillName}: unsupported action '{action}'.");
             return;
         }
@@ -114,6 +120,7 @@ public sealed class ExcelAssistantSkill : IBasicSkill
                     var fCheck = _guard.CheckExcelFormula(val, skillName);
                     if (!fCheck.Allowed)
                     {
+                        ctx.MarkDenied();
                         ctx.Observations.Add($"excel_assistant: blocked unsafe formula: {fCheck.Reason}");
                         return;
                     }
@@ -138,6 +145,7 @@ public sealed class ExcelAssistantSkill : IBasicSkill
         var approved = await ctx.ConfirmAsync(confirmTitle, confirmBody);
         if (!approved)
         {
+            ctx.MarkDenied();
             ctx.Observations.Add("excel_assistant: user declined write.");
             return;
         }

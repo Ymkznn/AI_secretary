@@ -34,6 +34,7 @@ public sealed class PushNotificationSkill : IBasicSkill
     {
         if (_skills.PublishNotificationHandler is null)
         {
+            ctx.MarkFailed();
             ctx.Observations.Add("push_notification: notification handler is not wired.");
             return;
         }

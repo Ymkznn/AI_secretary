@@ -63,6 +63,7 @@ public sealed class ManageMailSkill : IBasicSkill
                 await SyncAsync(ctx, source);
                 break;
             default:
+                ctx.MarkFailed();
                 ctx.Observations.Add($"manage_mail: unsupported action '{action}'.");
                 break;
         }
@@ -149,6 +150,7 @@ public sealed class ManageMailSkill : IBasicSkill
         var mailId = ctx.GetArg("mail_id") ?? ctx.TargetMailId ?? "";
         if (string.IsNullOrWhiteSpace(mailId))
         {
+            ctx.MarkFailed();
             ctx.Observations.Add($"{skillName}: missing mail_id for detail.");
             return;
         }
@@ -165,6 +167,7 @@ public sealed class ManageMailSkill : IBasicSkill
         {
             if (source != "all")
             {
+                ctx.MarkFailed();
                 ctx.Observations.Add($"{skillName}: cannot read '{mailId}' from {source}: {ex.Message}");
                 return;
             }

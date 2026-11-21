@@ -187,6 +187,8 @@ public sealed class FoundryModelGateway : IModelGateway
     /// </summary>
     private async Task WaitForPacingAsync(LlmPriority priority, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
+
         PacingWaiter? waiter = null;
         bool acquiredImmediately = false;
         lock (QueueLock)
@@ -210,14 +212,18 @@ public sealed class FoundryModelGateway : IModelGateway
         {
             using var reg = ct.Register(() =>
             {
-                lock (QueueLock) { waiter.Cancelled = true; }
-                waiter.Tcs.TrySetCanceled(ct);
+                lock (QueueLock)
+                {
+                    waiter.Cancelled = true;
+                    waiter.Tcs.TrySetCanceled(ct);
+                }
             });
             await waiter.Tcs.Task;
         }
 
         try
         {
+            ct.ThrowIfCancellationRequested();
             var minIntervalMs = _config.GetValue<int>("Foundry:MinRequestIntervalMs", 1500);
             var elapsed = DateTimeOffset.UtcNow - _lastRequestUtc;
             var wait = TimeSpan.FromMilliseconds(minIntervalMs) - elapsed;
@@ -233,41 +239,31 @@ public sealed class FoundryModelGateway : IModelGateway
 
     private static void ReleaseNextWaiter()
     {
-        PacingWaiter? next = null;
         lock (QueueLock)
         {
             var now = DateTimeOffset.UtcNow;
-            // Anti-starvation: if oldest background waiter has waited >= 12s, let it go next.
-            bool bgStarved = BackgroundQueue.Count > 0 &&
-                             !BackgroundQueue.Peek().Cancelled &&
-                             (now - BackgroundQueue.Peek().EnqueuedUtc) >= TimeSpan.FromSeconds(12);
-
-            while (next is null)
+            while (true)
             {
-                if (!bgStarved && InteractiveQueue.Count > 0)
-                {
-                    var cand = InteractiveQueue.Dequeue();
-                    if (!cand.Cancelled) next = cand;
-                }
-                else if (BackgroundQueue.Count > 0)
-                {
-                    var cand = BackgroundQueue.Dequeue();
-                    if (!cand.Cancelled) next = cand;
-                    bgStarved = false;
-                }
-                else if (InteractiveQueue.Count > 0)
-                {
-                    var cand = InteractiveQueue.Dequeue();
-                    if (!cand.Cancelled) next = cand;
-                }
-                else
+                // Anti-starvation: if oldest background waiter has waited >= 12s, let it go next.
+                bool bgStarved = BackgroundQueue.Count > 0 &&
+                                 (now - BackgroundQueue.Peek().EnqueuedUtc) >= TimeSpan.FromSeconds(12);
+                Queue<PacingWaiter>? q =
+                    (!bgStarved && InteractiveQueue.Count > 0) ? InteractiveQueue :
+                    BackgroundQueue.Count > 0 ? BackgroundQueue :
+                    InteractiveQueue.Count > 0 ? InteractiveQueue : null;
+                if (q is null)
                 {
                     _pacingActive = false;
                     return;
                 }
+
+                var cand = q.Dequeue();
+                // RunContinuationsAsynchronously is set on Tcs, so calling TrySetResult inside QueueLock is deadlock-free;
+                // if it returns false the waiter was already cancelled, so continue handing the turn to the next waiter.
+                if (!cand.Cancelled && cand.Tcs.TrySetResult(true))
+                    return;
             }
         }
-        next.Tcs.TrySetResult(true);
     }
 
     private static bool IsTransientNetworkError(Exception ex, CancellationToken ct)

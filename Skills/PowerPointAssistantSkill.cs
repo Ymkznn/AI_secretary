@@ -45,6 +45,7 @@ public sealed class PowerPointAssistantSkill : IBasicSkill
             {
                 if (!await _skills.EnsureExternalPathAccessAsync(targetPath, skillName, ctx.ConfirmAsync, ctx.Ct))
                 {
+                    ctx.MarkDenied();
                     ctx.Observations.Add($"powerpoint_assistant: user denied read permission for {targetPath}.");
                     return;
                 }
@@ -53,12 +54,14 @@ public sealed class PowerPointAssistantSkill : IBasicSkill
             var (ok, filePath, summary) = await _office.InspectPowerPointAsync(action == "inspect_outline" || !string.IsNullOrWhiteSpace(targetPath), ctx.Ct, targetPath);
             if (!ok)
             {
+                ctx.MarkFailed();
                 ctx.Observations.Add(summary);
                 return;
             }
 
             if (string.IsNullOrWhiteSpace(targetPath) && !await _skills.EnsureExternalPathAccessAsync(filePath, skillName, ctx.ConfirmAsync, ctx.Ct))
             {
+                ctx.MarkDenied();
                 ctx.Observations.Add($"powerpoint_assistant: user denied read permission for {filePath}.");
                 return;
             }
@@ -70,6 +73,7 @@ public sealed class PowerPointAssistantSkill : IBasicSkill
 
         if (action != "update_slide_text")
         {
+            ctx.MarkFailed();
             ctx.Observations.Add($"powerpoint_assistant: unsupported action '{action}'.");
             return;
         }
@@ -96,6 +100,7 @@ public sealed class PowerPointAssistantSkill : IBasicSkill
         var approved = await ctx.ConfirmAsync(confirmTitle, confirmBody);
         if (!approved)
         {
+            ctx.MarkDenied();
             ctx.Observations.Add("powerpoint_assistant: user declined update.");
             return;
         }

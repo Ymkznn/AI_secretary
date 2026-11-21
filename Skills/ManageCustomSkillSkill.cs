@@ -53,21 +53,26 @@ public sealed class ManageCustomSkillSkill : IBasicSkill
             var desc = ctx.GetArg("description") ?? "";
             var cmd = ctx.GetArg("command") ?? "";
             await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
-            var (ok, msg) = await _customSkills.CreateAsync(name, desc, cmd, ctx.ConfirmAsync, ctx.Ct);
+            var (outcome, msg) = await _customSkills.CreateAsync(name, desc, cmd, ctx.ConfirmAsync, ctx.Ct);
             ctx.Observations.Add(msg);
-            if (ok) ctx.CompletedSteps.Add($"{skillName}:{action}:{name}");
+            if (outcome == StepOutcome.Ok) ctx.CompletedSteps.Add($"{skillName}:{action}:{name}");
+            else if (outcome == StepOutcome.Denied) ctx.MarkDenied();
+            else ctx.MarkFailed();
             return;
         }
 
         if (action == "delete")
         {
             await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
-            var (ok, msg) = await _customSkills.DeleteAsync(name, ctx.ConfirmAsync, ctx.Ct);
+            var (outcome, msg) = await _customSkills.DeleteAsync(name, ctx.ConfirmAsync, ctx.Ct);
             ctx.Observations.Add(msg);
-            if (ok) ctx.CompletedSteps.Add($"{skillName}:delete:{name}");
+            if (outcome == StepOutcome.Ok) ctx.CompletedSteps.Add($"{skillName}:delete:{name}");
+            else if (outcome == StepOutcome.Denied) ctx.MarkDenied();
+            else ctx.MarkFailed();
             return;
         }
 
+        ctx.MarkFailed();
         ctx.Observations.Add($"manage_custom_skill: unsupported action '{action}'.");
     }
 }

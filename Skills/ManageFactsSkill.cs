@@ -58,6 +58,7 @@ public sealed class ManageFactsSkill : IBasicSkill
                 await DeleteAnnotationAsync(ctx);
                 break;
             default:
+                ctx.MarkFailed();
                 ctx.Observations.Add($"manage_facts: unsupported action '{action}'.");
                 break;
         }
@@ -68,6 +69,7 @@ public sealed class ManageFactsSkill : IBasicSkill
         var summary = ctx.GetArg("summary") ?? "";
         if (string.IsNullOrWhiteSpace(summary))
         {
+            ctx.MarkFailed();
             ctx.Observations.Add("manage_facts: missing summary for record.");
             return;
         }
@@ -108,6 +110,7 @@ public sealed class ManageFactsSkill : IBasicSkill
         var factId = ctx.GetArg("fact_id") ?? "";
         if (string.IsNullOrWhiteSpace(factId))
         {
+            ctx.MarkFailed();
             ctx.Observations.Add("manage_facts: missing fact_id.");
             return;
         }
@@ -128,6 +131,7 @@ public sealed class ManageFactsSkill : IBasicSkill
         var factId = ctx.GetArg("fact_id") ?? "";
         if (string.IsNullOrWhiteSpace(factId))
         {
+            ctx.MarkFailed();
             ctx.Observations.Add("manage_facts: missing fact_id.");
             return;
         }
@@ -152,6 +156,7 @@ public sealed class ManageFactsSkill : IBasicSkill
         var factId = ctx.GetArg("fact_id") ?? "";
         if (string.IsNullOrWhiteSpace(factId))
         {
+            ctx.MarkFailed();
             ctx.Observations.Add("manage_facts: missing fact_id.");
             return;
         }
@@ -171,6 +176,7 @@ public sealed class ManageFactsSkill : IBasicSkill
         var note = ctx.GetArg("note") ?? ctx.GetArg("summary") ?? "";
         if (string.IsNullOrWhiteSpace(targetType) || string.IsNullOrWhiteSpace(targetId) || string.IsNullOrWhiteSpace(note))
         {
+            ctx.MarkFailed();
             ctx.Observations.Add("manage_facts: annotate requires target_type, target_id, and note.");
             return;
         }
@@ -202,6 +208,7 @@ public sealed class ManageFactsSkill : IBasicSkill
         var note = ctx.GetArg("note") ?? ctx.GetArg("summary") ?? "";
         if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(note))
         {
+            ctx.MarkFailed();
             ctx.Observations.Add("manage_facts: update_annotation requires annotation_id and note.");
             return;
         }
@@ -215,6 +222,7 @@ public sealed class ManageFactsSkill : IBasicSkill
         var id = ctx.GetArg("annotation_id") ?? "";
         if (string.IsNullOrWhiteSpace(id))
         {
+            ctx.MarkFailed();
             ctx.Observations.Add("manage_facts: delete_annotation requires annotation_id.");
             return;
         }

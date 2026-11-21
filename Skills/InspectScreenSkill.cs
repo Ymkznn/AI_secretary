@@ -59,6 +59,7 @@ public sealed class InspectScreenSkill : IBasicSkill
             var approved = await ctx.ConfirmAsync(confirmTitle, confirmBody);
             if (!approved)
             {
+                ctx.MarkDenied();
                 ctx.Observations.Add("User denied screen capture.");
                 return;
             }
@@ -81,6 +82,7 @@ public sealed class InspectScreenSkill : IBasicSkill
         }
         else
         {
+            ctx.MarkFailed();
             ctx.Observations.Add($"inspect_screen failed: {msg}");
         }
     }

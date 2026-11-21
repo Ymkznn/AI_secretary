@@ -48,6 +48,7 @@ public sealed class ManageScheduleSkill : IBasicSkill
                 await DeleteAsync(ctx);
                 break;
             default:
+                ctx.MarkFailed();
                 ctx.Observations.Add($"manage_schedule: unsupported action '{action}'.");
                 break;
         }

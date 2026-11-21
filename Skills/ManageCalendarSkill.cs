@@ -64,6 +64,7 @@ public sealed class ManageCalendarSkill : IBasicSkill
             {
                 if (!startAt.HasValue)
                 {
+                    ctx.MarkFailed();
                     ctx.Observations.Add("manage_calendar check_conflict: missing start_at.");
                     break;
                 }
@@ -86,6 +87,7 @@ public sealed class ManageCalendarSkill : IBasicSkill
             {
                 if (string.IsNullOrWhiteSpace(title) || !startAt.HasValue)
                 {
+                    ctx.MarkFailed();
                     ctx.Observations.Add("manage_calendar create: requires title and start_at.");
                     break;
                 }
@@ -112,6 +114,7 @@ public sealed class ManageCalendarSkill : IBasicSkill
             {
                 if (string.IsNullOrWhiteSpace(idOrKw))
                 {
+                    ctx.MarkFailed();
                     ctx.Observations.Add("manage_calendar update: missing event_id.");
                     break;
                 }
@@ -154,6 +157,7 @@ public sealed class ManageCalendarSkill : IBasicSkill
             {
                 if (!remindMinutesBefore.HasValue)
                 {
+                    ctx.MarkFailed();
                     ctx.Observations.Add("manage_calendar update_all_reminders: missing remind_minutes_before.");
                     break;
                 }
@@ -166,6 +170,7 @@ public sealed class ManageCalendarSkill : IBasicSkill
             {
                 if (string.IsNullOrWhiteSpace(idOrKw))
                 {
+                    ctx.MarkFailed();
                     ctx.Observations.Add("manage_calendar skip_date: missing event_id.");
                     break;
                 }
@@ -174,6 +179,7 @@ public sealed class ManageCalendarSkill : IBasicSkill
                     : (startAt.HasValue ? startAt.Value.ToLocalTime().ToString("yyyy-MM-dd") : "");
                 if (string.IsNullOrWhiteSpace(ymd))
                 {
+                    ctx.MarkFailed();
                     ctx.Observations.Add("manage_calendar skip_date: missing exception_date (YYYY-MM-DD).");
                     break;
                 }
@@ -188,6 +194,7 @@ public sealed class ManageCalendarSkill : IBasicSkill
             {
                 if (string.IsNullOrWhiteSpace(idOrKw))
                 {
+                    ctx.MarkFailed();
                     ctx.Observations.Add("manage_calendar delete: missing event_id.");
                     break;
                 }
@@ -199,6 +206,7 @@ public sealed class ManageCalendarSkill : IBasicSkill
                 break;
             }
             default:
+                ctx.MarkFailed();
                 ctx.Observations.Add($"Unsupported manage_calendar action: {action}");
                 break;
         }

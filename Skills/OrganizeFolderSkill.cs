@@ -78,9 +78,10 @@ public sealed class OrganizeFolderSkill : IBasicSkill
         var action = ctx.GetArg("action") ?? "scan";
         var targetFolder = ctx.GetArg("target_folder") ?? ctx.GetArg("path");
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
-        var res = await OrganizeFolderAsync(action, targetFolder, ctx.Args, ctx.ConfirmAsync, ctx.Ct, skillName);
+        var res = await OrganizeFolderAsync(action, targetFolder, ctx.Args, ctx.ConfirmAsync, ctx.Ct, skillName, ctx);
         ctx.Observations.Add(res);
-        ctx.CompletedSteps.Add($"{skillName}:{action}");
+        if (ctx.Outcome == StepOutcome.Ok)
+            ctx.CompletedSteps.Add($"{skillName}:{action}");
     }
 
     public async Task<string> OrganizeFolderAsync(
@@ -89,13 +90,17 @@ public sealed class OrganizeFolderSkill : IBasicSkill
         JsonElement args,
         Func<string, string, Task<bool>> confirmAsync,
         CancellationToken ct = default,
-        string? skillName = null)
+        string? skillName = null,
+        SkillExecutionContext? ctx = null)
     {
         var check = _guard.CheckSkillExecution(string.IsNullOrWhiteSpace(skillName) ? Name : skillName);
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
 
         if (string.IsNullOrWhiteSpace(targetFolder))
+        {
+            ctx?.MarkFailed();
             return "organize_folder: target_folder is required.";
+        }
 
         var rootFull = Path.GetFullPath(targetFolder.Trim());
         if (!Directory.Exists(rootFull))
@@ -104,7 +109,10 @@ public sealed class OrganizeFolderSkill : IBasicSkill
         var isDriveRoot = IsDriveRoot(rootFull);
         var isUserProfileRoot = IsUserProfileRoot(rootFull);
         if (IsSystemDirectory(rootFull))
+        {
+            ctx?.MarkDenied();
             return $"Security policy forbids organizing system directory: {rootFull}";
+        }
 
         var act = (action ?? "scan").Trim().ToLowerInvariant();
         if (act == "scan")
@@ -141,7 +149,10 @@ public sealed class OrganizeFolderSkill : IBasicSkill
         }
 
         if (act != "execute")
+        {
+            ctx?.MarkFailed();
             return $"Unsupported organize_folder action: {act} (expected scan or execute)";
+        }
 
         if (!_sandbox.IsPathInsideSandbox(rootFull))
         {
@@ -149,7 +160,10 @@ public sealed class OrganizeFolderSkill : IBasicSkill
             var orgPermMsg = await _localizer.TextAsync("OrganizePermMessage", "Allow organizing files inside external folder '{0}'?", new object?[] { rootFull }, ct);
             var decision = await _skills.RequestPathPermissionAsync(orgPermTitle, orgPermMsg, rootFull, confirmAsync);
             if (decision == PathPermissionDecision.Deny)
+            {
+                ctx?.MarkDenied();
                 return $"User denied organizing folder outside sandbox: {rootFull}";
+            }
         }
 
         if (isDriveRoot || isUserProfileRoot)
@@ -165,7 +179,10 @@ public sealed class OrganizeFolderSkill : IBasicSkill
                 ct);
             var approvedRoot = await confirmAsync(rootTitle, rootMsg);
             if (!approvedRoot)
+            {
+                ctx?.MarkDenied();
                 return $"User denied organizing root folder: {rootFull}";
+            }
         }
 
         var logRows = new List<(string Time, string Stage, string Action, string Source, string Destination, string Status, string Reason)>();

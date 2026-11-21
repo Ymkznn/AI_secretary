@@ -40,9 +40,10 @@ public sealed class SandboxFileSkill : IBasicSkill
         var path = ctx.GetArg("path");
         var content = ctx.GetArg("content");
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
-        var res = await SandboxFileAsync(action, path, content, ctx.ConfirmAsync, ctx.Ct, skillName);
+        var res = await SandboxFileAsync(action, path, content, ctx.ConfirmAsync, ctx.Ct, skillName, ctx);
         ctx.Observations.Add(res);
-        ctx.CompletedSteps.Add($"{skillName}:{action}");
+        if (ctx.Outcome == StepOutcome.Ok)
+            ctx.CompletedSteps.Add($"{skillName}:{action}");
     }
 
     public async Task<string> SandboxFileAsync(
@@ -51,7 +52,8 @@ public sealed class SandboxFileSkill : IBasicSkill
         string? content,
         Func<string, string, Task<bool>> confirmAsync,
         CancellationToken ct = default,
-        string? skillName = null)
+        string? skillName = null,
+        SkillExecutionContext? ctx = null)
     {
         var check = _guard.CheckSkillExecution(string.IsNullOrWhiteSpace(skillName) ? Name : skillName);
         if (!check.Allowed) throw new UnauthorizedAccessException(check.Reason);
@@ -68,6 +70,7 @@ public sealed class SandboxFileSkill : IBasicSkill
             fileName.Equals("gmail_credentials.json", StringComparison.OrdinalIgnoreCase) ||
             fileName.EndsWith(".db", StringComparison.OrdinalIgnoreCase))
         {
+            ctx?.MarkDenied();
             return "Security policy forbids accessing credential or database files via sandbox_file.";
         }
 
@@ -81,7 +84,10 @@ public sealed class SandboxFileSkill : IBasicSkill
                 resolved,
                 confirmAsync);
             if (decision == PathPermissionDecision.Deny)
+            {
+                ctx?.MarkDenied();
                 return $"User denied access outside sandbox: {resolved}";
+            }
         }
 
         switch (act)
@@ -118,6 +124,7 @@ public sealed class SandboxFileSkill : IBasicSkill
                 return $"Deleted file: {resolved}";
 
             default:
+                ctx?.MarkFailed();
                 return $"Unsupported sandbox_file action: {act}";
         }
     }

@@ -79,6 +79,7 @@ public sealed class ManageWatcherSkill : IBasicSkill
 
         if (action != "create")
         {
+            ctx.MarkFailed();
             ctx.Observations.Add($"manage_watcher: unsupported action '{action}'.");
             return;
         }
@@ -96,6 +97,7 @@ public sealed class ManageWatcherSkill : IBasicSkill
         var guardRes = _guard.CheckWatcherRegistration(skillName, kind, url, interval, activeCount);
         if (!guardRes.Allowed)
         {
+            ctx.MarkDenied();
             ctx.Observations.Add($"manage_watcher: blocked by guard: {guardRes.Reason}");
             return;
         }
@@ -113,6 +115,7 @@ public sealed class ManageWatcherSkill : IBasicSkill
         var approved = await ctx.ConfirmAsync(confirmTitle, confirmBody);
         if (!approved)
         {
+            ctx.MarkDenied();
             ctx.Observations.Add("manage_watcher: user declined creating watcher.");
             return;
         }
