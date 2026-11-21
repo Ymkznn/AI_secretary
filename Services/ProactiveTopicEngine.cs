@@ -185,6 +185,18 @@ public static class ProactiveTopicEngine
         return (ProactiveAwarenessLevel.Normal, "default");
     }
 
+    public static List<string> FilterUserUpcomingSchedules(
+        IReadOnlyList<ReminderRecord> pendingReminders,
+        DateTimeOffset horizon)
+    {
+        return pendingReminders
+            .Where(r => string.IsNullOrWhiteSpace(r.SkillName))
+            .Where(r => r.RemindAt <= horizon)
+            .Take(4)
+            .Select(r => $"{r.RemindAt.ToLocalTime():MM/dd HH:mm} {r.Title}")
+            .ToList();
+    }
+
     public static List<KnowledgeFactRecord> ExtractConfirmedCustomTopics(IReadOnlyList<KnowledgeFactRecord> facts)
     {
         return facts

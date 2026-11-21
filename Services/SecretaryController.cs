@@ -2478,11 +2478,7 @@ public sealed class SecretaryController : IDisposable
         {
             var pending = await _store.GetPendingRemindersAsync(ct);
             var horizon = DateTimeOffset.Now.AddHours(24);
-            upcomingSchedules = pending
-                .Where(r => r.RemindAt <= horizon)
-                .Take(4)
-                .Select(r => $"{r.RemindAt.ToLocalTime():MM/dd HH:mm} {r.Title}")
-                .ToList();
+            upcomingSchedules = ProactiveTopicEngine.FilterUserUpcomingSchedules(pending, horizon);
         }
         catch { }
 

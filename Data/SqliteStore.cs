@@ -1706,6 +1706,58 @@ public sealed class SqliteStore
         return list;
     }
 
+    /// <summary>
+    /// Returns compact snippets of recent proactive idle check-ins (newest <paramref name="limit"/>, ordered chronologically)
+    /// to supply as a compact negative blocklist ("do not repeat these subjects, cravings, or opening phrases")
+    /// without injecting full assistant transcripts as conversation history.
+    /// </summary>
+    public async Task<List<string>> GetRecentProactiveSnippetsAsync(
+        string conversationId,
+        DateTimeOffset sinceUtc,
+        int limit = 6,
+        CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT Content, COALESCE(RevealedAt, CreatedAt) AS Ts
+            FROM (
+                SELECT Content, CreatedAt, RevealedAt
+                FROM ChatMessages
+                WHERE ConversationId = $conv
+                  AND Role = 'assistant'
+                  AND (
+                        COALESCE(TaskId, '') = 'proactive'
+                     OR ((ReplyToMessageId IS NULL OR trim(ReplyToMessageId) = '') AND (TaskId IS NULL OR trim(TaskId) = ''))
+                  )
+                  AND COALESCE(RevealedAt, CreatedAt) >= $since
+                  AND trim(COALESCE(Content, '')) <> ''
+                ORDER BY COALESCE(RevealedAt, CreatedAt) DESC, CreatedAt DESC
+                LIMIT $limit
+            )
+            ORDER BY COALESCE(RevealedAt, CreatedAt) ASC, CreatedAt ASC;
+            """;
+        cmd.Parameters.AddWithValue("$conv", conversationId);
+        cmd.Parameters.AddWithValue("$since", sinceUtc.ToString("O"));
+        cmd.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 10));
+
+        var list = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var raw = reader.GetString(0)?.Trim();
+            if (string.IsNullOrWhiteSpace(raw)) continue;
+            var single = System.Text.RegularExpressions.Regex.Replace(raw, @"\s+", " ");
+            var snippet = single.Length <= 55 ? single : single[..55] + "…";
+            var tsStr = reader.IsDBNull(1) ? "" : reader.GetString(1);
+            var timeLabel = DateTimeOffset.TryParse(tsStr, out var dto)
+                ? $"[{dto.ToLocalTime():HH:mm}] "
+                : "";
+            list.Add($"{timeLabel}{snippet}");
+        }
+        return list;
+    }
+
     public async Task<List<KnowledgeFactRecord>> RecallRelevantUserPrefFactsAsync(
         string conversationId,
         string? query,

@@ -331,4 +331,48 @@ public sealed class ProactiveTopicAndBackoffTests
             CleanupDb(tempDb);
         }
     }
+
+    [Fact]
+    public async Task ProactiveAntiRepeatBlocklist_AndUpcomingScheduleFilter_PreventRamenLoopsAndSkillLeaks()
+    {
+        var (store, tempDb) = CreateTempStore();
+        try
+        {
+            const string convId = "conv-antirepeat";
+            var now = DateTimeOffset.UtcNow;
+
+            var userMsg = new ChatMessageRecord { ConversationId = convId, Role = "user", Content = "那個解決ㄌ", CreatedAt = now.AddMinutes(-90), RevealedAt = now.AddMinutes(-90) };
+            await store.UpsertChatMessageAsync(userMsg);
+            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "太好了！SameSite 解決了", ReplyToMessageId = userMsg.Id, CreatedAt = now.AddMinutes(-89), RevealedAt = now.AddMinutes(-89) });
+            await store.UpsertChatMessageAsync(new ChatMessageRecord { ConversationId = convId, Role = "assistant", Content = "欸，都已經快凌晨一點了，佐奈突然超想吃熱呼呼的拉麵耶……", TaskId = "proactive", CreatedAt = now.AddMinutes(-75), RevealedAt = now.AddMinutes(-75) });
+
+            var snippets = await store.GetRecentProactiveSnippetsAsync(convId, now.AddHours(-12), 6);
+            Assert.Single(snippets);
+            Assert.Contains("熱呼呼的拉麵", snippets[0]);
+            Assert.DoesNotContain(snippets, s => s.Contains("SameSite 解決了"));
+
+            var selected = new SelectedProactiveTopic(
+                ProactiveTopicKind.PersonaSmallTalk, null, null, Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>());
+            var prompt = MainAgentPrompts.BuildProactiveUserPrompt(now, selected, new[] { ProactiveTopicKind.TimeAndLife }, snippets);
+            Assert.Contains("already_said_recently (NEGATIVE BLOCKLIST", prompt);
+            Assert.Contains("熱呼呼的拉麵", prompt);
+
+            // Background polling skills (SkillName != null) like "新郵件監控" must NEVER be surfaced as user reminders!
+            var reminders = new List<ReminderRecord>
+            {
+                new("r1", convId, "新郵件監控", "sync mail", null, now.AddMinutes(1), "Pending", IntervalMinutes: 1, SkillName: "sync_mail"),
+                new("r2", convId, "打掉 HTB Vaccine 機器", "remember HTB", null, now.AddHours(5), "Pending", IntervalMinutes: 0, SkillName: null),
+                new("r3", convId, "下週例會", "next week", null, now.AddDays(5), "Pending", IntervalMinutes: 0, SkillName: null)
+            };
+
+            var upcoming = ProactiveTopicEngine.FilterUserUpcomingSchedules(reminders, now.AddHours(24));
+            Assert.Single(upcoming);
+            Assert.Contains("打掉 HTB Vaccine 機器", upcoming[0]);
+            Assert.DoesNotContain(upcoming, s => s.Contains("新郵件監控"));
+        }
+        finally
+        {
+            CleanupDb(tempDb);
+        }
+    }
 }

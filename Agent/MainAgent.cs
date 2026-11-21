@@ -1124,6 +1124,8 @@ public sealed class MainAgent
             AwarenessLevel: awarenessLevel);
 
         var selection = ProactiveTopicEngine.PickTopic(ctx);
+        var recentProactiveSnippets = await _store.GetRecentProactiveSnippetsAsync(
+            conversationId, DateTimeOffset.UtcNow.AddHours(-12), 6, ct);
         var ttsEnabled = _tts.IsEnabled && _tts.ChatMode != "notify_only";
         var sys = MainAgentPrompts.BuildProactiveSystemPrompt(
             activeStylePrompt,
@@ -1131,7 +1133,7 @@ public sealed class MainAgent
             _tts.TargetLang,
             GetReplyLanguage(),
             ttsEnabled);
-        var user = MainAgentPrompts.BuildProactiveUserPrompt(nowLocal, selection, recentTopics);
+        var user = MainAgentPrompts.BuildProactiveUserPrompt(nowLocal, selection, recentTopics, recentProactiveSnippets);
 
         try
         {

@@ -208,7 +208,7 @@ public static class MainAgentPrompts
         return $$"""
             Roleplay the following persona and proactively greet/check in with the desktop user in 1-2 natural sentences.
             - The program has already selected ONE `selected_topic` for this check-in. Stay naturally focused on `selected_topic` using ONLY the fields supplied in the user prompt (never invent or guess screen/window contents if `current_activity` is not provided).
-            - Avoid repeating themes listed in `recent_topics` or repeating any content listed in `recent_shared_items`.
+            - Avoid repeating themes listed in `recent_topics`, any content in `recent_shared_items`, or ANY subject, food/craving, angle, or opening phrase listed in `already_said_recently`. Vary your sentence openings naturally (do NOT start consecutive check-ins with the same interjection or time-of-day opener).
             - Avoid repeating generic care clichés (drinking water, tea, resting) back-to-back; keep phrasing varied and natural, without stiff customer-service tone.
             - Do NOT start every check-in by calling the user's name; omit their name most of the time.
             - If there is genuinely nothing natural or worthwhile to say right now, you MAY skip this check-in by returning ONLY: {"skip": true}
@@ -223,12 +223,20 @@ public static class MainAgentPrompts
     public static string BuildProactiveUserPrompt(
         DateTimeOffset now,
         Services.SelectedProactiveTopic selection,
-        IReadOnlyList<Services.ProactiveTopicKind> recentTopics)
+        IReadOnlyList<Services.ProactiveTopicKind> recentTopics,
+        IReadOnlyList<string>? recentProactiveSnippets = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"now: {now:yyyy-MM-dd HH:mm (dddd)}");
         sb.AppendLine($"selected_topic: {Services.ProactiveTopicEngine.ToCanonicalTopicKey(selection.Topic)}");
         sb.AppendLine($"recent_topics (do not repeat): {(recentTopics.Count == 0 ? "(none)" : string.Join(", ", recentTopics.Select(Services.ProactiveTopicEngine.ToCanonicalTopicKey)))}");
+
+        if (recentProactiveSnippets is { Count: > 0 })
+        {
+            sb.AppendLine("already_said_recently (NEGATIVE BLOCKLIST — DO NOT repeat these subjects, foods, angles, or opening phrases):");
+            foreach (var snippet in recentProactiveSnippets.TakeLast(6))
+                sb.AppendLine($"- {snippet}");
+        }
 
         switch (selection.Topic)
         {
