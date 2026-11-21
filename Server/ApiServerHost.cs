@@ -70,6 +70,7 @@ public sealed class ApiServerHost : IAsyncDisposable
         });
         _browserBridge.FillOtpRequested += (requestId, code) => BroadcastEvent("browser_fill_otp", new { requestId, code });
         _browserBridge.TitleRequested += requestId => BroadcastEvent("browser_title_request", new { requestId });
+        _browserBridge.SelectionRequested += requestId => BroadcastEvent("browser_selection_request", new { requestId });
     }
 
     public async Task StartAsync(CancellationToken ct = default)
@@ -230,6 +231,10 @@ public sealed class ApiServerHost : IAsyncDisposable
             _browserBridge.CompleteApplyFills(requestId, result)
                 ? Results.Ok(new { received = true })
                 : Results.NotFound(new { error = "Fill request not found or expired." }));
+        _app.MapPost("/api/browser/selection-result/{requestId}", (string requestId, BrowserSelectionResult result) =>
+            _browserBridge.CompleteSelection(requestId, result)
+                ? Results.Ok(new { received = true })
+                : Results.NotFound(new { error = "Selection request not found or expired." }));
         _app.MapPost("/api/browser/page-signal", async (BrowserPageSignal signal, CancellationToken ct) =>
         {
             await _controller.HandleBrowserPageSignalAsync(signal, ct);

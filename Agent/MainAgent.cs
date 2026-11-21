@@ -30,6 +30,7 @@ public sealed class MainAgent
     private readonly StateMachineAgent _stateMachine;
     private readonly SandboxService _sandbox;
     private readonly AgentBlackboard _blackboard;
+    private readonly AttentionContextService _attention;
     private readonly ILogger<MainAgent> _logger;
 
     public MainAgent(
@@ -49,6 +50,7 @@ public sealed class MainAgent
         StateMachineAgent stateMachine,
         SandboxService sandbox,
         AgentBlackboard blackboard,
+        AttentionContextService attention,
         ILogger<MainAgent> logger)
     {
         _store = store;
@@ -67,6 +69,7 @@ public sealed class MainAgent
         _stateMachine = stateMachine;
         _sandbox = sandbox;
         _blackboard = blackboard;
+        _attention = attention;
         _logger = logger;
     }
 
@@ -105,6 +108,9 @@ public sealed class MainAgent
         var recent = await _store.GetChatMessagesAsync(conversationId, 80, ct);
         var historyMessages = BuildHistoryModelMessages(recent, userPrompt, maxMessages: 20, perMessageMaxChars: 2500, totalMaxChars: 18000);
 
+        // Record 90-second implicit correction feedback for any preceding deixis L1 prefetch turn.
+        await _attention.CheckImplicitFeedbackAsync(conversationId, userPrompt, ct);
+
         var recalledFacts = await _store.RecallRelevantFactsAsync(conversationId, userPrompt, 5, ct);
         var factsContext = MainAgentPrompts.FormatFactsContext(recalledFacts);
 
@@ -141,6 +147,9 @@ public sealed class MainAgent
             .ToHashSet(StringComparer.Ordinal);
         var blackboardContext = AgentBlackboard.FormatForPrompt(bbSnapshot);
 
+        // L1 deictic attention prefetch (only triggered on deterministic deictic cues; zero cost on normal turns).
+        var attentionCtx = await _attention.TryBuildL1ContextAsync(conversationId, userPrompt, targetMailId, recent, ct);
+
         var dynamicUserPrompt = MainAgentPrompts.BuildUserContextPrompt(
             DateTimeOffset.Now,
             targetMailId,
@@ -152,11 +161,11 @@ public sealed class MainAgent
             activeWindowContext,
             _sandbox.RootPath,
             _sandbox.GetTrustedPaths(),
-            blackboardContext);
+            blackboardContext,
+            attentionCtx?.FormattedBlock ?? "");
 
         // Fast path: 2-bit branch prediction for repeated read-only single-step intents (skips MainAgent routing LLM).
-        // Skip fast path ONLY when a USER-INITIATED task (planner / single_skill) is in-flight,
-        // so background mail_sync/watcher/scheduled polls never disable predicted fast paths.
+        // Skip fast path when a USER-INITIATED task is in-flight OR when L1 deictic context was prefetched.
         var turnStartedUtc = DateTimeOffset.UtcNow;
         var basePromptMessages = new List<ModelMessage>(2 + historyMessages.Count)
         {
@@ -169,6 +178,7 @@ public sealed class MainAgent
             string.IsNullOrWhiteSpace(preferredLogicalTaskId) &&
             (activePlannerTasks is null || activePlannerTasks.Count == 0) &&
             !bbSnapshot.HasUserInitiatedInFlight &&
+            attentionCtx is null &&
             !AttachmentExtractor.AttachmentPattern.IsMatch(userPrompt))
         {
             var (predWf, predStep) = await _workflowCache.TryPredictSingleStepAsync(conversationId, userPrompt, ct);
@@ -313,6 +323,9 @@ public sealed class MainAgent
         // Guard: if the model matched an active Planner task, force Planner continuation so task approvals persist.
         if (action == "run_skill" && !string.IsNullOrWhiteSpace(targetTaskId))
             action = "call_planner";
+
+        if (attentionCtx is not null)
+            await _attention.RecordDeixisOutcomeAsync(conversationId, attentionCtx, userPrompt, action, skill, ct);
 
         if (action == "join_task")
         {

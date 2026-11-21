@@ -22,6 +22,15 @@ public sealed record BrowserTabTitleResult(
     string? Title = null,
     bool Incognito = false);
 
+public sealed record BrowserSelectionResult(
+    string? Url = null,
+    string? Title = null,
+    string? SelectionText = null,
+    IReadOnlyList<string>? Headings = null,
+    string? Excerpt = null,
+    string? FocusedLabel = null,
+    bool Incognito = false);
+
 public sealed record BrowserFormFillItemResult(
     string FieldId,
     bool Applied,
@@ -48,6 +57,7 @@ public sealed class BrowserFormBridgeService
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserOtpFillResult?>> _otpWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserTabTitleResult?>> _titleWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserFormFillResult?>> _fillWaiters = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserSelectionResult?>> _selectionWaiters = new();
 
     public event Action<string>? ExtractRequested;
     public event Action<string, string?, int>? DomRequested;
@@ -55,6 +65,7 @@ public sealed class BrowserFormBridgeService
     public event Action<string, IReadOnlyList<BrowserFillAction>>? ApplyFillsRequested;
     public event Action<string, string>? FillOtpRequested;
     public event Action<string>? TitleRequested;
+    public event Action<string>? SelectionRequested;
 
     public Task<BrowserFormContext?> RequestActiveTabFormAsync(TimeSpan timeout, CancellationToken ct = default)
         => WaitWithTimeoutAsync(_extractWaiters, id => ExtractRequested?.Invoke(id), timeout, ct);
@@ -67,6 +78,13 @@ public sealed class BrowserFormBridgeService
 
     public Task<BrowserTabTitleResult?> RequestActiveTabTitleAsync(TimeSpan timeout, CancellationToken ct = default)
         => WaitWithTimeoutAsync(_titleWaiters, id => TitleRequested?.Invoke(id), timeout, ct);
+
+    /// <summary>
+    /// Fast L1 selection & safe page-excerpt fetch from the active non-incognito browser tab (never reads input values or passwords).
+    /// Intended to be called with a tight ~300ms timeout so it never slows down routing.
+    /// </summary>
+    public Task<BrowserSelectionResult?> RequestActiveTabSelectionAsync(TimeSpan timeout, CancellationToken ct = default)
+        => WaitWithTimeoutAsync(_selectionWaiters, id => SelectionRequested?.Invoke(id), timeout, ct);
 
     private static async Task<T?> WaitWithTimeoutAsync<T>(
         ConcurrentDictionary<string, TaskCompletionSource<T?>> waiters,
@@ -141,6 +159,14 @@ public sealed class BrowserFormBridgeService
     public bool CompleteApplyFills(string requestId, BrowserFormFillResult result)
     {
         if (!_fillWaiters.TryRemove(requestId, out var tcs))
+            return false;
+        tcs.TrySetResult(result);
+        return true;
+    }
+
+    public bool CompleteSelection(string requestId, BrowserSelectionResult result)
+    {
+        if (!_selectionWaiters.TryRemove(requestId, out var tcs))
             return false;
         tcs.TrySetResult(result);
         return true;

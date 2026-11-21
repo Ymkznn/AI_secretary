@@ -2539,7 +2539,17 @@ public sealed class SqliteStore
         return list;
     }
 
-    public async Task InsertPredictionLogAsync(
+    public Task InsertPredictionLogAsync(
+        string source,
+        string subjectKey,
+        string queryText,
+        string predictedAction,
+        bool execSucceeded,
+        long tokensSaved,
+        CancellationToken ct = default)
+        => InsertPredictionLogReturningIdAsync(source, subjectKey, queryText, predictedAction, execSucceeded, tokensSaved, ct);
+
+    public async Task<long> InsertPredictionLogReturningIdAsync(
         string source,
         string subjectKey,
         string queryText,
@@ -2555,6 +2565,7 @@ public sealed class SqliteStore
             cmd.CommandText = """
                 INSERT INTO PredictionLogs (TimestampUtc, Source, SubjectKey, QueryText, PredictedAction, ExecSucceeded, ImplicitFeedback, TokensSaved)
                 VALUES (@ts, @src, @subj, @q, @act, @ok, NULL, @saved);
+                SELECT last_insert_rowid();
                 """;
             cmd.Parameters.AddWithValue("@ts", DateTimeOffset.UtcNow.ToString("O"));
             cmd.Parameters.AddWithValue("@src", source);
@@ -2563,6 +2574,25 @@ public sealed class SqliteStore
             cmd.Parameters.AddWithValue("@act", predictedAction);
             cmd.Parameters.AddWithValue("@ok", execSucceeded ? 1 : 0);
             cmd.Parameters.AddWithValue("@saved", tokensSaved);
+            var scalar = await cmd.ExecuteScalarAsync(ct);
+            return scalar is not null && scalar is not DBNull ? Convert.ToInt64(scalar) : 0L;
+        }
+        catch
+        {
+            return 0L;
+        }
+    }
+
+    public async Task UpdatePredictionLogFeedbackAsync(long logId, string feedback, CancellationToken ct = default)
+    {
+        if (logId <= 0 || string.IsNullOrWhiteSpace(feedback)) return;
+        try
+        {
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE PredictionLogs SET ImplicitFeedback = @fb WHERE Id = @id;";
+            cmd.Parameters.AddWithValue("@fb", feedback);
+            cmd.Parameters.AddWithValue("@id", logId);
             await cmd.ExecuteNonQueryAsync(ct);
         }
         catch { }

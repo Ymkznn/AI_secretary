@@ -50,7 +50,6 @@ public sealed class SecretaryController : IDisposable
     // _presentGate protects millisecond UI/DB presentation state ONLY (messages, choices, TTS enqueue); NEVER spans LLM calls and NEVER acquired by background work alongside _userTurnGate.
     private readonly SemaphoreSlim _userTurnGate = new(1, 1);
     private readonly SemaphoreSlim _presentGate = new(1, 1);
-    private static readonly AsyncLocal<bool> s_holdingPresentGate = new();
     private int _mainTurnActiveCount;
 
     private sealed class PresentGateScope : IDisposable
@@ -61,20 +60,17 @@ public sealed class SecretaryController : IDisposable
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            s_holdingPresentGate.Value = false;
             _gate.Release();
         }
     }
 
     private async Task<IDisposable> EnterPresentGateAsync(CancellationToken ct = default)
     {
-        if (s_holdingPresentGate.Value)
+        if (!await _presentGate.WaitAsync(TimeSpan.FromSeconds(10), ct))
         {
-            _logger.LogError("Detected re-entrant _presentGate acquisition!");
-            System.Diagnostics.Debug.Fail("Re-entrant _presentGate acquisition detected!");
+            _logger.LogError("_presentGate wait > 10s — possible re-entrancy or a slow section");
+            await _presentGate.WaitAsync(ct);
         }
-        await _presentGate.WaitAsync(ct);
-        s_holdingPresentGate.Value = true;
         return new PresentGateScope(_presentGate);
     }
     private DateTimeOffset? _dndUntil;

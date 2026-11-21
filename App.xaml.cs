@@ -94,6 +94,7 @@ public partial class App : System.Windows.Application
         sc.AddSingleton<StateMachineAgent>();
         sc.AddSingleton<BrowserHostService>();
         sc.AddSingleton<BrowserFormBridgeService>();
+        sc.AddSingleton<AttentionContextService>();
         sc.AddSingleton<StandingWatcherService>();
         sc.AddSingleton<WorkflowCacheService>();
         sc.AddSingleton<WorkflowOptimizerAgent>();

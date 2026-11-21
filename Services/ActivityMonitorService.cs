@@ -17,6 +17,20 @@ public sealed record ExternalWindowTarget(
     IReadOnlyList<string>? FormFieldLabels = null,
     int VisibleInputCount = 0);
 
+public sealed record CachedBrowserPageSignal(
+    string Url,
+    string Title,
+    int InputCount,
+    IReadOnlyList<string> Labels,
+    IReadOnlyList<string> Headings,
+    string Excerpt,
+    DateTimeOffset CapturedAt);
+
+public sealed record DesktopSelectionSnapshot(
+    string? SelectionText,
+    string? FocusedElementLabel,
+    string? FocusedControlType);
+
 /// <summary>
 /// Pure sensor tracking recent external foreground windows (excluding this app),
 /// reading local password-redacted UIA fields, and emitting debounced WindowFocused signals
@@ -28,11 +42,13 @@ public sealed class ActivityMonitorService : IDisposable
     private readonly UiLocalizer _localizer;
     private readonly object _lock = new();
     private readonly LinkedList<ExternalWindowTarget> _recentTargets = new();
+    private CachedBrowserPageSignal? _lastBrowserPageSignal;
 
     private readonly CancellationTokenSource _cts = new();
     private Task? _loopTask;
     private nint _lastRawHwnd;
     private string? _lastVisitedTitle;
+    private bool _wasSelfForeground;
 
     private static readonly HashSet<string> SensitiveProcesses = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -83,6 +99,133 @@ public sealed class ActivityMonitorService : IDisposable
     {
         lock (_lock)
             return _recentTargets.First?.Value;
+    }
+
+    public CachedBrowserPageSignal? GetLastBrowserPageSignal()
+    {
+        lock (_lock)
+            return _lastBrowserPageSignal;
+    }
+
+    /// <summary>
+    /// Reads ONLY explicitly highlighted selection text (via UIA TextPattern.GetSelection) and safe accessible
+    /// focus label from a non-sensitive desktop window, strictly bounded by <paramref name="timeout"/> (default 300ms).
+    /// NEVER reads password fields and NEVER reads unselected input field values (ValuePattern).
+    /// </summary>
+    public async Task<DesktopSelectionSnapshot?> TryReadDesktopSelectionAsync(
+        ExternalWindowTarget target,
+        TimeSpan timeout,
+        CancellationToken ct = default)
+    {
+        if (target.Hwnd == IntPtr.Zero || SensitiveProcesses.Contains(target.ProcessName))
+            return null;
+
+        try
+        {
+            var work = Task.Run(() => ReadDesktopSelectionSync(target.Hwnd, target.ProcessId));
+            using var delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var completed = await Task.WhenAny(work, Task.Delay(timeout, delayCts.Token));
+            if (completed == work)
+            {
+                delayCts.Cancel();
+                return await work;
+            }
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static DesktopSelectionSnapshot? ReadDesktopSelectionSync(nint hwnd, int targetPid)
+    {
+        try
+        {
+            string? selection = null;
+            string? focusedLabel = null;
+            string? focusedType = null;
+
+            // 1) Inspect target window's Document / Edit controls via TextPattern.GetSelection() ONLY
+            //    (works for Word, Notepad, VS Code, PDF readers even after user focused AI Secretary).
+            var root = AutomationElement.FromHandle(hwnd);
+            if (root is not null)
+            {
+                var doc = root.FindFirst(
+                    TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document));
+                if (doc is not null)
+                    selection = TryExtractSafeSelection(doc);
+
+                if (string.IsNullOrWhiteSpace(selection))
+                {
+                    var edit = root.FindFirst(
+                        TreeScope.Descendants,
+                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
+                    if (edit is not null)
+                        selection = TryExtractSafeSelection(edit);
+                }
+            }
+
+            // 2) Inspect current AutomationElement.FocusedElement only if it still belongs to targetPid & is NOT password.
+            try
+            {
+                var focused = AutomationElement.FocusedElement;
+                if (focused is not null && focused.Current.ProcessId == targetPid && !focused.Current.IsPassword)
+                {
+                    if (string.IsNullOrWhiteSpace(selection))
+                        selection = TryExtractSafeSelection(focused);
+
+                    var name = focused.Current.Name?.Trim();
+                    if (!string.IsNullOrWhiteSpace(name))
+                        focusedLabel = name.Length <= 80 ? name : name[..80];
+                    focusedType = focused.Current.ControlType?.ProgrammaticName;
+                }
+            }
+            catch { }
+
+            if (string.IsNullOrWhiteSpace(selection) && string.IsNullOrWhiteSpace(focusedLabel))
+                return null;
+
+            return new DesktopSelectionSnapshot(selection, focusedLabel, focusedType);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? TryExtractSafeSelection(AutomationElement el)
+    {
+        try
+        {
+            if (el.Current.IsPassword)
+                return null;
+
+            if (el.TryGetCurrentPattern(TextPattern.Pattern, out var tpObj) && tpObj is TextPattern tp)
+            {
+                var ranges = tp.GetSelection();
+                if (ranges is { Length: > 0 })
+                {
+                    var sb = new StringBuilder();
+                    foreach (var r in ranges)
+                    {
+                        var txt = r.GetText(900);
+                        if (!string.IsNullOrWhiteSpace(txt))
+                        {
+                            if (sb.Length > 0) sb.Append(' ');
+                            sb.Append(txt.Trim());
+                            if (sb.Length >= 800) break;
+                        }
+                    }
+                    var combined = System.Text.RegularExpressions.Regex.Replace(sb.ToString(), @"\s+", " ").Trim();
+                    if (!string.IsNullOrWhiteSpace(combined))
+                        return combined.Length <= 800 ? combined : combined[..800] + "…";
+                }
+            }
+        }
+        catch { }
+        return null;
     }
 
     public async Task<(bool Ok, string Message)> TryFillOtpInExternalWindowAsync(string code, string? serviceHint = null, CancellationToken ct = default)
@@ -142,19 +285,41 @@ public sealed class ActivityMonitorService : IDisposable
 
     public Task HandleBrowserPageSignalAsync(BrowserPageSignal signal, CancellationToken ct = default)
     {
-        if (!ProactiveMonitoringEnabled || string.IsNullOrWhiteSpace(signal.Url) || signal.InputCount <= 0)
+        if (string.IsNullOrWhiteSpace(signal.Url))
             return Task.CompletedTask;
 
+        var now = DateTimeOffset.UtcNow;
         var title = string.IsNullOrWhiteSpace(signal.Title) ? signal.Url : signal.Title.Trim();
+        var labels = signal.Labels ?? Array.Empty<string>();
+        var headings = signal.Headings ?? Array.Empty<string>();
+        var excerpt = (signal.Excerpt ?? "").Trim();
+        if (excerpt.Length > 700) excerpt = excerpt[..700] + "…";
+
+        // Always cache L1 browser page metadata (even when InputCount == 0, e.g., Wiki/doc pages) for zero-round-trip deictic prefetch.
+        lock (_lock)
+        {
+            _lastBrowserPageSignal = new CachedBrowserPageSignal(
+                Url: signal.Url.Trim(),
+                Title: title,
+                InputCount: Math.Max(0, signal.InputCount),
+                Labels: labels,
+                Headings: headings,
+                Excerpt: excerpt,
+                CapturedAt: now);
+        }
+
+        if (!ProactiveMonitoringEnabled || signal.InputCount <= 0)
+            return Task.CompletedTask;
+
         var current = GetLastExternalTarget();
         var target = new ExternalWindowTarget(
             Hwnd: current?.Hwnd ?? IntPtr.Zero,
             ProcessId: current?.ProcessId ?? 0,
             ProcessName: current?.ProcessName ?? "browser",
             Title: title,
-            CapturedAt: DateTimeOffset.UtcNow,
+            CapturedAt: now,
             IsFormLike: signal.InputCount >= 4,
-            FormFieldLabels: signal.Labels ?? Array.Empty<string>(),
+            FormFieldLabels: labels,
             VisibleInputCount: signal.InputCount);
 
         WindowFocused?.Invoke(target, signal.Url);
@@ -228,7 +393,11 @@ public sealed class ActivityMonitorService : IDisposable
 
                 GetWindowThreadProcessId(hwnd, out var pid);
                 if (pid == 0 || pid == selfPid)
+                {
+                    if (pid == selfPid)
+                        _wasSelfForeground = true;
                     continue; // Critical: never overwrite LastExternalTarget with our own UI window!
+                }
 
                 var cls = GetWindowClass(hwnd);
                 if (IgnoredWindowClasses.Contains(cls))
@@ -243,6 +412,8 @@ public sealed class ActivityMonitorService : IDisposable
                     continue;
 
                 var now = DateTimeOffset.UtcNow;
+                bool returnedFromSelf = _wasSelfForeground;
+                _wasSelfForeground = false;
                 bool windowChanged = hwnd != _lastRawHwnd || !string.Equals(title, _lastVisitedTitle, StringComparison.Ordinal);
 
                 if (windowChanged)
@@ -269,6 +440,16 @@ public sealed class ActivityMonitorService : IDisposable
                                 WindowFocused?.Invoke(enriched, null);
                         }, ct);
                     }
+                }
+                else if (returnedFromSelf)
+                {
+                    // User switched away from AI Secretary back to the same external window (e.g. to highlight text in Word/Chrome):
+                    // refresh CapturedAt so L1 staleness accurately reflects when the user last actively focused that external window.
+                    var existing = GetLastExternalTarget();
+                    if (existing is not null && existing.Hwnd == hwnd)
+                        RecordTarget(existing with { CapturedAt = now });
+                    else
+                        RecordTarget(new ExternalWindowTarget(hwnd, (int)pid, procName, title, now));
                 }
             }
             catch (OperationCanceledException)

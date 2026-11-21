@@ -37,6 +37,7 @@ async function reportPageSignal(tab) {
     const frameResults = await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       func: () => {
+        const isTop = window === window.top;
         const els = Array.from(document.querySelectorAll('input, textarea, select'))
           .filter(el => {
             const t = (el.type || el.tagName).toLowerCase();
@@ -46,12 +47,51 @@ async function reportPageSignal(tab) {
           .map(el => (el.getAttribute('aria-label') || el.placeholder || el.name || el.id || '').trim())
           .filter(Boolean)
           .slice(0, 12);
-        return { inputCount: els.length, labels };
+
+        let headings = [];
+        let excerpt = '';
+        if (isTop) {
+          headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+            .filter(h => h.offsetParent !== null)
+            .map(h => (h.innerText || '').replace(/\s+/g, ' ').trim())
+            .filter(t => t.length >= 2)
+            .map(t => t.slice(0, 80))
+            .slice(0, 5);
+
+          // Safe L1 excerpt: never reads input/textarea/select values or passwords.
+          const container = document.querySelector('article, main, [role="main"], #mw-content-text, .mw-parser-output') || document.body;
+          if (container) {
+            const chunks = [];
+            let total = 0;
+            const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+              acceptNode(node) {
+                const p = node.parentElement;
+                if (!p) return NodeFilter.FILTER_REJECT;
+                if (p.closest('script, style, noscript, svg, nav, header, footer, aside, input, textarea, select, [aria-hidden="true"]')) {
+                  return NodeFilter.FILTER_REJECT;
+                }
+                const txt = (node.nodeValue || '').replace(/\s+/g, ' ').trim();
+                return txt.length >= 2 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+              }
+            });
+            let cur;
+            while ((cur = walker.nextNode()) && total < 650) {
+              const t = cur.nodeValue.replace(/\s+/g, ' ').trim();
+              if (!t) continue;
+              chunks.push(t);
+              total += t.length + 1;
+            }
+            excerpt = chunks.join(' ').slice(0, 650);
+          }
+        }
+        return { isTop, inputCount: els.length, labels, headings, excerpt };
       }
     });
 
     let totalInputs = 0;
     const allLabels = [];
+    let topHeadings = [];
+    let topExcerpt = '';
     for (const r of frameResults || []) {
       if (!r?.result) continue;
       totalInputs += r.result.inputCount || 0;
@@ -59,6 +99,10 @@ async function reportPageSignal(tab) {
         if (lbl && !allLabels.includes(lbl) && allLabels.length < 15) {
           allLabels.push(lbl);
         }
+      }
+      if (r.result.isTop) {
+        topHeadings = r.result.headings || [];
+        topExcerpt = r.result.excerpt || '';
       }
     }
 
@@ -69,7 +113,9 @@ async function reportPageSignal(tab) {
         url: tab.url,
         title: tab.title || '',
         inputCount: totalInputs,
-        labels: allLabels
+        labels: allLabels,
+        headings: topHeadings,
+        excerpt: topExcerpt
       })
     });
   } catch {}
@@ -349,6 +395,91 @@ async function handleTabTitle(requestId) {
   } catch {}
 }
 
+async function handleSelection(requestId) {
+  let result = { url: null, title: null, selectionText: null, headings: [], excerpt: null, focusedLabel: null, incognito: false };
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (tab) {
+      if (tab.incognito) {
+        result = { incognito: true };
+      } else if (tab.id && tab.url && /^https?:/i.test(tab.url)) {
+        result.url = tab.url;
+        result.title = tab.title || '';
+        const execRes = await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: false },
+          func: () => {
+            const active = document.activeElement;
+            const activeTag = (active?.tagName || '').toLowerCase();
+            const activeType = (active?.type || '').toLowerCase();
+            const isPasswordFocused = activeTag === 'input' && activeType === 'password';
+
+            // Strictly read page text selection only; NEVER read form input/textarea values or password fields.
+            let sel = '';
+            if (!isPasswordFocused && activeTag !== 'input' && activeTag !== 'textarea') {
+              sel = (window.getSelection ? String(window.getSelection() || '') : '').replace(/\s+/g, ' ').trim().slice(0, 750);
+            }
+
+            let focusedLabel = '';
+            if (active && !isPasswordFocused && (activeTag === 'input' || activeTag === 'textarea' || activeTag === 'select')) {
+              focusedLabel = (active.getAttribute('aria-label') || active.placeholder || active.name || active.id || '').trim().slice(0, 80);
+            }
+
+            const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+              .filter(h => h.offsetParent !== null)
+              .map(h => (h.innerText || '').replace(/\s+/g, ' ').trim())
+              .filter(t => t.length >= 2)
+              .map(t => t.slice(0, 80))
+              .slice(0, 5);
+
+            let excerpt = '';
+            const container = document.querySelector('article, main, [role="main"], #mw-content-text, .mw-parser-output') || document.body;
+            if (container) {
+              const chunks = [];
+              let total = 0;
+              const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+                acceptNode(node) {
+                  const p = node.parentElement;
+                  if (!p) return NodeFilter.FILTER_REJECT;
+                  if (p.closest('script, style, noscript, svg, nav, header, footer, aside, input, textarea, select, [aria-hidden="true"]')) {
+                    return NodeFilter.FILTER_REJECT;
+                  }
+                  const txt = (node.nodeValue || '').replace(/\s+/g, ' ').trim();
+                  return txt.length >= 2 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+                }
+              });
+              let cur;
+              while ((cur = walker.nextNode()) && total < 650) {
+                const t = cur.nodeValue.replace(/\s+/g, ' ').trim();
+                if (!t) continue;
+                chunks.push(t);
+                total += t.length + 1;
+              }
+              excerpt = chunks.join(' ').slice(0, 650);
+            }
+
+            return { selectionText: sel, focusedLabel, headings, excerpt };
+          }
+        });
+        const r = execRes?.[0]?.result;
+        if (r) {
+          result.selectionText = r.selectionText || null;
+          result.focusedLabel = r.focusedLabel || null;
+          result.headings = r.headings || [];
+          result.excerpt = r.excerpt || null;
+        }
+      }
+    }
+  } catch {}
+
+  try {
+    await fetch(`${API_BASE}/api/browser/selection-result/${encodeURIComponent(requestId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(result)
+    });
+  } catch {}
+}
+
 function ensureSseConnected() {
   if (sse && sse.readyState !== EventSource.CLOSED) {
     if (Date.now() - lastPingAt < 45000) return;
@@ -401,6 +532,13 @@ function connectSse() {
     try {
       const data = JSON.parse(ev.data);
       if (data?.requestId) handleTabTitle(data.requestId);
+    } catch {}
+  });
+  sse.addEventListener('browser_selection_request', (ev) => {
+    lastPingAt = Date.now();
+    try {
+      const data = JSON.parse(ev.data);
+      if (data?.requestId) handleSelection(data.requestId);
     } catch {}
   });
   sse.onerror = () => {

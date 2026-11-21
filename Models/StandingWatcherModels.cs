@@ -61,7 +61,9 @@ public sealed record BrowserPageSignal(
     string Url,
     string Title,
     int InputCount,
-    IReadOnlyList<string>? Labels = null);
+    IReadOnlyList<string>? Labels = null,
+    IReadOnlyList<string>? Headings = null,
+    string? Excerpt = null);
 
 public sealed record AutoStateRuleRecord(
     string TriggerKey,
