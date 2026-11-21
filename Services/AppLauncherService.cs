@@ -72,6 +72,17 @@ public sealed class AppLauncherService
             return new AppLaunchResult(false, "Security policy rejected launch arguments (only safe URLs or existing local paths are allowed).", Denied: true);
         }
 
+        // If "browser" is requested with an http(s) URL, hand the URL directly to Windows Shell
+        // so it always opens in the user's actual default browser (Edge, Chrome, Firefox, etc.).
+        if (query.Equals("browser", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(arguments) &&
+            Uri.TryCreate(arguments.Trim(), UriKind.Absolute, out var argUri) &&
+            argUri.Scheme is "http" or "https")
+        {
+            query = arguments.Trim();
+            arguments = null;
+        }
+
         var target = ResolveTarget(query);
         if (string.IsNullOrWhiteSpace(target))
         {
@@ -126,9 +137,9 @@ public sealed class AppLauncherService
         // 2. Built-in aliases
         if (BuiltInAliases.TryGetValue(query, out var aliased))
         {
-            // Prefer chrome.exe if "browser" is requested and Chrome is registered
-            if (query.Equals("browser", StringComparison.OrdinalIgnoreCase) && FindInAppPaths("chrome.exe") is string chromePath)
-                return chromePath;
+            if (query.Equals("browser", StringComparison.OrdinalIgnoreCase) &&
+                FindDefaultBrowserExecutable() is string defaultBrowser)
+                return defaultBrowser;
             return aliased;
         }
 
@@ -158,6 +169,39 @@ public sealed class AppLauncherService
         }
 
         return null;
+    }
+
+    private static string? FindDefaultBrowserExecutable()
+    {
+        try
+        {
+            using var choice = Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice");
+            var progId = choice?.GetValue("ProgId") as string;
+            if (string.IsNullOrWhiteSpace(progId)) return null;
+
+            using var cmdKey = Registry.ClassesRoot.OpenSubKey($@"{progId}\shell\open\command");
+            var cmd = cmdKey?.GetValue(null) as string;
+            if (string.IsNullOrWhiteSpace(cmd)) return null;
+
+            cmd = cmd.Trim();
+            string exePath;
+            if (cmd.StartsWith('"'))
+            {
+                var endQuote = cmd.IndexOf('"', 1);
+                exePath = endQuote > 1 ? cmd[1..endQuote] : cmd.Trim('"');
+            }
+            else
+            {
+                var space = cmd.IndexOf(' ');
+                exePath = space > 0 ? cmd[..space] : cmd;
+            }
+            return File.Exists(exePath) ? exePath : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static string? FindInAppPaths(string exeName)

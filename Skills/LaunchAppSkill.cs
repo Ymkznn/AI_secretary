@@ -16,11 +16,11 @@ public sealed class LaunchAppSkill : IBasicSkill
     public string StatusText => "Launching application...";
     public string MainAgentSpec => """
             launch_app
-               - Purpose: Launch a whitelisted local Windows application (Notepad, Calculator, Chrome, Edge, VS Code, Terminal, Office, etc.).
-               - Args: {"app_name": "app name", "arguments": "optional args"}
+               - Purpose: Open a web URL in the user's default browser (pass the https:// URL directly as `app_name` with no browser name), or launch a whitelisted local Windows application (Notepad, Calculator, Edge, Chrome, VS Code, Office, etc.).
+               - Args: {"app_name": "https:// URL (uses default browser) OR app name", "arguments": "optional args"}
             
         """;
-    public string PlannerSpec => """launch_app: Launch local Windows app. args: {"app_name":"...","arguments":"..."}""";
+    public string PlannerSpec => """launch_app: Open https:// URL in default browser (pass URL directly as app_name) or launch local Windows app. args: {"app_name":"https://... or app name","arguments":"optional"}""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
