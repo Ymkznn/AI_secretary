@@ -24,7 +24,9 @@ public sealed record CachedBrowserPageSignal(
     IReadOnlyList<string> Labels,
     IReadOnlyList<string> Headings,
     string Excerpt,
-    DateTimeOffset CapturedAt);
+    DateTimeOffset CapturedAt,
+    bool OtpFieldPresent = false,
+    bool OtpFieldFocused = false);
 
 public sealed record DesktopSelectionSnapshot(
     string? SelectionText,
@@ -67,6 +69,7 @@ public sealed class ActivityMonitorService : IDisposable
     };
 
     public event Action<ExternalWindowTarget, string?>? WindowFocused;
+    public event Action<CachedBrowserPageSignal>? BrowserPageSignalReceived;
 
     public bool ProactiveMonitoringEnabled { get; set; } = true;
 
@@ -244,23 +247,25 @@ public sealed class ActivityMonitorService : IDisposable
         return null;
     }
 
-    public async Task<(bool Ok, string Message)> TryFillOtpInExternalWindowAsync(string code, string? serviceHint = null, CancellationToken ct = default)
+    public Task<(bool Ok, string Message)> TryFillOtpInExternalWindowAsync(string code, string? serviceHint = null, CancellationToken ct = default, string? displayHandle = null)
     {
+        // Zero-LLM path: uses TextCached only so L2 OTP auto-fill never triggers a localization LLM call.
         if (string.IsNullOrWhiteSpace(code))
-            return (false, await _localizer.TextAsync("OtpEmpty", "Verification code is empty.", Array.Empty<object?>(), ct));
+            return Task.FromResult((false, _localizer.TextCached("OtpEmpty", "Verification code is empty.")));
 
+        var handleTag = string.IsNullOrWhiteSpace(displayHandle) ? "otp" : displayHandle;
         var targets = GetRecentExternalTargets();
         var target = targets.FirstOrDefault(t => !string.IsNullOrWhiteSpace(serviceHint) && SharesKeyword(t.Title, serviceHint))
                      ?? targets.FirstOrDefault();
 
         if (target is null)
-            return (false, await _localizer.TextAsync("OtpTargetMissing", "No matching external browser or login window found.", Array.Empty<object?>(), ct));
+            return Task.FromResult((false, _localizer.TextCached("OtpTargetMissing", "No matching external browser or login window found.")));
 
         try
         {
             var root = AutomationElement.FromHandle(target.Hwnd);
             if (root is null)
-                return (false, await _localizer.TextAsync("OtpWindowInaccessible", "Cannot access target window UI.", Array.Empty<object?>(), ct));
+                return Task.FromResult((false, _localizer.TextCached("OtpWindowInaccessible", "Cannot access target window UI.")));
 
             var doc = root.FindFirst(
                 TreeScope.Descendants,
@@ -278,24 +283,24 @@ public sealed class ActivityMonitorService : IDisposable
             }
 
             if (chosen is null)
-                return (false, await _localizer.TextAsync("OtpFieldNotFound", "No fillable input found in '{0}'; copied to clipboard instead.", new object?[] { Truncate(target.Title, 24) }, ct));
+                return Task.FromResult((false, _localizer.TextCached("OtpFieldNotFound", "No fillable input found in '{0}'.", Truncate(target.Title, 24))));
 
             SetForegroundWindow(target.Hwnd);
             if (chosen.TryGetCurrentPattern(ValuePattern.Pattern, out var vpObj) && vpObj is ValuePattern vp && !vp.Current.IsReadOnly)
             {
                 vp.SetValue(code);
-                return (true, await _localizer.TextAsync("OtpFilled", "Filled verification code {0} into '{1}' (not auto-submitted).", new object?[] { code, Truncate(target.Title, 24) }, ct));
+                return Task.FromResult((true, _localizer.TextCached("OtpFilledSafe", "Filled {0} into '{1}' (not auto-submitted).", handleTag, Truncate(target.Title, 24))));
             }
 
             chosen.SetFocus();
             System.Windows.Forms.SendKeys.SendWait("^a");
             System.Windows.Forms.SendKeys.SendWait(code);
-            return (true, await _localizer.TextAsync("OtpTyped", "Entered verification code {0} into '{1}' (not auto-submitted).", new object?[] { code, Truncate(target.Title, 24) }, ct));
+            return Task.FromResult((true, _localizer.TextCached("OtpTypedSafe", "Entered {0} into '{1}' (not auto-submitted).", handleTag, Truncate(target.Title, 24))));
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "TryFillOtpInExternalWindowAsync failed");
-            return (false, await _localizer.TextAsync("OtpAutoFillFailed", "Auto-fill failed: {0}", new object?[] { ex.Message }, ct));
+            return Task.FromResult((false, _localizer.TextCached("OtpAutoFillFailed", "Auto-fill failed: {0}", ex.Message)));
         }
     }
 
@@ -311,18 +316,25 @@ public sealed class ActivityMonitorService : IDisposable
         var excerpt = (signal.Excerpt ?? "").Trim();
         if (excerpt.Length > 700) excerpt = excerpt[..700] + "…";
 
+        var cached = new CachedBrowserPageSignal(
+            Url: signal.Url.Trim(),
+            Title: title,
+            InputCount: Math.Max(0, signal.InputCount),
+            Labels: labels,
+            Headings: headings,
+            Excerpt: excerpt,
+            CapturedAt: now,
+            OtpFieldPresent: signal.OtpFieldPresent,
+            OtpFieldFocused: signal.OtpFieldFocused);
+
         // Always cache L1 browser page metadata (even when InputCount == 0, e.g., Wiki/doc pages) for zero-round-trip deictic prefetch.
         lock (_lock)
         {
-            _lastBrowserPageSignal = new CachedBrowserPageSignal(
-                Url: signal.Url.Trim(),
-                Title: title,
-                InputCount: Math.Max(0, signal.InputCount),
-                Labels: labels,
-                Headings: headings,
-                Excerpt: excerpt,
-                CapturedAt: now);
+            _lastBrowserPageSignal = cached;
         }
+
+        // Notify OTP dual-signal detector regardless of InputCount (OTP pages often have only 1 input).
+        BrowserPageSignalReceived?.Invoke(cached);
 
         if (!ProactiveMonitoringEnabled || signal.InputCount <= 0)
             return Task.CompletedTask;

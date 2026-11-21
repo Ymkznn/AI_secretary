@@ -35,6 +35,9 @@ public sealed class SecretaryController : IDisposable
     private readonly WorkflowCacheService _workflowCache;
     private readonly WorkflowOptimizerAgent _optimizer;
     private readonly AgentBlackboard _blackboard;
+    private readonly SecretVaultService _vault;
+    private readonly OtpSituationDetector _otpDetector;
+    private readonly AutonomyPolicyService _autonomy;
     private readonly IConfiguration _config;
     private readonly ILogger<SecretaryController> _logger;
 
@@ -175,6 +178,9 @@ public sealed class SecretaryController : IDisposable
         WorkflowCacheService workflowCache,
         WorkflowOptimizerAgent optimizer,
         AgentBlackboard blackboard,
+        SecretVaultService vault,
+        OtpSituationDetector otpDetector,
+        AutonomyPolicyService autonomy,
         IConfiguration config,
         ILogger<SecretaryController> logger)
     {
@@ -203,6 +209,9 @@ public sealed class SecretaryController : IDisposable
         _workflowCache = workflowCache;
         _optimizer = optimizer;
         _blackboard = blackboard;
+        _vault = vault;
+        _otpDetector = otpDetector;
+        _autonomy = autonomy;
         _config = config;
         _logger = logger;
 
@@ -340,6 +349,9 @@ public sealed class SecretaryController : IDisposable
         _stateMachine.ProposalRequested += OnStateMachineProposal;
         _activity.WindowFocused += (target, url) =>
             _ = _stateMachine.HandleWindowFocusAsync(ConversationId, target, url, _appCts.Token);
+        _activity.BrowserPageSignalReceived += sig =>
+            _otpDetector.OnPageSignal(sig.Url, sig.Title, sig.Headings, sig.OtpFieldPresent, sig.OtpFieldFocused, sig.CapturedAt);
+        _otpDetector.SituationDetected += OnOtpSituationDetected;
         _activity.Start();
 
         _ = Task.Run(() => RunSchedulerLoopAsync(_appCts.Token));
@@ -828,6 +840,12 @@ public sealed class SecretaryController : IDisposable
             replyToLogicalTaskId.StartsWith("state-propose:", StringComparison.Ordinal))
         {
             await HandleStateMachineProposalResponseAsync(replyToLogicalTaskId, prompt);
+            return;
+        }
+        if (!string.IsNullOrWhiteSpace(replyToLogicalTaskId) &&
+            replyToLogicalTaskId.StartsWith("otp-promote:", StringComparison.Ordinal))
+        {
+            await HandleOtpPromotionResponseAsync(replyToLogicalTaskId, prompt);
             return;
         }
 
@@ -1753,7 +1771,9 @@ public sealed class SecretaryController : IDisposable
         {
             List<PinnedReminderItem> snapshot;
             lock (_pinnedLock)
-                snapshot = _pinnedReminders.Where(p => p.Kind != PinnedItemKind.Confirmation).ToList();
+                snapshot = _pinnedReminders
+                    .Where(p => p.Kind != PinnedItemKind.Confirmation && !p.Id.StartsWith("otp-undo:", StringComparison.Ordinal))
+                    .ToList();
             var json = JsonSerializer.Serialize(snapshot);
             await _store.SetSyncValueAsync("pinned_reminders", json, CancellationToken.None);
 
@@ -1768,16 +1788,35 @@ public sealed class SecretaryController : IDisposable
 
     public async Task PushProactiveNotificationAsync(string convId, string eventId, MailItem mail, string title, string summary, CancellationToken ct, int reRemindMinutes = 15, List<NotificationButtonOption>? actions = null)
     {
-        var finalActions = actions is not null ? new List<NotificationButtonOption>(actions) : new List<NotificationButtonOption>();
-        var otpBtn = finalActions.FirstOrDefault(a => a.Type is "fill_otp" or "copy_otp");
-        if (!string.IsNullOrEmpty(otpBtn?.Prompt))
+        var senderDomain = OtpExtractor.ExtractSenderDomain(mail.SenderEmail);
+        var regDomain = OtpExtractor.ExtractRegistrableDomain(senderDomain);
+        var finalActions = new List<NotificationButtonOption>();
+
+        if (actions is not null)
         {
-            _skills.LastObservedOtpCode = otpBtn.Prompt;
-            _skills.LastObservedOtpHint = title;
-            _boostedPollUntilUtc = DateTimeOffset.MinValue;
+            foreach (var btn in actions)
+            {
+                if (btn.Type is "fill_otp" or "copy_otp" && !string.IsNullOrWhiteSpace(btn.Prompt))
+                {
+                    var handle = SecretVaultService.IsOtpHandle(btn.Prompt)
+                        ? btn.Prompt.Trim().ToLowerInvariant()
+                        : _vault.StoreOtp(btn.Prompt, regDomain, mail.SenderName, mail.Id);
+                    _skills.LastObservedOtpHandle = handle;
+                    _skills.LastObservedOtpHint = title;
+                    _boostedPollUntilUtc = DateTimeOffset.MinValue;
+                    finalActions.Add(btn with { Prompt = handle });
+                }
+                else
+                {
+                    finalActions.Add(btn);
+                }
+            }
         }
 
-        await PersistNotificationAsync(convId, eventId, mail, title, summary, reRemindMinutes, finalActions, ct);
+        // Defense-in-depth: redact any vaulted OTP plaintext from title/summary before DB persistence.
+        var safeTitle = _vault.RedactKnownSecrets(title);
+        var safeSummary = _vault.RedactKnownSecrets(summary);
+        await PersistNotificationAsync(convId, eventId, mail, safeTitle, safeSummary, reRemindMinutes, finalActions, ct);
     }
 
     private async Task PersistNotificationAsync(
@@ -2282,24 +2321,259 @@ public sealed class SecretaryController : IDisposable
     public Task HandleBrowserPageSignalAsync(BrowserPageSignal signal, CancellationToken ct = default)
         => _activity.HandleBrowserPageSignalAsync(signal, ct);
 
-    public async Task<(bool Ok, string Message)> FillOtpInExternalWindowAsync(
-        string code,
+    public bool TryConsumeOtpForClipboard(string? handleOrCode, out string secretValue, out string displayHandle)
+    {
+        secretValue = "";
+        displayHandle = "otp";
+        if (string.IsNullOrWhiteSpace(handleOrCode)) return false;
+
+        var raw = handleOrCode.Trim();
+        if (SecretVaultService.IsOtpHandle(raw))
+        {
+            displayHandle = raw.ToLowerInvariant();
+            return _vault.TryConsume(displayHandle, out secretValue, out _);
+        }
+
+        // Legacy fallback if an older persisted notification held a raw code: vault & immediately consume.
+        displayHandle = _vault.StoreOtp(raw);
+        return _vault.TryConsume(displayHandle, out secretValue, out _);
+    }
+
+    public async Task<(bool Ok, string Message)> FillOtpByHandleAsync(
+        string handleOrCode,
         string? serviceHint = null,
+        string? domain = null,
+        bool recordL1Accept = false,
         CancellationToken ct = default)
     {
-        var extRes = await _browserBridge.RequestFillOtpAsync(code, TimeSpan.FromMilliseconds(1500), ct);
+        if (string.IsNullOrWhiteSpace(handleOrCode))
+            return (false, "驗證碼代號無效。");
+
+        string handle;
+        string realCode;
+        SecretMetadata? meta = null;
+        var raw = handleOrCode.Trim();
+        if (SecretVaultService.IsOtpHandle(raw))
+        {
+            handle = raw.ToLowerInvariant();
+            if (!_vault.TryConsume(handle, out realCode, out meta))
+                return (false, $"驗證碼代號 {handle} 已使用或過期。");
+        }
+        else
+        {
+            handle = _vault.StoreOtp(raw);
+            if (!_vault.TryConsume(handle, out realCode, out meta))
+                return (false, "無法取得驗證碼。");
+        }
+
+        var (ok, msg) = await FillOtpDirectInternalAsync(realCode, handle, serviceHint, ct);
+        if (ok && recordL1Accept)
+        {
+            var effectiveDomain = !string.IsNullOrWhiteSpace(domain) ? domain : (meta?.SenderDomain ?? "unknown");
+            var outcome = await _autonomy.RecordAcceptedAsync(AutonomyPolicyService.ActionFillOtp, effectiveDomain, atLevel: 1, ct);
+            if (outcome.ShouldOfferPromotion)
+            {
+                UpsertPinnedConfirmation(
+                    $"otp-promote:{effectiveDomain}",
+                    $"自動填入驗證碼（{effectiveDomain}）",
+                    $"你在 {effectiveDomain} 已接受 3 次驗證碼填入，以後直接幫你自動填（附 10 秒復原、絕不自動送出）嗎？",
+                    new[] { "好，以後自動填", "維持先問我" });
+            }
+        }
+        return (ok, msg);
+    }
+
+    public async Task<(bool Ok, string Message)> UndoAutoFilledOtpAsync(string domain, CancellationToken ct = default)
+    {
+        var extRes = await _browserBridge.RequestClearOtpAsync(TimeSpan.FromMilliseconds(1500), ct);
+        var newLevel = await _autonomy.RecordRejectedOrUndoneAsync(
+            AutonomyPolicyService.ActionFillOtp,
+            domain,
+            activeLevel: 2,
+            reason: "user clicked 10s undo on L2 OTP auto-fill",
+            ct: ct);
+        AgentsChanged?.Invoke();
+
+        return extRes is { Filled: true }
+            ? (true, $"已清空驗證碼欄位，並將 {domain} 降級為 L{newLevel}（下次先詢問）。")
+            : (false, $"未能自動清空欄位（請手動清除），已將 {domain} 降級為 L{newLevel}（下次先詢問）。");
+    }
+
+    public async Task RejectL1OtpPromptAsync(string domain, CancellationToken ct = default)
+    {
+        await _autonomy.RecordRejectedOrUndoneAsync(
+            AutonomyPolicyService.ActionFillOtp,
+            domain,
+            activeLevel: 1,
+            reason: "user rejected L1 OTP prompt",
+            ct: ct);
+        AgentsChanged?.Invoke();
+    }
+
+    private async Task HandleOtpPromotionResponseAsync(string logicalId, string choice)
+    {
+        var domain = logicalId["otp-promote:".Length..];
+        RemovePinnedConfirmation(logicalId);
+        ClearChoices(removePinnedChatChoice: false);
+
+        var trimmed = (choice ?? "").Trim();
+        string replyText;
+        if (trimmed.Contains("自動", StringComparison.OrdinalIgnoreCase) || trimmed.StartsWith("好", StringComparison.Ordinal))
+        {
+            await _autonomy.PromoteToL2Async(AutonomyPolicyService.ActionFillOtp, domain, "user accepted promotion after 3 L1 accepts", _appCts.Token);
+            AgentsChanged?.Invoke();
+            replyText = $"好，以後在 {domain} 收到驗證碼時我會直接幫你填入（附 10 秒復原，絕不自動送出）。";
+        }
+        else
+        {
+            await _autonomy.KeepAtL1Async(AutonomyPolicyService.ActionFillOtp, domain, _appCts.Token);
+            replyText = $"了解，{domain} 維持先詢問你再填入驗證碼。";
+        }
+
+        using (await EnterPresentGateAsync(_appCts.Token))
+        {
+            var now = DateTimeOffset.UtcNow;
+            var msg = new ChatMessageRecord
+            {
+                ConversationId = ConversationId,
+                Role = "assistant",
+                Content = replyText,
+                CreatedAt = now,
+                RevealedAt = now
+            };
+            await _store.UpsertChatMessageAsync(msg, _appCts.Token);
+        }
+        StateChanged?.Invoke();
+        ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReply", "AI Secretary Reply"), replyText);
+    }
+
+    /// <summary>
+    /// Dual-signal OTP correlator handler. L2 auto-fill path runs with ZERO LLM calls!
+    /// </summary>
+    private void OnOtpSituationDetected(OtpCorrelationDecision decision)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var ct = _appCts.Token;
+                var page = decision.Page;
+                var domain = string.IsNullOrWhiteSpace(page.RegistrableDomain) ? "unknown" : page.RegistrableDomain;
+
+                if (decision.Kind == OtpDecisionKind.MultipleMatches)
+                {
+                    var actions = new List<NotificationButtonOption>();
+                    foreach (var c in decision.Candidates.Take(3))
+                    {
+                        var label = $"填 {c.Mail.SenderName} ({c.Mail.ReceivedAtUtc.ToLocalTime():HH:mm})";
+                        if (label.Length > 20) label = label[..20];
+                        actions.Add(new NotificationButtonOption("fill_otp_l1", label, $"{c.Mail.Handle}|{domain}", actions.Count == 0));
+                    }
+                    actions.Add(new NotificationButtonOption("reject_otp_l1", "不用", domain, false));
+
+                    var notifId = $"otp-multi-{Guid.NewGuid():N}"[..18];
+                    var title = $"偵測到多組驗證碼（{domain}）";
+                    var summary = $"目前有 {decision.Candidates.Count} 組剛收到的驗證碼都符合此頁，請選擇要填入哪一組（絕不自動送出）。";
+                    var payload = new NotificationActionPayload(notifId, notifId, "", title, summary, "Unread", actions);
+                    AddPinnedReminder(new PinnedReminderItem(notifId, title, summary, null, payload, 0));
+                    ProactiveAlert?.Invoke(title, summary);
+                    return;
+                }
+
+                var cand = decision.Candidates[0];
+                var level = await _autonomy.ResolveEffectiveLevelAsync(AutonomyPolicyService.ActionFillOtp, domain, cand.Confidence, ct);
+                if (level <= 0)
+                    return;
+
+                if (level >= 2)
+                {
+                    // ZERO-LLM L2 auto-fill path: consume single-use handle -> fill DOM (never submit!) -> 10s Undo toast.
+                    if (!_vault.TryConsume(cand.Mail.Handle, out var realCode, out _))
+                        return;
+
+                    _boostedPollUntilUtc = DateTimeOffset.MinValue;
+                    var (ok, _) = await FillOtpDirectInternalAsync(realCode, cand.Mail.Handle, page.Title, ct);
+                    if (!ok)
+                        return;
+
+                    var undoId = $"otp-undo:{cand.Mail.Handle}";
+                    var title = $"已自動填入驗證碼（{domain}）";
+                    var summary = $"已將 {cand.Mail.Handle} 填入「{page.Title}」（未自動送出）。10 秒內可點「復原」清空欄位。";
+                    var actions = new List<NotificationButtonOption>
+                    {
+                        new("undo_otp", "復原（清空欄位）", $"{domain}|{cand.Mail.Handle}", IsPrimary: true)
+                    };
+                    var payload = new NotificationActionPayload(undoId, undoId, cand.Mail.MailId, title, summary, "Unread", actions);
+                    AddPinnedReminder(new PinnedReminderItem(undoId, title, summary, cand.Mail.MailId, payload, 0));
+                    ProactiveAlert?.Invoke(title, summary);
+
+                    // Auto-dismiss Undo card after 10 seconds and record accepted L2 fill if not undone.
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(10), ct);
+                            bool stillPinned;
+                            lock (_pinnedLock)
+                                stillPinned = _pinnedReminders.Any(p => p.Id == undoId);
+                            if (stillPinned)
+                            {
+                                await DismissPinnedReminderAsync(undoId);
+                                await _autonomy.RecordAcceptedAsync(AutonomyPolicyService.ActionFillOtp, domain, atLevel: 2, ct);
+                            }
+                        }
+                        catch { }
+                    }, ct);
+                    return;
+                }
+
+                // Level 1: prompt user to click (never auto-fill).
+                var l1Id = $"otp-l1:{cand.Mail.Handle}";
+                var l1Title = $"驗證碼已就緒（{cand.Mail.SenderName}）";
+                var l1Summary = $"偵測到「{page.Title}」有驗證碼欄位，要幫你填入 {cand.Mail.Handle} 嗎？（絕不自動送出）";
+                var l1Actions = new List<NotificationButtonOption>
+                {
+                    new("fill_otp_l1", "填入驗證碼", $"{cand.Mail.Handle}|{domain}", IsPrimary: true),
+                    new("copy_otp", "複製驗證碼", cand.Mail.Handle, IsPrimary: false),
+                    new("reject_otp_l1", "這次不用", domain, IsPrimary: false)
+                };
+                var l1Payload = new NotificationActionPayload(l1Id, l1Id, cand.Mail.MailId, l1Title, l1Summary, "Unread", l1Actions);
+                AddPinnedReminder(new PinnedReminderItem(l1Id, l1Title, l1Summary, cand.Mail.MailId, l1Payload, 0));
+                ProactiveAlert?.Invoke(l1Title, l1Summary);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "OnOtpSituationDetected error");
+            }
+        });
+    }
+
+    private async Task<(bool Ok, string Message)> FillOtpDirectInternalAsync(
+        string realCode,
+        string displayHandle,
+        string? serviceHint,
+        CancellationToken ct)
+    {
+        // Zero-LLM path: uses TextCached only so L2 OTP auto-fill never touches any LLM.
+        var extRes = await _browserBridge.RequestFillOtpAsync(realCode, TimeSpan.FromMilliseconds(1500), ct);
         if (extRes is { Filled: true })
         {
             var title = string.IsNullOrWhiteSpace(extRes.Title)
-                ? await _localizer.TextAsync("BrowserTabDefault", "Browser tab", Array.Empty<object?>(), ct)
+                ? _localizer.TextCached("BrowserTabDefault", "Browser tab")
                 : extRes.Title.Trim();
             if (title.Length > 24) title = title[..24] + "…";
-            var msg = await _localizer.TextAsync("OtpExtensionFilled", "Filled verification code {0} into '{1}' via browser extension ({2}, not auto-submitted).", new object?[] { code, title, extRes.Mode ?? "dom" }, ct);
+            var msg = _localizer.TextCached("OtpExtensionFilledSafe", "Filled {0} into '{1}' via browser extension ({2}, not auto-submitted).", displayHandle, title, extRes.Mode ?? "dom");
             return (true, msg);
         }
 
-        return await _activity.TryFillOtpInExternalWindowAsync(code, serviceHint, ct);
+        return await _activity.TryFillOtpInExternalWindowAsync(realCode, serviceHint, ct, displayHandle);
     }
+
+    public Task<(bool Ok, string Message)> FillOtpInExternalWindowAsync(
+        string handleOrCode,
+        string? serviceHint = null,
+        CancellationToken ct = default)
+        => FillOtpByHandleAsync(handleOrCode, serviceHint, ct: ct);
 
     public Task<BranchTelemetryStats> GetBranchTelemetryAsync(CancellationToken ct = default)
         => _store.GetBranchTelemetryAsync(ct);

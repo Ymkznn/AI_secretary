@@ -302,6 +302,15 @@ public sealed class SqliteStore
                 TokensSaved INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS IX_PredictionLogs_Ts ON PredictionLogs(TimestampUtc DESC);
+            CREATE TABLE IF NOT EXISTS AutonomyPolicies (
+                ActionClass TEXT NOT NULL,
+                Domain TEXT NOT NULL,
+                Level INTEGER NOT NULL DEFAULT 1,
+                Accepted INTEGER NOT NULL DEFAULT 0,
+                Rejected INTEGER NOT NULL DEFAULT 0,
+                UpdatedAt TEXT NOT NULL,
+                PRIMARY KEY (ActionClass, Domain)
+            );
             """;
 
         await using var cmd = conn.CreateCommand();
@@ -2637,6 +2646,50 @@ public sealed class SqliteStore
             }
         }
         catch { }
+    }
+
+    public async Task<AutonomyPolicyRecord?> GetAutonomyPolicyAsync(string actionClass, string domain, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT ActionClass, Domain, Level, Accepted, Rejected, UpdatedAt
+            FROM AutonomyPolicies
+            WHERE ActionClass = @ac AND Domain = @dom;
+            """;
+        cmd.Parameters.AddWithValue("@ac", actionClass);
+        cmd.Parameters.AddWithValue("@dom", domain);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (!await r.ReadAsync(ct)) return null;
+        return new AutonomyPolicyRecord(
+            ActionClass: r.GetString(0),
+            Domain: r.GetString(1),
+            Level: r.GetInt32(2),
+            Accepted: r.GetInt32(3),
+            Rejected: r.GetInt32(4),
+            UpdatedAt: DateTimeOffset.Parse(r.GetString(5)));
+    }
+
+    public async Task UpsertAutonomyPolicyAsync(AutonomyPolicyRecord policy, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO AutonomyPolicies (ActionClass, Domain, Level, Accepted, Rejected, UpdatedAt)
+            VALUES (@ac, @dom, @lvl, @acc, @rej, @ts)
+            ON CONFLICT(ActionClass, Domain) DO UPDATE SET
+                Level = excluded.Level,
+                Accepted = excluded.Accepted,
+                Rejected = excluded.Rejected,
+                UpdatedAt = excluded.UpdatedAt;
+            """;
+        cmd.Parameters.AddWithValue("@ac", policy.ActionClass);
+        cmd.Parameters.AddWithValue("@dom", policy.Domain);
+        cmd.Parameters.AddWithValue("@lvl", policy.Level);
+        cmd.Parameters.AddWithValue("@acc", policy.Accepted);
+        cmd.Parameters.AddWithValue("@rej", policy.Rejected);
+        cmd.Parameters.AddWithValue("@ts", policy.UpdatedAt.ToUniversalTime().ToString("O"));
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     public async Task<bool> DeleteWorkflowCacheAsync(string workflowId, CancellationToken ct = default)

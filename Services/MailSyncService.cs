@@ -19,6 +19,8 @@ public sealed class MailSyncService
     private readonly SkillRegistry _skillRegistry;
     private readonly PlannerAgent _planner;
     private readonly AgentBlackboard _blackboard;
+    private readonly SecretVaultService _vault;
+    private readonly OtpSituationDetector _otpDetector;
     private readonly ILogger<MailSyncService> _logger;
     private readonly SemaphoreSlim _triageGate = new(2, 2);
 
@@ -30,6 +32,8 @@ public sealed class MailSyncService
         SkillRegistry skillRegistry,
         PlannerAgent planner,
         AgentBlackboard blackboard,
+        SecretVaultService vault,
+        OtpSituationDetector otpDetector,
         ILogger<MailSyncService> logger)
     {
         _store = store;
@@ -39,6 +43,8 @@ public sealed class MailSyncService
         _skillRegistry = skillRegistry;
         _planner = planner;
         _blackboard = blackboard;
+        _vault = vault;
+        _otpDetector = otpDetector;
         _logger = logger;
     }
 
@@ -99,10 +105,11 @@ public sealed class MailSyncService
                 var lines = newMails
                     .OrderByDescending(m => m.ReceivedAt)
                     .Take(10)
-                    .Select(m => $"- id={m.Id} | from={m.SenderName} | subject=\"{m.Subject}\" | at={m.ReceivedAt.ToLocalTime():MM-dd HH:mm} | snippet={m.Snippet}");
+                    .Select(m => $"- id={m.Id} | from={m.SenderName} | subject=\"{m.Subject}\" | at={m.ReceivedAt.ToLocalTime():MM-dd HH:mm} | snippet={_vault.RedactKnownSecrets(m.Snippet)}");
                 summary += "\nNew emails:\n" + string.Join("\n", lines);
             }
 
+            summary = _vault.RedactKnownSecrets(summary);
             bool hasNotableChanges = newMails.Count > 0 || notes.Count > 0;
             var dedupeKey = hasNotableChanges ? null : $"mail_sync_empty:{mode}";
             _blackboard.CompleteTask(
@@ -145,6 +152,8 @@ public sealed class MailSyncService
             if (!seenInBatch.Add($"{mail.SenderEmail}|{mail.Subject}")) continue;
 
             processed.Add(mail);
+            var deterministicHandle = TryEmitDeterministicOtpEvent(mail);
+
             if (decision == MailRuleDecision.NeedsAiTriage)
             {
                 var triageTaskId = $"mail_triage:{mail.Id}";
@@ -157,14 +166,15 @@ public sealed class MailSyncService
                     try
                     {
                         var triage = await _planner.TriageMailEventAsync(mail, conversationId, ct);
+                        var (safeTitle, safeSummary, safeActions) = VaultAndRedactTriage(mail, triage, deterministicHandle);
                         var bbSummary = triage.Urgent
-                            ? $"Urgent email [{triage.Title}]: {triage.Summary}"
+                            ? $"Urgent email [{safeTitle}]: {safeSummary}"
                             : $"Non-urgent email from {mail.SenderName} ({mail.Subject})";
                         _blackboard.CompleteTask(triageTaskId, "mail_sync", triageGoal, bbSummary, succeeded: true, recordInRecent: triage.Urgent);
                         triageDone = true;
                         if (triage.Urgent)
                         {
-                            await onNotifyAsync(eventId, mail, triage.Title, triage.Summary, triage.ReRemindMinutes, triage.Actions);
+                            await onNotifyAsync(eventId, mail, safeTitle, safeSummary, triage.ReRemindMinutes, safeActions);
                         }
                     }
                     catch (Exception ex)
@@ -228,6 +238,8 @@ public sealed class MailSyncService
             if (!isNew) continue;
 
             processed.Add(mail);
+            var deterministicHandle = TryEmitDeterministicOtpEvent(mail);
+
             if (decision == MailRuleDecision.NeedsAiTriage)
             {
                 var triageTaskId = $"mail_triage:{mail.Id}";
@@ -240,14 +252,15 @@ public sealed class MailSyncService
                     try
                     {
                         var triage = await _planner.TriageMailEventAsync(mail, conversationId, ct);
+                        var (safeTitle, safeSummary, safeActions) = VaultAndRedactTriage(mail, triage, deterministicHandle);
                         var bbSummary = triage.Urgent
-                            ? $"Urgent email [{triage.Title}]: {triage.Summary}"
+                            ? $"Urgent email [{safeTitle}]: {safeSummary}"
                             : $"Non-urgent email from {mail.SenderName} ({mail.Subject})";
                         _blackboard.CompleteTask(triageTaskId, "mail_sync", triageGoal, bbSummary, succeeded: true, recordInRecent: triage.Urgent);
                         triageDone = true;
                         if (triage.Urgent)
                         {
-                            await onNotifyAsync(eventId, mail, triage.Title, triage.Summary, triage.ReRemindMinutes, triage.Actions);
+                            await onNotifyAsync(eventId, mail, safeTitle, safeSummary, triage.ReRemindMinutes, safeActions);
                         }
                     }
                     catch (Exception ex)
@@ -268,5 +281,72 @@ public sealed class MailSyncService
             await _store.SetSyncValueAsync("gmail_sync_cursor", newest.ToString("O"), ct);
 
         return processed;
+    }
+
+    private string? TryEmitDeterministicOtpEvent(MailItem mail)
+    {
+        if (!OtpExtractor.TryExtractFromMail(mail, out var rawCode))
+            return null;
+
+        var senderDomain = OtpExtractor.ExtractSenderDomain(mail.SenderEmail);
+        var regDomain = OtpExtractor.ExtractRegistrableDomain(senderDomain);
+        var handle = _vault.StoreOtp(rawCode, regDomain, mail.SenderName, mail.Id);
+
+        _otpDetector.OnOtpMailEvent(new OtpMailEvent(
+            MailId: mail.Id,
+            SenderDomain: senderDomain,
+            SenderRegistrableDomain: regDomain,
+            SenderName: mail.SenderName,
+            Subject: mail.Subject,
+            ReceivedAtUtc: mail.ReceivedAt.ToUniversalTime(),
+            Handle: handle));
+        return handle;
+    }
+
+    private (string Title, string Summary, List<NotificationButtonOption>? Actions) VaultAndRedactTriage(
+        MailItem mail,
+        TriageResult triage,
+        string? existingHandle)
+    {
+        var senderDomain = OtpExtractor.ExtractSenderDomain(mail.SenderEmail);
+        var regDomain = OtpExtractor.ExtractRegistrableDomain(senderDomain);
+        string? handle = existingHandle;
+        List<NotificationButtonOption>? safeActions = null;
+
+        if (triage.Actions is { Count: > 0 })
+        {
+            safeActions = new List<NotificationButtonOption>(triage.Actions.Count);
+            foreach (var btn in triage.Actions)
+            {
+                if (btn.Type is "fill_otp" or "copy_otp" && !string.IsNullOrWhiteSpace(btn.Prompt))
+                {
+                    var btnHandle = SecretVaultService.IsOtpHandle(btn.Prompt)
+                        ? btn.Prompt.Trim().ToLowerInvariant()
+                        : _vault.StoreOtp(btn.Prompt, regDomain, mail.SenderName, mail.Id);
+                    if (handle is null)
+                    {
+                        handle = btnHandle;
+                        _otpDetector.OnOtpMailEvent(new OtpMailEvent(
+                            MailId: mail.Id,
+                            SenderDomain: senderDomain,
+                            SenderRegistrableDomain: regDomain,
+                            SenderName: mail.SenderName,
+                            Subject: mail.Subject,
+                            ReceivedAtUtc: mail.ReceivedAt.ToUniversalTime(),
+                            Handle: handle));
+                    }
+                    safeActions.Add(btn with { Prompt = btnHandle });
+                }
+                else
+                {
+                    safeActions.Add(btn);
+                }
+            }
+        }
+
+        // Redact any plaintext OTP from title/summary before persisting to DB or Blackboard.
+        var safeTitle = _vault.RedactKnownSecrets(triage.Title);
+        var safeSummary = _vault.RedactKnownSecrets(triage.Summary);
+        return (safeTitle, safeSummary, safeActions);
     }
 }

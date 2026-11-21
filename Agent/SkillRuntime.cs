@@ -21,7 +21,7 @@ public sealed record PendingMailNotificationContext(
     string Summary,
     int ReRemindMinutes,
     List<NotificationButtonOption>? Actions,
-    string? Otp)
+    string? OtpHandle)
 {
     public bool Published { get; set; }
 }
@@ -59,7 +59,8 @@ public sealed class SkillRuntime
         get => _activeEventNotification.Value;
         set => _activeEventNotification.Value = value;
     }
-    public string? LastObservedOtpCode { get; set; }
+    /// <summary>Opaque vault handle (e.g. <c>otp#a1b2c3</c>) for the most recently observed OTP — NEVER plaintext.</summary>
+    public string? LastObservedOtpHandle { get; set; }
     public string? LastObservedOtpHint { get; set; }
 
     public SkillRuntime(

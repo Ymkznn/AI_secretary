@@ -542,13 +542,18 @@ public partial class MainWindow : Window
                     case "copy_otp":
                         if (!string.IsNullOrWhiteSpace(btn.Prompt))
                         {
-                            var code = btn.Prompt;
+                            var handle = btn.Prompt;
                             AddTracked(btn.Label, btn.IsPrimary, async () =>
                             {
-                                if (TrySetClipboardText(code))
+                                if (_controller.TryConsumeOtpForClipboard(handle, out var realCode, out var displayHandle)
+                                    && TrySetClipboardText(realCode))
                                 {
                                     await DismissNotificationPinnedAsync();
-                                    OutputStatusText.Text = await _controller.LocalizeAsync("OtpCopiedStatus", "Copied code {0}!", code);
+                                    OutputStatusText.Text = await _controller.LocalizeAsync("OtpCopiedSafeStatus", "Copied {0} to clipboard!", displayHandle);
+                                }
+                                else
+                                {
+                                    OutputStatusText.Text = "驗證碼已過期或已使用。";
                                 }
                             });
                         }
@@ -556,14 +561,13 @@ public partial class MainWindow : Window
                     case "fill_otp":
                         if (!string.IsNullOrWhiteSpace(btn.Prompt))
                         {
-                            var code = btn.Prompt;
+                            var handle = btn.Prompt;
                             var titleHint = n.Title;
                             AddTracked(btn.Label, btn.IsPrimary, async () =>
                             {
-                                TrySetClipboardText(code);
                                 try
                                 {
-                                    var (ok, msg) = await _controller.FillOtpInExternalWindowAsync(code, titleHint);
+                                    var (ok, msg) = await _controller.FillOtpByHandleAsync(handle, titleHint);
                                     if (ok)
                                         await DismissNotificationPinnedAsync();
                                     OutputStatusText.Text = msg;
@@ -572,6 +576,54 @@ public partial class MainWindow : Window
                                 {
                                     OutputStatusText.Text = ex.Message;
                                 }
+                            });
+                        }
+                        break;
+                    case "fill_otp_l1":
+                        if (!string.IsNullOrWhiteSpace(btn.Prompt))
+                        {
+                            var parts = btn.Prompt.Split('|', 2);
+                            var handle = parts[0];
+                            var domain = parts.Length > 1 ? parts[1] : null;
+                            var titleHint = n.Title;
+                            AddTracked(btn.Label, btn.IsPrimary, async () =>
+                            {
+                                try
+                                {
+                                    var (ok, msg) = await _controller.FillOtpByHandleAsync(handle, titleHint, domain, recordL1Accept: true);
+                                    if (ok)
+                                        await DismissNotificationPinnedAsync();
+                                    OutputStatusText.Text = msg;
+                                }
+                                catch (Exception ex)
+                                {
+                                    OutputStatusText.Text = ex.Message;
+                                }
+                            });
+                        }
+                        break;
+                    case "undo_otp":
+                        if (!string.IsNullOrWhiteSpace(btn.Prompt))
+                        {
+                            var parts = btn.Prompt.Split('|', 2);
+                            var domain = parts[0];
+                            AddTracked(btn.Label, btn.IsPrimary, async () =>
+                            {
+                                await DismissNotificationPinnedAsync();
+                                var (_, msg) = await _controller.UndoAutoFilledOtpAsync(domain);
+                                OutputStatusText.Text = msg;
+                            });
+                        }
+                        break;
+                    case "reject_otp_l1":
+                        if (!string.IsNullOrWhiteSpace(btn.Prompt))
+                        {
+                            var domain = btn.Prompt;
+                            AddTracked(btn.Label, btn.IsPrimary, async () =>
+                            {
+                                await DismissNotificationPinnedAsync();
+                                await _controller.RejectL1OtpPromptAsync(domain);
+                                OutputStatusText.Text = $"已略過 {domain} 的自動驗證碼提示。";
                             });
                         }
                         break;

@@ -86,7 +86,11 @@ public sealed class UiLocalizer
             ["TtsFallbackMail"] = "You have a new email notification.",
             ["TtsFallbackSchedule"] = "You have an upcoming schedule reminder.",
             ["TtsFallbackDone"] = "Done. Please check the screen.",
-            ["path_perm_title"] = "External File Access"
+            ["path_perm_title"] = "External File Access",
+            ["OtpExtensionFilledSafe"] = "Filled {0} into '{1}' via browser extension ({2}, not auto-submitted).",
+            ["OtpFilledSafe"] = "Filled {0} into '{1}' (not auto-submitted).",
+            ["OtpTypedSafe"] = "Entered {0} into '{1}' (not auto-submitted).",
+            ["OtpCopiedSafeStatus"] = "Copied {0} to clipboard!"
         };
 
         foreach (var (key, val) in registry.GetHotLocalizationEntries())

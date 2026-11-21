@@ -63,7 +63,17 @@ public sealed record BrowserPageSignal(
     int InputCount,
     IReadOnlyList<string>? Labels = null,
     IReadOnlyList<string>? Headings = null,
-    string? Excerpt = null);
+    string? Excerpt = null,
+    bool OtpFieldPresent = false,
+    bool OtpFieldFocused = false);
+
+public sealed record AutonomyPolicyRecord(
+    string ActionClass,
+    string Domain,
+    int Level,
+    int Accepted,
+    int Rejected,
+    DateTimeOffset UpdatedAt);
 
 public sealed record AutoStateRuleRecord(
     string TriggerKey,

@@ -27,10 +27,10 @@ async function getTargetTab() {
   return tab;
 }
 
-async function reportPageSignal(tab) {
+async function reportPageSignal(tab, forceResend = false) {
   if (!tab || !tab.id || tab.incognito || !tab.url || !/^https?:/i.test(tab.url)) return;
   const key = `${tab.url}|${tab.title || ''}`;
-  if (key === lastSignalKey) return;
+  if (!forceResend && key === lastSignalKey) return;
   lastSignalKey = key;
 
   try {
@@ -38,15 +38,72 @@ async function reportPageSignal(tab) {
       target: { tabId: tab.id, allFrames: true },
       func: () => {
         const isTop = window === window.top;
-        const els = Array.from(document.querySelectorAll('input, textarea, select'))
+        const allInputs = Array.from(document.querySelectorAll('input, textarea, select'))
           .filter(el => {
             const t = (el.type || el.tagName).toLowerCase();
-            return t !== 'password' && t !== 'hidden' && t !== 'submit' && t !== 'button' && !el.disabled && !el.readOnly && el.offsetParent !== null;
+            return t !== 'hidden' && t !== 'submit' && t !== 'button' && !el.disabled && !el.readOnly && el.offsetParent !== null;
           });
+        const els = allInputs.filter(el => (el.type || el.tagName).toLowerCase() !== 'password');
         const labels = els
           .map(el => (el.getAttribute('aria-label') || el.placeholder || el.name || el.id || '').trim())
           .filter(Boolean)
           .slice(0, 12);
+
+        // Deterministic OTP field detection (structure only — NEVER reads .value or password values).
+        const otpHintRe = /otp|code|verify|verification|one[-_ ]?time|passcode|驗證碼|認證碼|動態密碼|認証コード/i;
+        const getLabelFor = (el) => {
+          try {
+            if (el.id) {
+              const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+              if (lbl?.innerText) return lbl.innerText.trim();
+            }
+            const parentLbl = el.closest('label');
+            if (parentLbl?.innerText) return parentLbl.innerText.trim();
+          } catch {}
+          return '';
+        };
+        const isOtpInput = (el) => {
+          if ((el.tagName || '').toLowerCase() !== 'input') return false;
+          const ac = (el.getAttribute('autocomplete') || '').toLowerCase().trim();
+          if (ac === 'one-time-code') return true;
+          const maxLen = Number(el.maxLength || 0);
+          const inputMode = (el.getAttribute('inputmode') || el.inputMode || '').toLowerCase().trim();
+          const meta = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${getLabelFor(el)}`;
+          return otpHintRe.test(meta) && maxLen >= 4 && maxLen <= 8 && inputMode === 'numeric';
+        };
+
+        const visibleTextInputs = allInputs.filter(el => (el.tagName || '').toLowerCase() === 'input');
+        const singleCharBoxes = visibleTextInputs.filter(el => Number(el.maxLength) === 1);
+        const multiBoxOtp = singleCharBoxes.length >= 4 && singleCharBoxes.length <= 8
+          && (singleCharBoxes.some(el => (el.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code'
+              || (el.getAttribute('inputmode') || '').toLowerCase() === 'numeric')
+              || otpHintRe.test(document.title || ''));
+        const otpInputs = visibleTextInputs.filter(isOtpInput);
+        const otpFieldPresent = otpInputs.length > 0 || multiBoxOtp;
+
+        let activeEl = document.activeElement;
+        while (activeEl && activeEl.shadowRoot && activeEl.shadowRoot.activeElement) {
+          activeEl = activeEl.shadowRoot.activeElement;
+        }
+        const otpFieldFocused = otpFieldPresent && Boolean(
+          activeEl && (otpInputs.includes(activeEl) || (multiBoxOtp && singleCharBoxes.includes(activeEl)))
+        );
+
+        // Install a lightweight one-time focus listener on OTP pages so focusing an OTP box pushes a fresh signal immediately.
+        if (otpFieldPresent && !window.__aiSecOtpFocusHooked) {
+          window.__aiSecOtpFocusHooked = true;
+          document.addEventListener('focusin', (ev) => {
+            const target = ev.target;
+            if (!target || (target.tagName || '').toLowerCase() !== 'input') return;
+            const ac = (target.getAttribute('autocomplete') || '').toLowerCase().trim();
+            const ml = Number(target.maxLength || 0);
+            const im = (target.getAttribute('inputmode') || '').toLowerCase().trim();
+            const meta = `${target.name || ''} ${target.id || ''} ${target.placeholder || ''} ${target.getAttribute('aria-label') || ''}`;
+            if (ac === 'one-time-code' || ml === 1 || (otpHintRe.test(meta) && ml >= 4 && ml <= 8 && im === 'numeric')) {
+              try { chrome.runtime.sendMessage({ type: 'OTP_FIELD_FOCUSED' }); } catch {}
+            }
+          }, true);
+        }
 
         let headings = [];
         let excerpt = '';
@@ -84,7 +141,7 @@ async function reportPageSignal(tab) {
             excerpt = chunks.join(' ').slice(0, 650);
           }
         }
-        return { isTop, inputCount: els.length, labels, headings, excerpt };
+        return { isTop, inputCount: els.length, labels, headings, excerpt, otpFieldPresent, otpFieldFocused };
       }
     });
 
@@ -92,9 +149,13 @@ async function reportPageSignal(tab) {
     const allLabels = [];
     let topHeadings = [];
     let topExcerpt = '';
+    let otpFieldPresent = false;
+    let otpFieldFocused = false;
     for (const r of frameResults || []) {
       if (!r?.result) continue;
       totalInputs += r.result.inputCount || 0;
+      if (r.result.otpFieldPresent) otpFieldPresent = true;
+      if (r.result.otpFieldFocused) otpFieldFocused = true;
       for (const lbl of r.result.labels || []) {
         if (lbl && !allLabels.includes(lbl) && allLabels.length < 15) {
           allLabels.push(lbl);
@@ -115,7 +176,9 @@ async function reportPageSignal(tab) {
         inputCount: totalInputs,
         labels: allLabels,
         headings: topHeadings,
-        excerpt: topExcerpt
+        excerpt: topExcerpt,
+        otpFieldPresent,
+        otpFieldFocused
       })
     });
   } catch {}
@@ -373,6 +436,35 @@ async function handleFillOtp(requestId, code) {
   } catch {}
 }
 
+async function handleClearOtp(requestId) {
+  let result = { filled: false, error: 'no active tab' };
+  try {
+    const tab = await getTargetTab();
+    if (tab) {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        files: ['content.js']
+      });
+      const frameResults = await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        func: () => (window.__aiSecretaryHelper ? window.__aiSecretaryHelper.clearOtp() : null)
+      });
+      const hit = (frameResults || []).map(r => r?.result).find(r => r?.filled);
+      result = hit || (frameResults || []).map(r => r?.result).find(Boolean) || { filled: false, error: 'no response' };
+    }
+  } catch (e) {
+    result = { filled: false, error: String(e?.message || e) };
+  }
+
+  try {
+    await fetch(`${API_BASE}/api/browser/clear-otp-result/${encodeURIComponent(requestId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(result)
+    });
+  } catch {}
+}
+
 async function handleTabTitle(requestId) {
   let result = { title: null, incognito: false };
   try {
@@ -527,6 +619,13 @@ function connectSse() {
       if (data?.requestId && data?.code) handleFillOtp(data.requestId, data.code);
     } catch {}
   });
+  sse.addEventListener('browser_clear_otp', (ev) => {
+    lastPingAt = Date.now();
+    try {
+      const data = JSON.parse(ev.data);
+      if (data?.requestId) handleClearOtp(data.requestId);
+    } catch {}
+  });
   sse.addEventListener('browser_title_request', (ev) => {
     lastPingAt = Date.now();
     try {
@@ -572,6 +671,11 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
     const tab = await chrome.tabs.get(tabId);
     scheduleReportPageSignal(tab);
   } catch {}
+});
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg?.type === 'OTP_FIELD_FOCUSED' && sender?.tab && sender.tab.active) {
+    reportPageSignal(sender.tab, true);
+  }
 });
 
 connectSse();

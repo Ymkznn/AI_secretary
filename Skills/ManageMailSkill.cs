@@ -1,5 +1,6 @@
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Models;
+using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Skills;
 
@@ -9,10 +10,12 @@ namespace AiSecretary.Desktop.Skills;
 public sealed class ManageMailSkill : IBasicSkill
 {
     private readonly SkillRuntime _skills;
+    private readonly SecretVaultService _vault;
 
-    public ManageMailSkill(SkillRuntime skills)
+    public ManageMailSkill(SkillRuntime skills, SecretVaultService vault)
     {
         _skills = skills;
+        _vault = vault;
     }
 
     public string Name => "manage_mail";
@@ -136,10 +139,13 @@ public sealed class ManageMailSkill : IBasicSkill
         else
         {
             foreach (var m in collected.Take(15))
+            {
+                VaultOtpIfPresent(m);
                 ctx.Sources.Add(new MailSourceRef(m.Id, m.Subject, m.SenderName, m.Subject, m.ReceivedAt));
+            }
 
             var lines = collected.Take(15).Select(m =>
-                $"- id={m.Id} | from={m.SenderName} | subject=\"{m.Subject}\" | at={m.ReceivedAt.ToLocalTime():MM-dd HH:mm} | snippet={m.Snippet}");
+                $"- id={m.Id} | from={m.SenderName} | subject=\"{_vault.RedactKnownSecrets(m.Subject)}\" | at={m.ReceivedAt.ToLocalTime():MM-dd HH:mm} | snippet={_vault.RedactKnownSecrets(m.Snippet)}");
             ctx.Observations.Add($"{skillName}: {collected.Count} email(s) (source={source}):\n" + string.Join("\n", lines));
         }
         ctx.CompletedSteps.Add($"{skillName}:list:{source}");
@@ -186,11 +192,23 @@ public sealed class ManageMailSkill : IBasicSkill
             return;
         }
 
+        VaultOtpIfPresent(mail);
         ctx.Sources.Add(new MailSourceRef(mail.Id, mail.Subject, mail.SenderName, mail.Subject, mail.ReceivedAt));
         var body = string.IsNullOrWhiteSpace(mail.Body) ? mail.Snippet : mail.Body;
+        body = _vault.RedactKnownSecrets(body);
         if (body.Length > 4000) body = body[..4000] + "\n...(truncated)";
-        ctx.Observations.Add($"manage_mail: id={mail.Id} from={mail.SenderName} subject=\"{mail.Subject}\" at={mail.ReceivedAt.ToLocalTime():yyyy-MM-dd HH:mm}\n{body}");
+        ctx.Observations.Add($"manage_mail: id={mail.Id} from={mail.SenderName} subject=\"{_vault.RedactKnownSecrets(mail.Subject)}\" at={mail.ReceivedAt.ToLocalTime():yyyy-MM-dd HH:mm}\n{body}");
         ctx.CompletedSteps.Add($"manage_mail:detail:{mail.Id}");
+    }
+
+    private void VaultOtpIfPresent(MailItem mail)
+    {
+        if (!OtpExtractor.TryExtractFromMail(mail, out var rawCode))
+            return;
+        var regDomain = OtpExtractor.ExtractRegistrableDomain(OtpExtractor.ExtractSenderDomain(mail.SenderEmail));
+        var handle = _vault.StoreOtp(rawCode, regDomain, mail.SenderName, mail.Id);
+        _skills.LastObservedOtpHandle = handle;
+        _skills.LastObservedOtpHint = mail.Subject;
     }
 
     private async Task SyncAsync(SkillExecutionContext ctx, string source)

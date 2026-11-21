@@ -370,6 +370,42 @@
     return { filled: true, mode: 'single', title: document.title, url: location.href };
   }
 
+  function clearOtp() {
+    const inputs = queryAllDeep(document, 'input').filter(isVisibleInput);
+    if (inputs.length === 0) {
+      return { filled: false, title: document.title, url: location.href, error: 'no visible inputs' };
+    }
+
+    const singleCharBoxes = inputs.filter(el => el.maxLength === 1);
+    if (singleCharBoxes.length >= 4 && singleCharBoxes.length <= 8) {
+      for (const box of singleCharBoxes) {
+        setNativeValue(box, '');
+      }
+      return { filled: true, mode: `clear_multi(${singleCharBoxes.length})`, title: document.title, url: location.href };
+    }
+
+    const otpRegex = /otp|one[-_ ]?time|code|verify|verification|token|auth|pin|passcode|2fa|mfa|驗證|認證|動態密碼|認証/i;
+    let best = null;
+    let bestScore = -1;
+    for (const el of inputs) {
+      const type = (el.type || 'text').toLowerCase();
+      const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+      const hintText = `${el.id} ${el.name} ${el.placeholder} ${el.getAttribute('aria-label') || ''}`;
+      const isOtpHint = otpRegex.test(hintText);
+      if (type === 'password' && !isOtpHint && ac !== 'one-time-code') continue;
+      let score = 1;
+      if (ac === 'one-time-code') score += 10;
+      if (isOtpHint) score += 5;
+      if (el.inputMode === 'numeric' || type === 'tel' || type === 'number') score += 2;
+      if (score > bestScore) { bestScore = score; best = el; }
+    }
+    if (!best) {
+      return { filled: false, title: document.title, url: location.href, error: 'no matching otp input to clear' };
+    }
+    setNativeValue(best, '');
+    return { filled: true, mode: 'clear_single', title: document.title, url: location.href };
+  }
+
   function sanitizeCloneDom(rootDocOrEl) {
     const clone = rootDocOrEl.cloneNode(true);
     for (const pw of clone.querySelectorAll('input[type="password"]')) {
@@ -431,7 +467,8 @@
     extractFormFields,
     extractDom,
     applyFills,
-    fillOtp
+    fillOtp,
+    clearOtp
   };
 
   if (!window.__aiSecretaryFocusTrackerInstalled) {
@@ -460,6 +497,8 @@
         sendResponse({ applied: res.appliedCount, result: res });
       } else if (msg?.type === 'FILL_OTP') {
         sendResponse(h.fillOtp(msg.code));
+      } else if (msg?.type === 'CLEAR_OTP') {
+        sendResponse(h.clearOtp());
       }
       return true;
     });

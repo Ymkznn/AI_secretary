@@ -69,6 +69,7 @@ public sealed class ApiServerHost : IAsyncDisposable
             fills = fills.Select(f => new { fieldId = f.FieldId, value = f.Value, label = f.Label, name = f.Name }).ToList()
         });
         _browserBridge.FillOtpRequested += (requestId, code) => BroadcastEvent("browser_fill_otp", new { requestId, code });
+        _browserBridge.ClearOtpRequested += requestId => BroadcastEvent("browser_clear_otp", new { requestId });
         _browserBridge.TitleRequested += requestId => BroadcastEvent("browser_title_request", new { requestId });
         _browserBridge.SelectionRequested += requestId => BroadcastEvent("browser_selection_request", new { requestId });
     }
@@ -223,6 +224,10 @@ public sealed class ApiServerHost : IAsyncDisposable
             _browserBridge.CompleteFillOtp(requestId, result)
                 ? Results.Ok(new { received = true })
                 : Results.NotFound(new { error = "OTP fill request not found or expired." }));
+        _app.MapPost("/api/browser/clear-otp-result/{requestId}", (string requestId, BrowserOtpFillResult result) =>
+            _browserBridge.CompleteClearOtp(requestId, result)
+                ? Results.Ok(new { received = true })
+                : Results.NotFound(new { error = "OTP clear request not found or expired." }));
         _app.MapPost("/api/browser/title-result/{requestId}", (string requestId, BrowserTabTitleResult result) =>
             _browserBridge.CompleteTabTitle(requestId, result)
                 ? Results.Ok(new { received = true })

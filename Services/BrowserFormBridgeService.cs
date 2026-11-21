@@ -55,6 +55,7 @@ public sealed class BrowserFormBridgeService
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserFormContext?>> _extractWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserDomSnapshot?>> _domWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserOtpFillResult?>> _otpWaiters = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserOtpFillResult?>> _clearOtpWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserTabTitleResult?>> _titleWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserFormFillResult?>> _fillWaiters = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<BrowserSelectionResult?>> _selectionWaiters = new();
@@ -64,6 +65,7 @@ public sealed class BrowserFormBridgeService
     /// <summary>(requestId, fills). The extension must POST the outcome to /api/browser/fill-result/{requestId}.</summary>
     public event Action<string, IReadOnlyList<BrowserFillAction>>? ApplyFillsRequested;
     public event Action<string, string>? FillOtpRequested;
+    public event Action<string>? ClearOtpRequested;
     public event Action<string>? TitleRequested;
     public event Action<string>? SelectionRequested;
 
@@ -75,6 +77,9 @@ public sealed class BrowserFormBridgeService
 
     public Task<BrowserOtpFillResult?> RequestFillOtpAsync(string code, TimeSpan timeout, CancellationToken ct = default)
         => WaitWithTimeoutAsync(_otpWaiters, id => FillOtpRequested?.Invoke(id, code), timeout, ct);
+
+    public Task<BrowserOtpFillResult?> RequestClearOtpAsync(TimeSpan timeout, CancellationToken ct = default)
+        => WaitWithTimeoutAsync(_clearOtpWaiters, id => ClearOtpRequested?.Invoke(id), timeout, ct);
 
     public Task<BrowserTabTitleResult?> RequestActiveTabTitleAsync(TimeSpan timeout, CancellationToken ct = default)
         => WaitWithTimeoutAsync(_titleWaiters, id => TitleRequested?.Invoke(id), timeout, ct);
@@ -135,6 +140,14 @@ public sealed class BrowserFormBridgeService
     public bool CompleteFillOtp(string requestId, BrowserOtpFillResult result)
     {
         if (!_otpWaiters.TryRemove(requestId, out var tcs))
+            return false;
+        tcs.TrySetResult(result);
+        return true;
+    }
+
+    public bool CompleteClearOtp(string requestId, BrowserOtpFillResult result)
+    {
+        if (!_clearOtpWaiters.TryRemove(requestId, out var tcs))
             return false;
         tcs.TrySetResult(result);
         return true;

@@ -12,15 +12,18 @@ public sealed class FillOtpSkill : IBasicSkill
     private readonly BrowserFormBridgeService _browserBridge;
     private readonly ActivityMonitorService _activity;
     private readonly SkillRuntime _skills;
+    private readonly SecretVaultService _vault;
 
     public FillOtpSkill(
         BrowserFormBridgeService browserBridge,
         ActivityMonitorService activity,
-        SkillRuntime skills)
+        SkillRuntime skills,
+        SecretVaultService vault)
     {
         _browserBridge = browserBridge;
         _activity = activity;
         _skills = skills;
+        _vault = vault;
     }
 
     public string Name => "fill_otp";
@@ -29,23 +32,47 @@ public sealed class FillOtpSkill : IBasicSkill
     public string MainAgentSpec => """
             fill_otp
                - Purpose: Fill an OTP/verification code into the active browser verification page via Extension DOM (or UIA fallback), never auto-submitting.
-               - Args: {"code": "optional; omit to use active event/latest OTP", "service_hint": "optional window/service keyword"}
+               - Args: {"handle": "optional otp#xxxxxx handle; omit to use latest vaulted OTP", "service_hint": "optional window/service keyword"}
             
         """;
-    public string PlannerSpec => """fill_otp: Fill OTP into active verification page via Extension DOM (or UIA fallback), never submits. args: {"code":"optional","service_hint":"optional"}""";
+    public string PlannerSpec => """fill_otp: Fill OTP into active verification page via Extension DOM (or UIA fallback), never submits. args: {"handle":"optional otp#xxxxxx","service_hint":"optional"}""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
         var ev = _skills.CurrentEventNotification;
-        var code = ctx.GetArg("code");
-        if (string.IsNullOrWhiteSpace(code) || code.Contains("{{", StringComparison.Ordinal))
-            code = ev?.Otp ?? _skills.LastObservedOtpCode;
+        var rawArg = ctx.GetArg("handle") ?? ctx.GetArg("code");
+        if (string.IsNullOrWhiteSpace(rawArg) || rawArg.Contains("{{", StringComparison.Ordinal))
+            rawArg = ev?.OtpHandle ?? _skills.LastObservedOtpHandle ?? _vault.GetLatestActiveHandle();
 
-        if (string.IsNullOrWhiteSpace(code))
+        if (string.IsNullOrWhiteSpace(rawArg))
         {
             ctx.MarkFailed();
-            ctx.Observations.Add("fill_otp: no OTP code available to fill.");
+            ctx.Observations.Add("fill_otp: no active OTP handle available to fill.");
             return;
+        }
+
+        // Convert any direct input into a single-use vault handle so observations NEVER log plaintext OTP digits.
+        string handle;
+        string realCode;
+        if (SecretVaultService.IsOtpHandle(rawArg))
+        {
+            handle = rawArg.Trim().ToLowerInvariant();
+            if (!_vault.TryConsume(handle, out realCode, out _))
+            {
+                ctx.MarkFailed();
+                ctx.Observations.Add($"fill_otp: handle {handle} has already been used or expired.");
+                return;
+            }
+        }
+        else
+        {
+            handle = _vault.StoreOtp(rawArg);
+            if (!_vault.TryConsume(handle, out realCode, out _))
+            {
+                ctx.MarkFailed();
+                ctx.Observations.Add("fill_otp: failed to resolve OTP handle.");
+                return;
+            }
         }
 
         var hint = ctx.GetArg("service_hint");
@@ -54,18 +81,18 @@ public sealed class FillOtpSkill : IBasicSkill
 
         var skillName = ctx.EffectiveName(Name);
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
-        var extRes = await _browserBridge.RequestFillOtpAsync(code, TimeSpan.FromMilliseconds(1500), ctx.Ct);
+        var extRes = await _browserBridge.RequestFillOtpAsync(realCode, TimeSpan.FromMilliseconds(1500), ctx.Ct);
         if (extRes is { Filled: true })
         {
             var title = string.IsNullOrWhiteSpace(extRes.Title) ? "browser tab" : extRes.Title.Trim();
-            ctx.Observations.Add($"{skillName} succeeded via Browser Extension ({extRes.Mode ?? "dom"}) on \"{title}\" (code={code}, not submitted).");
+            ctx.Observations.Add($"{skillName} succeeded via Browser Extension ({extRes.Mode ?? "dom"}) on \"{title}\" (filled {handle}, not submitted).");
             ctx.CompletedSteps.Add(skillName);
             return;
         }
 
-        var (ok, msg) = await _activity.TryFillOtpInExternalWindowAsync(code, hint, ctx.Ct);
+        var (ok, msg) = await _activity.TryFillOtpInExternalWindowAsync(realCode, hint, ctx.Ct, handle);
         ctx.Observations.Add(ok
-            ? $"{skillName} succeeded via UIA: {msg}"
+            ? $"{skillName} succeeded via UIA: filled {handle} ({msg})"
             : $"{skillName} failed: {msg}");
         if (ok)
             ctx.CompletedSteps.Add(skillName);
