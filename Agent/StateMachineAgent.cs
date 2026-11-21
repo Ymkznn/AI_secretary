@@ -72,6 +72,7 @@ public sealed class StateMachineAgent : IDisposable
     private readonly GuardService _guard;
     private readonly IModelGateway _model;
     private readonly BrowserFormBridgeService _browserBridge;
+    private readonly AgentBlackboard _blackboard;
     private readonly ILogger<StateMachineAgent> _logger;
 
     private readonly object _latestLock = new();
@@ -89,6 +90,7 @@ public sealed class StateMachineAgent : IDisposable
         GuardService guard,
         IModelGateway model,
         BrowserFormBridgeService browserBridge,
+        AgentBlackboard blackboard,
         ILogger<StateMachineAgent> logger)
     {
         _store = store;
@@ -96,6 +98,7 @@ public sealed class StateMachineAgent : IDisposable
         _guard = guard;
         _model = model;
         _browserBridge = browserBridge;
+        _blackboard = blackboard;
         _logger = logger;
     }
 
@@ -403,21 +406,38 @@ public sealed class StateMachineAgent : IDisposable
         await _store.RecordBranchOutcomeAsync(hit: true, estimatedTokensSaved: 350, ct);
 
         var observations = new List<string>();
-        foreach (var step in steps.Take(2))
+        var completedSteps = new List<string>();
+        var bbId = $"sm_accept:{triggerKey}";
+        var bbGoal = $"StateMachine accepted {steps[0].Skill} ({triggerKey})";
+        _blackboard.StartTask(bbId, "state_machine", bbGoal);
+        bool bbDone = false;
+        try
         {
-            if (!_guard.IsSkillEnabled(step.Skill)) continue;
-            await _worker.RunStepAsync(
-                conversationId: conversationId,
-                userPrompt: $"[auto_state_accepted:{existing.StateName}] {triggerKey}",
-                skillName: step.Skill,
-                args: step.Args,
-                targetMailId: null,
-                confirmAsync: (_, _) => Task.FromResult(false),
-                onStatusAsync: _ => Task.CompletedTask,
-                sources: new List<MailSourceRef>(),
-                observations: observations,
-                completedSteps: new List<string>(),
-                ct: ct);
+            bool allOk = true;
+            foreach (var step in steps.Take(2))
+            {
+                if (!_guard.IsSkillEnabled(step.Skill)) continue;
+                var outcome = await _worker.RunStepAsync(
+                    conversationId: conversationId,
+                    userPrompt: $"[auto_state_accepted:{existing.StateName}] {triggerKey}",
+                    skillName: step.Skill,
+                    args: step.Args,
+                    targetMailId: null,
+                    confirmAsync: (_, _) => Task.FromResult(false),
+                    onStatusAsync: _ => Task.CompletedTask,
+                    sources: new List<MailSourceRef>(),
+                    observations: observations,
+                    completedSteps: completedSteps,
+                    ct: ct);
+                if (outcome != Skills.StepOutcome.Ok)
+                    allOk = false;
+            }
+            _blackboard.CompleteTask(bbId, "state_machine", bbGoal, AgentBlackboard.BuildCompactSummary(completedSteps, observations), succeeded: allOk, recordInRecent: true);
+            bbDone = true;
+        }
+        finally
+        {
+            if (!bbDone) _blackboard.EnsureClosed(bbId);
         }
 
         if (observations.Count == 0)
@@ -579,35 +599,67 @@ public sealed class StateMachineAgent : IDisposable
         List<CachedWorkflowStep> steps,
         CancellationToken ct)
     {
+        var bbId = $"sm_replay:{triggerKey}";
+        var bbGoal = $"Auto-replay {steps[0].Skill} ({stateName})";
+        _blackboard.StartTask(bbId, "state_machine", bbGoal);
+        var observations = new List<string>();
+        var completedSteps = new List<string>();
         bool anyExecuted = false;
-        foreach (var step in steps.Take(2))
+        bool succeeded = true;
+        bool bbDone = false;
+
+        try
         {
-            if (!_guard.IsSkillEnabled(step.Skill)) continue;
-            try
+            foreach (var step in steps.Take(2))
             {
-                var outcome = await _worker.RunStepAsync(
-                    conversationId: conversationId,
-                    userPrompt: $"[auto_state:{stateName}] {triggerKey}",
-                    skillName: step.Skill,
-                    args: step.Args,
-                    targetMailId: null,
-                    confirmAsync: (_, _) => Task.FromResult(false),
-                    onStatusAsync: _ => Task.CompletedTask,
-                    sources: new List<MailSourceRef>(),
-                    observations: new List<string>(),
-                    completedSteps: new List<string>(),
-                    ct: ct);
-                anyExecuted = true;
-                if (outcome != Skills.StepOutcome.Ok)
-                    return false;
+                if (!_guard.IsSkillEnabled(step.Skill)) continue;
+                try
+                {
+                    var outcome = await _worker.RunStepAsync(
+                        conversationId: conversationId,
+                        userPrompt: $"[auto_state:{stateName}] {triggerKey}",
+                        skillName: step.Skill,
+                        args: step.Args,
+                        targetMailId: null,
+                        confirmAsync: (_, _) => Task.FromResult(false),
+                        onStatusAsync: _ => Task.CompletedTask,
+                        sources: new List<MailSourceRef>(),
+                        observations: observations,
+                        completedSteps: completedSteps,
+                        ct: ct);
+                    anyExecuted = true;
+                    if (outcome != Skills.StepOutcome.Ok)
+                    {
+                        succeeded = false;
+                        break;
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogDebug(ex, "[StateMachineAgent] step {Skill} failed for {Key}", step.Skill, triggerKey);
+                    observations.Add($"{step.Skill} failed: {ex.Message}");
+                    succeeded = false;
+                    break;
+                }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogDebug(ex, "[StateMachineAgent] step {Skill} failed for {Key}", step.Skill, triggerKey);
-                return false;
-            }
+
+            bool ok = anyExecuted && succeeded;
+            _blackboard.CompleteTask(
+                bbId,
+                "state_machine",
+                bbGoal,
+                AgentBlackboard.BuildCompactSummary(completedSteps, observations),
+                succeeded: ok,
+                recordInRecent: observations.Count > 0,
+                dedupeKey: $"sm_replay:{triggerKey}");
+            bbDone = true;
+            return ok;
         }
-        return anyExecuted;
+        finally
+        {
+            if (!bbDone)
+                _blackboard.EnsureClosed(bbId);
+        }
     }
 
     private List<CachedWorkflowStep> FilterSafeSteps(List<CachedWorkflowStep> steps)

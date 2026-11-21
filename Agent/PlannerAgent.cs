@@ -40,6 +40,7 @@ public sealed class PlannerAgent
     private readonly UiLocalizer _localizer;
     private readonly AppSettingsService _settings;
     private readonly ActivityMonitorService _activity;
+    private readonly AgentBlackboard _blackboard;
     private readonly ILogger<PlannerAgent> _logger;
 
     public PlannerAgent(
@@ -54,6 +55,7 @@ public sealed class PlannerAgent
         UiLocalizer localizer,
         AppSettingsService settings,
         ActivityMonitorService activity,
+        AgentBlackboard blackboard,
         ILogger<PlannerAgent> logger)
     {
         _store = store;
@@ -67,6 +69,7 @@ public sealed class PlannerAgent
         _localizer = localizer;
         _settings = settings;
         _activity = activity;
+        _blackboard = blackboard;
         _logger = logger;
     }
 
@@ -114,6 +117,9 @@ public sealed class PlannerAgent
 
         var nowLocal = DateTimeOffset.Now;
         var activeWindowContext = ActivityMonitorService.FormatActiveWindowState(_activity.GetLastExternalTarget());
+        var bbSnap = _blackboard.GetSnapshot(maxRecentResults: 6, maxAge: TimeSpan.FromMinutes(10));
+        long lastBbVersion = bbSnap.Version;
+        var blackboardContext = AgentBlackboard.FormatForPrompt(bbSnap);
         var plannerPrompt = PlannerPrompts.BuildPlannerUserPrompt(
             nowLocal,
             _sandbox.RootPath,
@@ -124,7 +130,8 @@ public sealed class PlannerAgent
             goal,
             userPrompt,
             activeWindowContext,
-            _sandbox.GetTrustedPaths());
+            _sandbox.GetTrustedPaths(),
+            blackboardContext);
 
         var sources = new List<MailSourceRef>();
         var observations = new List<string>();
@@ -216,6 +223,7 @@ public sealed class PlannerAgent
                     await onStatusAsync(statusNote);
 
                 onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerPreparing", "Worker preparing {0} step(s)...", plannedSteps.Count));
+                _blackboard.UpdateProgress(taskId, $"round {round}/{maxRounds}: {string.Join(", ", plannedSteps.Take(3).Select(s => s.Skill))}");
                 var stepLimit = Math.Min(plannedSteps.Count, _guard.MaxWorkerStepsPerTask);
                 int obsBefore = observations.Count;
                 bool roundHadDenied = false;
@@ -243,7 +251,7 @@ public sealed class PlannerAgent
 
                 var roundObs = observations.Skip(obsBefore).ToList();
 
-                // Sync any concurrent notifications (e.g. arriving OTP mail / reminder) between Planner <-> Worker rounds
+                // Sync any concurrent notifications (e.g. arriving OTP mail / reminder) & blackboard results between Planner <-> Worker rounds
                 var latestMsgs = await _store.GetChatMessagesAsync(conversationId, 10, ct);
                 foreach (var n in latestMsgs.Where(m =>
                              m.Role == "notification" &&
@@ -256,6 +264,18 @@ public sealed class PlannerAgent
                     roundObs.Add(note);
                 }
                 lastNotifCheckUtc = DateTimeOffset.UtcNow;
+
+                var concurrentBb = _blackboard.GetCompletedSince(lastBbVersion, excludeTaskId: taskId);
+                foreach (var r in concurrentBb)
+                {
+                    if (r.Version > lastBbVersion) lastBbVersion = r.Version;
+                    var note = $"[Concurrent background result ({r.Kind}) at {r.CompletedAt.ToLocalTime():HH:mm:ss}]: {r.Goal} -> {r.Summary}";
+                    if (!observations.Any(o => o.Contains(r.Summary, StringComparison.Ordinal)))
+                    {
+                        observations.Add(note);
+                        roundObs.Add(note);
+                    }
+                }
 
                 wasDeclinedOrDenied = roundHadDenied;
                 if (wasDeclinedOrDenied)

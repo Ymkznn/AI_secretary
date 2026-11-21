@@ -21,6 +21,7 @@ public sealed class StandingWatcherService
     private readonly IHttpClientFactory _httpFactory;
     private readonly BrowserHostService _browserHost;
     private readonly UiLocalizer _localizer;
+    private readonly AgentBlackboard _blackboard;
     private readonly ILogger<StandingWatcherService> _logger;
     private readonly SemaphoreSlim _tickLock = new(1, 1);
 
@@ -30,6 +31,7 @@ public sealed class StandingWatcherService
         IHttpClientFactory httpFactory,
         BrowserHostService browserHost,
         UiLocalizer localizer,
+        AgentBlackboard blackboard,
         ILogger<StandingWatcherService> logger)
     {
         _store = store;
@@ -37,6 +39,7 @@ public sealed class StandingWatcherService
         _httpFactory = httpFactory;
         _browserHost = browserHost;
         _localizer = localizer;
+        _blackboard = blackboard;
         _logger = logger;
     }
 
@@ -73,6 +76,10 @@ public sealed class StandingWatcherService
         var now = DateTimeOffset.UtcNow;
         var jitterSec = Random.Shared.Next(-Math.Max(2, w.IntervalSeconds / 15), Math.Max(3, w.IntervalSeconds / 10));
         var nextAt = now.AddSeconds(Math.Max(60, w.IntervalSeconds + jitterSec));
+        var bbId = $"watcher:{w.WatcherId}";
+        var bbGoal = $"Check watcher: {w.Title}";
+        _blackboard.StartTask(bbId, "watcher", bbGoal);
+        bool bbCompleted = false;
 
         try
         {
@@ -82,6 +89,8 @@ public sealed class StandingWatcherService
             {
                 await _store.UpdateWatcherStateAsync(w.WatcherId, w.LastSnapshot, now, nextAt, w.FailureCount, "NeedsAuth", ct);
                 var needsAuthMsg = await _localizer.TextAsync("WatcherNeedsAuth", "Session expired for '{0}'. Please reopen the dedicated browser and sign in to resume.", new object?[] { w.Title }, ct);
+                _blackboard.CompleteTask(bbId, "watcher", bbGoal, needsAuthMsg, succeeded: false, recordInRecent: true);
+                bbCompleted = true;
                 await onTriggeredAsync(w, needsAuthMsg);
                 return (false, "needs_auth");
             }
@@ -91,6 +100,8 @@ public sealed class StandingWatcherService
                 var fails = w.FailureCount + 1;
                 var newStatus = fails >= 5 ? "Paused" : w.Status;
                 await _store.UpdateWatcherStateAsync(w.WatcherId, w.LastSnapshot, now, nextAt, fails, newStatus, ct);
+                _blackboard.CompleteTask(bbId, "watcher", bbGoal, $"Watcher '{w.Title}' check error: {currentValue}", succeeded: false, recordInRecent: newStatus == "Paused", dedupeKey: $"watcher:{w.WatcherId}");
+                bbCompleted = true;
                 if (newStatus == "Paused")
                 {
                     var pausedMsg = await _localizer.TextAsync("WatcherPaused", "Watcher '{0}' paused automatically after {1} consecutive failures: {2}", new object?[] { w.Title, fails, currentValue }, ct);
@@ -107,7 +118,14 @@ public sealed class StandingWatcherService
                 var alertMsg = string.IsNullOrWhiteSpace(w.ThresholdValue)
                     ? await _localizer.TextAsync("WatcherChanged", "'{0}' detected a new change:\n{1}", new object?[] { w.Title, currentValue }, ct)
                     : await _localizer.TextAsync("WatcherMatched", "'{0}' matched condition (current: {1}, threshold: {2})\n{3}", new object?[] { w.Title, currentValue, w.ThresholdValue, w.Url }, ct);
+                _blackboard.CompleteTask(bbId, "watcher", bbGoal, alertMsg, succeeded: true, recordInRecent: true);
+                bbCompleted = true;
                 await onTriggeredAsync(w, alertMsg);
+            }
+            else
+            {
+                _blackboard.CompleteTask(bbId, "watcher", bbGoal, $"Watcher '{w.Title}' checked (no trigger): {currentValue}", succeeded: true, recordInRecent: false, dedupeKey: $"watcher_idle:{w.WatcherId}");
+                bbCompleted = true;
             }
 
             return (true, currentValue);
@@ -118,7 +136,14 @@ public sealed class StandingWatcherService
             var fails = w.FailureCount + 1;
             var newStatus = fails >= 5 ? "Paused" : w.Status;
             await _store.UpdateWatcherStateAsync(w.WatcherId, w.LastSnapshot, now, nextAt, fails, newStatus, ct);
+            _blackboard.CompleteTask(bbId, "watcher", bbGoal, $"Watcher '{w.Title}' error: {ex.Message}", succeeded: false, recordInRecent: false);
+            bbCompleted = true;
             return (false, ex.Message);
+        }
+        finally
+        {
+            if (!bbCompleted)
+                _blackboard.EnsureClosed(bbId);
         }
     }
 

@@ -101,9 +101,11 @@ public partial class ChatHistoryWindow : Wpf.Ui.Controls.FluentWindow
             return;
         }
 
-        foreach (var msg in messages)
+        var msgById = messages.ToDictionary(m => m.Id, StringComparer.Ordinal);
+        for (int i = 0; i < messages.Count; i++)
         {
-            MessagesPanel.Children.Add(BuildMessageRow(msg));
+            var prev = i > 0 ? messages[i - 1] : null;
+            MessagesPanel.Children.Add(BuildMessageRow(messages[i], prev, msgById));
         }
 
         if (scrollToBottom || nearBottom)
@@ -113,11 +115,11 @@ public partial class ChatHistoryWindow : Wpf.Ui.Controls.FluentWindow
         }
     }
 
-    private UIElement BuildMessageRow(ChatMessageRecord msg)
+    private UIElement BuildMessageRow(ChatMessageRecord msg, ChatMessageRecord? prevMsg, IReadOnlyDictionary<string, ChatMessageRecord> msgById)
     {
         bool isUser = string.Equals(msg.Role, "user", StringComparison.OrdinalIgnoreCase);
         bool isNotification = string.Equals(msg.Role, "notification", StringComparison.OrdinalIgnoreCase);
-        var timeText = msg.CreatedAt.ToLocalTime().ToString("HH:mm");
+        var timeText = (msg.RevealedAt ?? msg.CreatedAt).ToLocalTime().ToString("HH:mm");
 
         var row = new Grid { Margin = new Thickness(0, 0, 0, 10) };
 
@@ -194,6 +196,34 @@ public partial class ChatHistoryWindow : Wpf.Ui.Controls.FluentWindow
             FontSize = 13
         };
 
+        var bubbleBody = new StackPanel { Orientation = System.Windows.Controls.Orientation.Vertical };
+        if (!isNotification &&
+            !string.IsNullOrWhiteSpace(msg.ReplyToMessageId) &&
+            msgById.TryGetValue(msg.ReplyToMessageId, out var replyTarget) &&
+            (prevMsg is null || !string.Equals(prevMsg.Id, replyTarget.Id, StringComparison.Ordinal)))
+        {
+            var quoteRaw = (replyTarget.Content ?? "").ReplaceLineEndings(" ").Trim();
+            if (quoteRaw.Length > 42) quoteRaw = quoteRaw[..42] + "…";
+            var quoteBox = new Border
+            {
+                BorderBrush = Brush(_isDark ? "#60A5FA" : "#0078D4"),
+                BorderThickness = new Thickness(2, 0, 0, 0),
+                Padding = new Thickness(7, 2, 4, 2),
+                Margin = new Thickness(0, 0, 0, 6),
+                Background = Brush(_isDark ? "#22FFFFFF" : "#100078D4"),
+                CornerRadius = new CornerRadius(0, 4, 4, 0),
+                Child = new TextBlock
+                {
+                    Text = $"↳ 回覆：「{quoteRaw}」",
+                    FontSize = 11.5,
+                    Opacity = 0.78,
+                    TextWrapping = TextWrapping.Wrap
+                }
+            };
+            bubbleBody.Children.Add(quoteBox);
+        }
+        bubbleBody.Children.Add(contentElement);
+
         var leftBubble = new Border
         {
             Background = Brush(isNotification
@@ -206,7 +236,7 @@ public partial class ChatHistoryWindow : Wpf.Ui.Controls.FluentWindow
             CornerRadius = new CornerRadius(12, 12, 12, 4),
             Padding = new Thickness(12, 8, 12, 8),
             MaxWidth = 380,
-            Child = contentElement
+            Child = bubbleBody
         };
 
         bubbleRow.Children.Add(leftBubble);

@@ -34,6 +34,7 @@ public partial class App : System.Windows.Application
         sc.AddSingleton<IConfiguration>(config);
         sc.AddSingleton<AppSettingsService>();
         sc.AddSingleton<InteractionGateway>();
+        sc.AddSingleton<AgentBlackboard>();
         sc.AddLogging(b => b.AddConsole());
 
         sc.AddHttpClient("EwsClient")

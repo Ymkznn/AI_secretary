@@ -75,6 +75,7 @@ public sealed class ManageMailSkill : IBasicSkill
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
         if (!_skills.IsOutlookConfigured)
         {
+            ctx.MarkFailed();
             ctx.Observations.Add($"{skillName}: Outlook/EWS is not configured; folder discovery is unavailable.");
             return;
         }

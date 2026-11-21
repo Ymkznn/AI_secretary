@@ -69,6 +69,8 @@ public sealed class UiLocalizer
             ["StepKilledByUser"] = "Cleared by /kill magent",
             ["StageMainRouting"] = "MainAgent analyzing intent and routing...",
             ["StageMainDone"] = "MainAgent replied directly",
+            ["StageMainJoined"] = "Joined running background task",
+            ["JoinTaskDefaultReply"] = "Still checking on that—I'll answer everything together as soon as it finishes.",
             ["StageWorkerDispatch"] = "MainAgent dispatched Worker ({0}, {1})",
             ["StageWorkerDone"] = "Worker finished {0}",
             ["StageWorkerPreparing"] = "Worker preparing {0} step(s)...",

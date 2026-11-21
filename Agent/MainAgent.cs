@@ -29,6 +29,7 @@ public sealed class MainAgent
     private readonly MemoryReflectionAgent _memoryReflection;
     private readonly StateMachineAgent _stateMachine;
     private readonly SandboxService _sandbox;
+    private readonly AgentBlackboard _blackboard;
     private readonly ILogger<MainAgent> _logger;
 
     public MainAgent(
@@ -47,6 +48,7 @@ public sealed class MainAgent
         MemoryReflectionAgent memoryReflection,
         StateMachineAgent stateMachine,
         SandboxService sandbox,
+        AgentBlackboard blackboard,
         ILogger<MainAgent> logger)
     {
         _store = store;
@@ -64,6 +66,7 @@ public sealed class MainAgent
         _memoryReflection = memoryReflection;
         _stateMachine = stateMachine;
         _sandbox = sandbox;
+        _blackboard = blackboard;
         _logger = logger;
     }
 
@@ -93,7 +96,8 @@ public sealed class MainAgent
         Action<string, bool>? onPlannerTaskFinished = null,
         Action<string>? onSingleSkillFinished = null,
         Action<string>? onClosePlannerTask = null,
-        string? preferredLogicalTaskId = null)
+        string? preferredLogicalTaskId = null,
+        string? userMessageId = null)
     {
         onStageChanged?.Invoke("main", _localizer.TextCached("StageMainRouting", "MainAgent analyzing intent and routing..."));
         var mainSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Main", ct: ct);
@@ -129,6 +133,10 @@ public sealed class MainAgent
 
         var activeTasksContext = MainAgentPrompts.FormatActiveTasksContext(activePlannerTasks);
         var activeWindowContext = ActivityMonitorService.FormatActiveWindowState(_activity.GetLastExternalTarget());
+        var bbSnapshot = _blackboard.GetSnapshot(maxRecentResults: 6, maxAge: TimeSpan.FromMinutes(10));
+        long routeStartVersion = bbSnapshot.Version;
+        var inFlightIdsAtRouteStart = bbSnapshot.InFlight.Select(t => t.TaskId).ToHashSet(StringComparer.Ordinal);
+        var blackboardContext = AgentBlackboard.FormatForPrompt(bbSnapshot);
 
         var dynamicUserPrompt = MainAgentPrompts.BuildUserContextPrompt(
             DateTimeOffset.Now,
@@ -140,9 +148,11 @@ public sealed class MainAgent
             activeTasksContext,
             activeWindowContext,
             _sandbox.RootPath,
-            _sandbox.GetTrustedPaths());
+            _sandbox.GetTrustedPaths(),
+            blackboardContext);
 
         // Fast path: 2-bit branch prediction for repeated read-only single-step intents (skips MainAgent routing LLM).
+        // Skip fast path whenever any task is in-flight so MainAgent router can observe <in_flight> and join_task cleanly.
         var turnStartedUtc = DateTimeOffset.UtcNow;
         var basePromptMessages = new List<ModelMessage>(2 + historyMessages.Count)
         {
@@ -154,6 +164,7 @@ public sealed class MainAgent
         if (string.IsNullOrWhiteSpace(targetMailId) &&
             string.IsNullOrWhiteSpace(preferredLogicalTaskId) &&
             (activePlannerTasks is null || activePlannerTasks.Count == 0) &&
+            bbSnapshot.InFlight.Count == 0 &&
             !AttachmentExtractor.AttachmentPattern.IsMatch(userPrompt))
         {
             var (predWf, predStep) = await _workflowCache.TryPredictSingleStepAsync(conversationId, userPrompt, ct);
@@ -163,72 +174,112 @@ public sealed class MainAgent
                 var predArgs = predStep.Args;
                 var predAck = await _localizer.TextAsync("DefaultDispatchAck", "Working on it...", Array.Empty<object?>(), ct);
                 var syntheticRouteJson = JsonSerializer.Serialize(new { action = "run_skill", skill = predSkill, ack = predAck });
+                var predGoal = $"{predSkill}: {userPrompt}";
 
                 if (onDispatchBackground is not null)
                 {
+                    _blackboard.StartTask(taskId, "single_skill", predGoal, userMessageId);
                     onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerDispatch", "MainAgent dispatched Worker ({0}, {1})", predSkill, "Predicted"));
                     await onReplyAsync(predAck, new List<MailSourceRef>());
 
                     onDispatchBackground(async (bgCt, bgReplyAsync, bgDirectTtsText, bgChoices) =>
                     {
-                        var report = await _worker.ExecuteSingleSkillRawAsync(
-                            conversationId, userPrompt, predSkill, predArgs, targetMailId, confirmAsync,
-                            async s => { onStageChanged?.Invoke("worker", s); await onStatusAsync(s); },
-                            bgCt, taskId);
-                        if (report.Handled)
+                        var activeBbId = taskId;
+                        bool bbCommitted = false;
+                        try
                         {
-                            await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: report.Succeeded, estimatedTokensSaved: report.Succeeded ? 350 : 0, bgCt);
-                            await _store.InsertPredictionLogAsync("single_step", predWf.WorkflowId, userPrompt, predSkill, report.Succeeded, report.Succeeded ? 350 : 0, bgCt);
-                            onSingleSkillFinished?.Invoke(taskId);
-                            onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", predSkill));
+                            var report = await _worker.ExecuteSingleSkillRawAsync(
+                                conversationId, userPrompt, predSkill, predArgs, targetMailId, confirmAsync,
+                                async s => { _blackboard.UpdateProgress(activeBbId, s); onStageChanged?.Invoke("worker", s); await onStatusAsync(s); },
+                                bgCt, taskId);
+                            if (report.Handled)
+                            {
+                                var rawSummary = AgentBlackboard.BuildCompactSummary(report.CompletedSteps, report.Observations);
+                                var (_, joinedFollowUps, _) = _blackboard.CompleteTask(activeBbId, "single_skill", predGoal, rawSummary, report.Succeeded, suppressJoinedEvent: true);
+                                bbCommitted = true;
+
+                                await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: report.Succeeded, estimatedTokensSaved: report.Succeeded ? 350 : 0, bgCt);
+                                await _store.InsertPredictionLogAsync("single_step", predWf.WorkflowId, userPrompt, predSkill, report.Succeeded, report.Succeeded ? 350 : 0, bgCt);
+                                onSingleSkillFinished?.Invoke(taskId);
+                                onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", predSkill));
+                                await SynthesizeFinalReplyAsync(
+                                    conversationId, mainSession, basePromptMessages, syntheticRouteJson,
+                                    "Worker", userPrompt, report.CompletedSteps, report.Observations, report.Sources,
+                                    turnStartedUtc, includeTaskStatus: false, ModelTier.Simple,
+                                    bgReplyAsync, bgDirectTtsText, bgChoices, onTaskCompleted: null, extraNote: null, bgCt,
+                                    joinedFollowUps: joinedFollowUps, turnStartBbVersion: routeStartVersion, bbTaskId: activeBbId);
+                                return;
+                            }
+
+                            await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: false, estimatedTokensSaved: 0, bgCt);
+                            await _store.InsertPredictionLogAsync("single_step", predWf.WorkflowId, userPrompt, predSkill, false, 0, bgCt);
+                            onStageChanged?.Invoke("planner", _localizer.TextCached("StagePlannerPlanning", "MainAgent -> Planner ({0})...", "Simple"));
+                            var plannerTaskId = resolveLogicalTaskId is not null
+                                ? resolveLogicalTaskId("call_planner", null, userPrompt)
+                                : taskId;
+                            _blackboard.UpgradeTask(activeBbId, plannerTaskId, "planner", userPrompt);
+                            activeBbId = plannerTaskId;
+
+                            var planReport = await _planner.ExecuteGoalAsync(
+                                conversationId, plannerTaskId, userPrompt, userPrompt, targetMailId, confirmAsync,
+                                async s => { _blackboard.UpdateProgress(activeBbId, s); onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
+                                onStageChanged, ModelTier.Simple, bgCt);
+                            var planSummary = AgentBlackboard.BuildCompactSummary(planReport.CompletedSteps, planReport.Observations);
+                            var (_, planJoined, _) = _blackboard.CompleteTask(
+                                activeBbId, "planner", userPrompt, planSummary,
+                                succeeded: !planReport.WasDeclinedOrDenied && planReport.Observations.Count > 0,
+                                suppressJoinedEvent: true);
+                            bbCommitted = true;
+
+                            bool isDone = true;
                             await SynthesizeFinalReplyAsync(
                                 conversationId, mainSession, basePromptMessages, syntheticRouteJson,
-                                "Worker", userPrompt, report.CompletedSteps, report.Observations, report.Sources,
-                                turnStartedUtc, includeTaskStatus: false, ModelTier.Simple,
-                                bgReplyAsync, bgDirectTtsText, bgChoices, onTaskCompleted: null, extraNote: null, bgCt);
-                            return;
+                                "Planner", userPrompt, planReport.CompletedSteps, planReport.Observations, planReport.Sources,
+                                turnStartedUtc, includeTaskStatus: true, ModelTier.Simple,
+                                bgReplyAsync, bgDirectTtsText, bgChoices, done => isDone = done,
+                                planReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({planReport.RoundsExecuted})." : null,
+                                bgCt,
+                                joinedFollowUps: planJoined, turnStartBbVersion: routeStartVersion, bbTaskId: activeBbId);
+                            onPlannerTaskFinished?.Invoke(plannerTaskId, isDone);
                         }
-
-                        await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: false, estimatedTokensSaved: 0, bgCt);
-                        await _store.InsertPredictionLogAsync("single_step", predWf.WorkflowId, userPrompt, predSkill, false, 0, bgCt);
-                        onStageChanged?.Invoke("planner", _localizer.TextCached("StagePlannerPlanning", "MainAgent -> Planner ({0})...", "Simple"));
-                        var plannerTaskId = resolveLogicalTaskId is not null
-                            ? resolveLogicalTaskId("call_planner", null, userPrompt)
-                            : taskId;
-                        var planReport = await _planner.ExecuteGoalAsync(
-                            conversationId, plannerTaskId, userPrompt, userPrompt, targetMailId, confirmAsync,
-                            async s => { onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
-                            onStageChanged, ModelTier.Simple, bgCt);
-                        bool isDone = true;
-                        await SynthesizeFinalReplyAsync(
-                            conversationId, mainSession, basePromptMessages, syntheticRouteJson,
-                            "Planner", userPrompt, planReport.CompletedSteps, planReport.Observations, planReport.Sources,
-                            turnStartedUtc, includeTaskStatus: true, ModelTier.Simple,
-                            bgReplyAsync, bgDirectTtsText, bgChoices, done => isDone = done,
-                            planReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({planReport.RoundsExecuted})." : null,
-                            bgCt);
-                        onPlannerTaskFinished?.Invoke(plannerTaskId, isDone);
+                        finally
+                        {
+                            if (!bbCommitted)
+                                _blackboard.EnsureClosed(activeBbId);
+                        }
                     });
                     return;
                 }
 
                 await onStatusAsync(predAck);
                 onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerDispatch", "MainAgent dispatched Worker ({0}, {1})", predSkill, "Predicted"));
-                var syncReport = await _worker.ExecuteSingleSkillRawAsync(
-                    conversationId, userPrompt, predSkill, predArgs, targetMailId, confirmAsync,
-                    s => onStatusAsync(s), ct, taskId);
-                if (syncReport.Handled)
+                _blackboard.StartTask(taskId, "single_skill", predGoal, userMessageId);
+                bool syncPredCommitted = false;
+                try
                 {
-                    await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: syncReport.Succeeded, estimatedTokensSaved: syncReport.Succeeded ? 350 : 0, ct);
-                    await _store.InsertPredictionLogAsync("single_step", predWf.WorkflowId, userPrompt, predSkill, syncReport.Succeeded, syncReport.Succeeded ? 350 : 0, ct);
-                    onSingleSkillFinished?.Invoke(taskId);
-                    onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", predSkill));
-                    await SynthesizeFinalReplyAsync(
-                        conversationId, mainSession, basePromptMessages, syntheticRouteJson,
-                        "Worker", userPrompt, syncReport.CompletedSteps, syncReport.Observations, syncReport.Sources,
-                        turnStartedUtc, includeTaskStatus: false, ModelTier.Simple,
-                        onReplyAsync, onDirectTtsText, onChoices, onTaskCompleted: null, extraNote: null, ct);
-                    return;
+                    var syncReport = await _worker.ExecuteSingleSkillRawAsync(
+                        conversationId, userPrompt, predSkill, predArgs, targetMailId, confirmAsync,
+                        s => onStatusAsync(s), ct, taskId);
+                    if (syncReport.Handled)
+                    {
+                        var (_, syncJoined, _) = _blackboard.CompleteTask(taskId, "single_skill", predGoal, AgentBlackboard.BuildCompactSummary(syncReport.CompletedSteps, syncReport.Observations), syncReport.Succeeded, suppressJoinedEvent: true);
+                        syncPredCommitted = true;
+                        await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: syncReport.Succeeded, estimatedTokensSaved: syncReport.Succeeded ? 350 : 0, ct);
+                        await _store.InsertPredictionLogAsync("single_step", predWf.WorkflowId, userPrompt, predSkill, syncReport.Succeeded, syncReport.Succeeded ? 350 : 0, ct);
+                        onSingleSkillFinished?.Invoke(taskId);
+                        onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", predSkill));
+                        await SynthesizeFinalReplyAsync(
+                            conversationId, mainSession, basePromptMessages, syntheticRouteJson,
+                            "Worker", userPrompt, syncReport.CompletedSteps, syncReport.Observations, syncReport.Sources,
+                            turnStartedUtc, includeTaskStatus: false, ModelTier.Simple,
+                            onReplyAsync, onDirectTtsText, onChoices, onTaskCompleted: null, extraNote: null, ct,
+                            joinedFollowUps: syncJoined, turnStartBbVersion: routeStartVersion, bbTaskId: taskId);
+                        return;
+                    }
+                }
+                finally
+                {
+                    if (!syncPredCommitted) _blackboard.EnsureClosed(taskId);
                 }
 
                 await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: false, estimatedTokensSaved: 0, ct);
@@ -251,7 +302,7 @@ public sealed class MainAgent
         {
             if (action == "reply" && string.IsNullOrWhiteSpace(closeTaskId))
                 closeTaskId = preferredLogicalTaskId;
-            else if (action != "reply" && string.IsNullOrWhiteSpace(targetTaskId))
+            else if (action is not ("reply" or "join_task") && string.IsNullOrWhiteSpace(targetTaskId))
                 targetTaskId = preferredLogicalTaskId;
         }
 
@@ -259,10 +310,88 @@ public sealed class MainAgent
         if (action == "run_skill" && !string.IsNullOrWhiteSpace(targetTaskId))
             action = "call_planner";
 
+        if (action == "join_task")
+        {
+            var joinTargetId = targetTaskId;
+            if (string.IsNullOrWhiteSpace(joinTargetId) && bbSnapshot.InFlight.Count == 1)
+                joinTargetId = bbSnapshot.InFlight[0].TaskId;
+
+            if (!string.IsNullOrWhiteSpace(joinTargetId))
+            {
+                if (_blackboard.TryJoinTask(joinTargetId, userMessageId ?? taskId, userPrompt, out var alreadyCompleted))
+                {
+                    var joinReply = !string.IsNullOrWhiteSpace(directReply)
+                        ? directReply
+                        : (!string.IsNullOrWhiteSpace(ack)
+                            ? ack
+                            : await _localizer.TextAsync("JoinTaskDefaultReply", "Still checking on that—I'll answer everything together as soon as it finishes.", Array.Empty<object?>(), ct));
+                    onStageChanged?.Invoke("main_done", _localizer.TextCached("StageMainJoined", "Joined running background task"));
+                    if (!string.IsNullOrWhiteSpace(ttsText))
+                        onDirectTtsText?.Invoke(ttsText);
+                    await onReplyAsync(joinReply, new List<MailSourceRef>());
+                    return;
+                }
+
+                if (alreadyCompleted is not null)
+                {
+                    // Target task finished right while MainAgent was routing: answer immediately with fresh result!
+                    onStageChanged?.Invoke("main_done", _localizer.TextCached("StageMainDone", "MainAgent replied with fresh result"));
+                    await RewriteWithFreshResultsAsync(
+                        conversationId, mainSession, routeMessages, routeResp.Content,
+                        new[] { alreadyCompleted }, onReplyAsync, onDirectTtsText, onChoices, ct);
+                    return;
+                }
+            }
+
+            // Fallback if join target disappeared during routing: check if any in-flight task from start just completed
+            if (inFlightIdsAtRouteStart.Count > 0 && _blackboard.Version > routeStartVersion)
+            {
+                var finishedAny = _blackboard.GetCompletedSince(routeStartVersion, onlyTaskIds: inFlightIdsAtRouteStart);
+                if (finishedAny.Count > 0)
+                {
+                    onStageChanged?.Invoke("main_done", _localizer.TextCached("StageMainDone", "MainAgent replied with fresh result"));
+                    await RewriteWithFreshResultsAsync(
+                        conversationId, mainSession, routeMessages, routeResp.Content,
+                        finishedAny, onReplyAsync, onDirectTtsText, onChoices, ct);
+                    return;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(directReply))
+            {
+                onStageChanged?.Invoke("main_done", _localizer.TextCached("StageMainDone", "MainAgent replied directly"));
+                if (!string.IsNullOrWhiteSpace(ttsText))
+                    onDirectTtsText?.Invoke(ttsText);
+                await onReplyAsync(directReply, new List<MailSourceRef>());
+                return;
+            }
+        }
+
         if (action == "reply" && !string.IsNullOrWhiteSpace(directReply) && string.IsNullOrWhiteSpace(targetMailId))
         {
             if (!string.IsNullOrWhiteSpace(closeTaskId))
                 onClosePlannerTask?.Invoke(closeTaskId);
+
+            // Narrow freshness check (direct reply only, max 1 regeneration):
+            // Only trigger if a task that was ALREADY in <in_flight> at routing start completed during routing
+            // AND is relevant to this turn (so unrelated questions are never slowed down or regenerated).
+            if (inFlightIdsAtRouteStart.Count > 0 && _blackboard.Version > routeStartVersion)
+            {
+                var newlyCompleted = _blackboard.GetCompletedSince(routeStartVersion, onlyTaskIds: inFlightIdsAtRouteStart);
+                var relevantCompleted = newlyCompleted
+                    .Where(r => IsCompletedResultRelevantToTurn(userPrompt, directReply, r))
+                    .ToList();
+                if (relevantCompleted.Count > 0)
+                {
+                    onStageChanged?.Invoke("main_done", _localizer.TextCached("StageMainDone", "MainAgent replied with fresh result"));
+                    var rewritten = await RewriteWithFreshResultsAsync(
+                        conversationId, mainSession, routeMessages, routeResp.Content,
+                        relevantCompleted, onReplyAsync, onDirectTtsText, onChoices, ct);
+                    if (memoryWorthy)
+                        _memoryReflection.EnqueueChatReflection(conversationId, userPrompt, rewritten);
+                    return;
+                }
+            }
 
             onStageChanged?.Invoke("main_done", _localizer.TextCached("StageMainDone", "MainAgent replied directly"));
             if (choices.Count > 0)
@@ -280,8 +409,10 @@ public sealed class MainAgent
             var dispatchNote = !string.IsNullOrWhiteSpace(ack)
                 ? ack
                 : await _localizer.TextAsync("DefaultDispatchAck", "Working on it...", Array.Empty<object?>(), ct);
+            var skillGoal = $"{skill}: {effectiveGoal}";
             if (onDispatchBackground is not null)
             {
+                _blackboard.StartTask(taskId, "single_skill", skillGoal, userMessageId);
                 onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerDispatch", "MainAgent dispatched Worker ({0}, {1})", skill, tier.ToString()));
                 if (!string.IsNullOrWhiteSpace(ttsText))
                     onDirectTtsText?.Invoke(ttsText);
@@ -289,44 +420,70 @@ public sealed class MainAgent
 
                 onDispatchBackground(async (bgCt, bgReplyAsync, bgDirectTtsText, bgChoices) =>
                 {
-                    var report = await _worker.ExecuteSingleSkillRawAsync(
-                        conversationId, userPrompt, skill, args, targetMailId, confirmAsync,
-                        async s => { onStageChanged?.Invoke("worker", s); await onStatusAsync(s); },
-                        bgCt, taskId);
-                    if (report.Handled)
+                    var activeBbId = taskId;
+                    bool bbCommitted = false;
+                    try
                     {
-                        if (report.Succeeded)
+                        var report = await _worker.ExecuteSingleSkillRawAsync(
+                            conversationId, userPrompt, skill, args, targetMailId, confirmAsync,
+                            async s => { _blackboard.UpdateProgress(activeBbId, s); onStageChanged?.Invoke("worker", s); await onStatusAsync(s); },
+                            bgCt, taskId);
+                        if (report.Handled)
                         {
-                            await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, bgCt);
-                            await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, bgCt);
+                            var rawSummary = AgentBlackboard.BuildCompactSummary(report.CompletedSteps, report.Observations);
+                            var (_, joinedFollowUps, _) = _blackboard.CompleteTask(activeBbId, "single_skill", skillGoal, rawSummary, report.Succeeded, suppressJoinedEvent: true);
+                            bbCommitted = true;
+
+                            if (report.Succeeded)
+                            {
+                                await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, bgCt);
+                                await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, bgCt);
+                            }
+                            onSingleSkillFinished?.Invoke(taskId);
+                            onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
+                            await SynthesizeFinalReplyAsync(
+                                conversationId, mainSession, routeMessages, routeResp.Content,
+                                "Worker", userPrompt, report.CompletedSteps, report.Observations, report.Sources,
+                                turnStartedUtc, includeTaskStatus: false, tier,
+                                bgReplyAsync, bgDirectTtsText, bgChoices, onTaskCompleted: null, extraNote: null, bgCt,
+                                joinedFollowUps: joinedFollowUps, turnStartBbVersion: routeStartVersion, bbTaskId: activeBbId);
+                            return;
                         }
-                        onSingleSkillFinished?.Invoke(taskId);
-                        onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
+
+                        onStageChanged?.Invoke("planner", _localizer.TextCached("StagePlannerPlanning", "MainAgent -> Planner ({0})...", tier.ToString()));
+                        var plannerTaskId = resolveLogicalTaskId is not null
+                            ? resolveLogicalTaskId("call_planner", targetTaskId, effectiveGoal)
+                            : taskId;
+                        _blackboard.UpgradeTask(activeBbId, plannerTaskId, "planner", effectiveGoal);
+                        activeBbId = plannerTaskId;
+
+                        var planReport = await _planner.ExecuteGoalAsync(
+                            conversationId, plannerTaskId, effectiveGoal, userPrompt, targetMailId, confirmAsync,
+                            async s => { _blackboard.UpdateProgress(activeBbId, s); onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
+                            onStageChanged, tier, bgCt);
+                        var planSummary = AgentBlackboard.BuildCompactSummary(planReport.CompletedSteps, planReport.Observations);
+                        var (_, planJoined, _) = _blackboard.CompleteTask(
+                            activeBbId, "planner", effectiveGoal, planSummary,
+                            succeeded: !planReport.WasDeclinedOrDenied && planReport.Observations.Count > 0,
+                            suppressJoinedEvent: true);
+                        bbCommitted = true;
+
+                        bool isDone = true;
                         await SynthesizeFinalReplyAsync(
                             conversationId, mainSession, routeMessages, routeResp.Content,
-                            "Worker", userPrompt, report.CompletedSteps, report.Observations, report.Sources,
-                            turnStartedUtc, includeTaskStatus: false, tier,
-                            bgReplyAsync, bgDirectTtsText, bgChoices, onTaskCompleted: null, extraNote: null, bgCt);
-                        return;
+                            "Planner", userPrompt, planReport.CompletedSteps, planReport.Observations, planReport.Sources,
+                            turnStartedUtc, includeTaskStatus: true, tier,
+                            bgReplyAsync, bgDirectTtsText, bgChoices, done => isDone = done,
+                            planReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({planReport.RoundsExecuted})." : null,
+                            bgCt,
+                            joinedFollowUps: planJoined, turnStartBbVersion: routeStartVersion, bbTaskId: activeBbId);
+                        onPlannerTaskFinished?.Invoke(plannerTaskId, isDone);
                     }
-
-                    onStageChanged?.Invoke("planner", _localizer.TextCached("StagePlannerPlanning", "MainAgent -> Planner ({0})...", tier.ToString()));
-                    var plannerTaskId = resolveLogicalTaskId is not null
-                        ? resolveLogicalTaskId("call_planner", targetTaskId, effectiveGoal)
-                        : taskId;
-                    var planReport = await _planner.ExecuteGoalAsync(
-                        conversationId, plannerTaskId, effectiveGoal, userPrompt, targetMailId, confirmAsync,
-                        async s => { onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
-                        onStageChanged, tier, bgCt);
-                    bool isDone = true;
-                    await SynthesizeFinalReplyAsync(
-                        conversationId, mainSession, routeMessages, routeResp.Content,
-                        "Planner", userPrompt, planReport.CompletedSteps, planReport.Observations, planReport.Sources,
-                        turnStartedUtc, includeTaskStatus: true, tier,
-                        bgReplyAsync, bgDirectTtsText, bgChoices, done => isDone = done,
-                        planReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({planReport.RoundsExecuted})." : null,
-                        bgCt);
-                    onPlannerTaskFinished?.Invoke(plannerTaskId, isDone);
+                    finally
+                    {
+                        if (!bbCommitted)
+                            _blackboard.EnsureClosed(activeBbId);
+                    }
                 });
                 return;
             }
@@ -338,23 +495,35 @@ public sealed class MainAgent
                     ? onStatusAsync(s)
                     : onStatusAsync($"{dispatchNote} ({s})");
             onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerDispatch", "MainAgent dispatched Worker ({0}, {1})", skill, tier.ToString()));
-            var syncReport = await _worker.ExecuteSingleSkillRawAsync(
-                conversationId, userPrompt, skill, args, targetMailId, confirmAsync, workerStatusAsync, ct, taskId);
-            if (syncReport.Handled)
+            _blackboard.StartTask(taskId, "single_skill", skillGoal, userMessageId);
+            bool syncSkillCommitted = false;
+            try
             {
-                if (syncReport.Succeeded)
+                var syncReport = await _worker.ExecuteSingleSkillRawAsync(
+                    conversationId, userPrompt, skill, args, targetMailId, confirmAsync, workerStatusAsync, ct, taskId);
+                if (syncReport.Handled)
                 {
-                    await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, ct);
-                    await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, ct);
+                    var (_, syncJoined, _) = _blackboard.CompleteTask(taskId, "single_skill", skillGoal, AgentBlackboard.BuildCompactSummary(syncReport.CompletedSteps, syncReport.Observations), syncReport.Succeeded, suppressJoinedEvent: true);
+                    syncSkillCommitted = true;
+                    if (syncReport.Succeeded)
+                    {
+                        await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, ct);
+                        await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, ct);
+                    }
+                    onSingleSkillFinished?.Invoke(taskId);
+                    onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
+                    await SynthesizeFinalReplyAsync(
+                        conversationId, mainSession, routeMessages, routeResp.Content,
+                        "Worker", userPrompt, syncReport.CompletedSteps, syncReport.Observations, syncReport.Sources,
+                        turnStartedUtc, includeTaskStatus: false, tier,
+                        onReplyAsync, onDirectTtsText, onChoices, onTaskCompleted: null, extraNote: null, ct,
+                        joinedFollowUps: syncJoined, turnStartBbVersion: routeStartVersion, bbTaskId: taskId);
+                    return;
                 }
-                onSingleSkillFinished?.Invoke(taskId);
-                onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
-                await SynthesizeFinalReplyAsync(
-                    conversationId, mainSession, routeMessages, routeResp.Content,
-                    "Worker", userPrompt, syncReport.CompletedSteps, syncReport.Observations, syncReport.Sources,
-                    turnStartedUtc, includeTaskStatus: false, tier,
-                    onReplyAsync, onDirectTtsText, onChoices, onTaskCompleted: null, extraNote: null, ct);
-                return;
+            }
+            finally
+            {
+                if (!syncSkillCommitted) _blackboard.EnsureClosed(taskId);
             }
         }
 
@@ -366,6 +535,7 @@ public sealed class MainAgent
             : await _localizer.TextAsync("DefaultPlannerAck", "Planning the steps...", Array.Empty<object?>(), ct);
         if (onDispatchBackground is not null)
         {
+            _blackboard.StartTask(logicalTaskId, "planner", effectiveGoal, userMessageId);
             onStageChanged?.Invoke("planner", _localizer.TextCached("StagePlannerPlanning", "MainAgent -> Planner ({0})...", tier.ToString()));
             if (!string.IsNullOrWhiteSpace(ttsText))
                 onDirectTtsText?.Invoke(ttsText);
@@ -373,19 +543,36 @@ public sealed class MainAgent
 
             onDispatchBackground(async (bgCt, bgReplyAsync, bgDirectTtsText, bgChoices) =>
             {
-                var planReport = await _planner.ExecuteGoalAsync(
-                    conversationId, logicalTaskId, effectiveGoal, userPrompt, targetMailId, confirmAsync,
-                    async s => { onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
-                    onStageChanged, tier, bgCt);
-                bool isDone = true;
-                await SynthesizeFinalReplyAsync(
-                    conversationId, mainSession, routeMessages, routeResp.Content,
-                    "Planner", userPrompt, planReport.CompletedSteps, planReport.Observations, planReport.Sources,
-                    turnStartedUtc, includeTaskStatus: true, tier,
-                    bgReplyAsync, bgDirectTtsText, bgChoices, done => isDone = done,
-                    planReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({planReport.RoundsExecuted})." : null,
-                    bgCt);
-                onPlannerTaskFinished?.Invoke(logicalTaskId, isDone);
+                bool bbCommitted = false;
+                try
+                {
+                    var planReport = await _planner.ExecuteGoalAsync(
+                        conversationId, logicalTaskId, effectiveGoal, userPrompt, targetMailId, confirmAsync,
+                        async s => { _blackboard.UpdateProgress(logicalTaskId, s); onStageChanged?.Invoke("planner", s); await onStatusAsync(s); },
+                        onStageChanged, tier, bgCt);
+                    var planSummary = AgentBlackboard.BuildCompactSummary(planReport.CompletedSteps, planReport.Observations);
+                    var (_, planJoined, _) = _blackboard.CompleteTask(
+                        logicalTaskId, "planner", effectiveGoal, planSummary,
+                        succeeded: !planReport.WasDeclinedOrDenied && planReport.Observations.Count > 0,
+                        suppressJoinedEvent: true);
+                    bbCommitted = true;
+
+                    bool isDone = true;
+                    await SynthesizeFinalReplyAsync(
+                        conversationId, mainSession, routeMessages, routeResp.Content,
+                        "Planner", userPrompt, planReport.CompletedSteps, planReport.Observations, planReport.Sources,
+                        turnStartedUtc, includeTaskStatus: true, tier,
+                        bgReplyAsync, bgDirectTtsText, bgChoices, done => isDone = done,
+                        planReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({planReport.RoundsExecuted})." : null,
+                        bgCt,
+                        joinedFollowUps: planJoined, turnStartBbVersion: routeStartVersion, bbTaskId: logicalTaskId);
+                    onPlannerTaskFinished?.Invoke(logicalTaskId, isDone);
+                }
+                finally
+                {
+                    if (!bbCommitted)
+                        _blackboard.EnsureClosed(logicalTaskId);
+                }
             });
             return;
         }
@@ -397,18 +584,35 @@ public sealed class MainAgent
             string.Equals(s, plannerNote, StringComparison.Ordinal)
                 ? onStatusAsync(s)
                 : onStatusAsync($"{plannerNote} ({s})");
-        var syncPlanReport = await _planner.ExecuteGoalAsync(
-            conversationId, logicalTaskId, effectiveGoal, userPrompt, targetMailId, confirmAsync,
-            plannerStatusAsync, onStageChanged, tier, ct);
-        bool syncDone = true;
-        await SynthesizeFinalReplyAsync(
-            conversationId, mainSession, routeMessages, routeResp.Content,
-            "Planner", userPrompt, syncPlanReport.CompletedSteps, syncPlanReport.Observations, syncPlanReport.Sources,
-            turnStartedUtc, includeTaskStatus: true, tier,
-            onReplyAsync, onDirectTtsText, onChoices, done => syncDone = done,
-            syncPlanReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({syncPlanReport.RoundsExecuted})." : null,
-            ct);
-        onPlannerTaskFinished?.Invoke(logicalTaskId, syncDone);
+        _blackboard.StartTask(logicalTaskId, "planner", effectiveGoal, userMessageId);
+        bool syncPlanCommitted = false;
+        try
+        {
+            var syncPlanReport = await _planner.ExecuteGoalAsync(
+                conversationId, logicalTaskId, effectiveGoal, userPrompt, targetMailId, confirmAsync,
+                plannerStatusAsync, onStageChanged, tier, ct);
+            var (_, syncPlanJoined, _) = _blackboard.CompleteTask(
+                logicalTaskId, "planner", effectiveGoal,
+                AgentBlackboard.BuildCompactSummary(syncPlanReport.CompletedSteps, syncPlanReport.Observations),
+                succeeded: !syncPlanReport.WasDeclinedOrDenied && syncPlanReport.Observations.Count > 0,
+                suppressJoinedEvent: true);
+            syncPlanCommitted = true;
+
+            bool syncDone = true;
+            await SynthesizeFinalReplyAsync(
+                conversationId, mainSession, routeMessages, routeResp.Content,
+                "Planner", userPrompt, syncPlanReport.CompletedSteps, syncPlanReport.Observations, syncPlanReport.Sources,
+                turnStartedUtc, includeTaskStatus: true, tier,
+                onReplyAsync, onDirectTtsText, onChoices, done => syncDone = done,
+                syncPlanReport.ReachedRoundLimit ? $"Planner reached the configured max rounds ({syncPlanReport.RoundsExecuted})." : null,
+                ct,
+                joinedFollowUps: syncPlanJoined, turnStartBbVersion: routeStartVersion, bbTaskId: logicalTaskId);
+            onPlannerTaskFinished?.Invoke(logicalTaskId, syncDone);
+        }
+        finally
+        {
+            if (!syncPlanCommitted) _blackboard.EnsureClosed(logicalTaskId);
+        }
     }
 
     /// <summary>
@@ -433,7 +637,10 @@ public sealed class MainAgent
         Action<IReadOnlyList<string>>? onChoices,
         Action<bool>? onTaskCompleted,
         string? extraNote,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyList<JoinedFollowUp>? joinedFollowUps = null,
+        long turnStartBbVersion = 0,
+        string? bbTaskId = null)
     {
         // Sync any background notifications (mail triage, reminders, watchers) delivered while Worker/Planner ran
         var latestMsgs = await _store.GetChatMessagesAsync(conversationId, 10, ct);
@@ -447,6 +654,16 @@ public sealed class MainAgent
                 observations.Add(note);
         }
 
+        if (turnStartBbVersion > 0)
+        {
+            foreach (var r in _blackboard.GetCompletedSince(turnStartBbVersion, excludeTaskId: bbTaskId))
+            {
+                var note = $"[Concurrent background result ({r.Kind}) at {r.CompletedAt.ToLocalTime():HH:mm:ss}]: {r.Goal} -> {r.Summary}";
+                if (!observations.Any(o => o.Contains(r.Summary, StringComparison.Ordinal)))
+                    observations.Add(note);
+            }
+        }
+
         var synthesisPrompt = PlannerPrompts.BuildMainAgentReportSynthesisPrompt(
             sourceLabel,
             completedSteps,
@@ -456,7 +673,8 @@ public sealed class MainAgent
             _tts.ChatMode,
             _tts.TargetLang,
             GetReplyLanguage(),
-            extraNote);
+            extraNote,
+            joinedFollowUps);
 
         var finalMessages = new List<ModelMessage>(cachedPrefixMessages.Count + 2);
         finalMessages.AddRange(cachedPrefixMessages);
@@ -474,6 +692,9 @@ public sealed class MainAgent
         var (clean1, finalTtsText) = WorkerAgent.ExtractAndStripTtsText(clean0);
         var (cleanFinal, isTaskDone) = ExtractAndStripTaskStatus(clean1, finalChoices.Count > 0);
 
+        if (!string.IsNullOrWhiteSpace(bbTaskId) && !string.IsNullOrWhiteSpace(cleanFinal))
+            _blackboard.RefineResultSummary(bbTaskId, cleanFinal);
+
         if (finalChoices.Count > 0)
             onChoices?.Invoke(finalChoices);
         if (!string.IsNullOrWhiteSpace(finalTtsText))
@@ -483,6 +704,164 @@ public sealed class MainAgent
 
         if (completedSteps.Count > 0)
             _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, completedSteps, observations, cleanFinal);
+    }
+
+    /// <summary>
+    /// 一次性以剛完成的背景任務結果改寫回覆（重用路由前綴快取，絕不遞迴重試）。
+    /// </summary>
+    private async Task<string> RewriteWithFreshResultsAsync(
+        string conversationId,
+        AgentSessionRecord mainSession,
+        IReadOnlyList<ModelMessage> cachedRouteMessages,
+        string routingAssistantJson,
+        IReadOnlyList<TaskResult> completedResults,
+        Func<string, List<MailSourceRef>, Task> onReplyAsync,
+        Action<string>? onDirectTtsText,
+        Action<IReadOnlyList<string>>? onChoices,
+        CancellationToken ct)
+    {
+        var rewritePrompt = PlannerPrompts.BuildFreshnessRewritePrompt(
+            completedResults,
+            _tts.IsEnabled,
+            _tts.ChatMode,
+            _tts.TargetLang,
+            GetReplyLanguage());
+
+        var msgs = new List<ModelMessage>(cachedRouteMessages.Count + 2);
+        msgs.AddRange(cachedRouteMessages);
+        msgs.Add(new("assistant", routingAssistantJson));
+        msgs.Add(new("user", rewritePrompt));
+
+        var resp = await _model.CompleteAsync(
+            msgs,
+            new LlmCallOptions("MainAgent.FreshnessRegen", ModelTier.Simple, CachePolicy.Conversation, LlmPriority.Interactive),
+            ct);
+        await _sessions.RecordTokensAsync(mainSession, resp.EstimatedTokens, ct: ct);
+
+        var (clean0, choices) = WorkerAgent.ExtractAndStripChoices(resp.Content);
+        var (clean1, ttsText) = WorkerAgent.ExtractAndStripTtsText(clean0);
+        var (cleanFinal, _) = ExtractAndStripTaskStatus(clean1, choices.Count > 0);
+
+        if (choices.Count > 0)
+            onChoices?.Invoke(choices);
+        if (!string.IsNullOrWhiteSpace(ttsText))
+            onDirectTtsText?.Invoke(ttsText);
+        await onReplyAsync(cleanFinal, new List<MailSourceRef>());
+        return cleanFinal;
+    }
+
+    /// <summary>供使用者透過 join_task 掛載於非互動背景任務（mail_sync / watcher / scheduled / state_machine）完成後產生回覆。</summary>
+    public async Task<(string Reply, string? TtsText)> SynthesizeJoinedFollowUpReplyAsync(
+        string conversationId,
+        TaskResult result,
+        IReadOnlyList<JoinedFollowUp> joinedFollowUps,
+        CancellationToken ct = default)
+    {
+        var mainSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Main", ct: ct);
+        var activeStylePrompt = _tts.GetActiveStylePrompt() ?? _styles.GetActiveStylePrompt();
+        var prefFacts = await _store.RecallRelevantUserPrefFactsAsync(conversationId, result.Goal, 5, ct);
+        var prefContext = MainAgentPrompts.FormatPreferencesContext(prefFacts);
+        var sys = PlannerPrompts.BuildFinalReplySystemPrompt(
+            activeStylePrompt,
+            _tts.IsEnabled,
+            _tts.ChatMode,
+            includeTaskStatus: false,
+            _tts.TargetLang,
+            GetReplyLanguage());
+
+        var resp = await _model.CompleteAsync(new[]
+        {
+            new ModelMessage("system", sys),
+            new ModelMessage("user", PlannerPrompts.BuildJoinedSystemTaskPrompt(prefContext, result, joinedFollowUps))
+        }, new LlmCallOptions("MainAgent.JoinedSystemReply", ModelTier.Simple, CachePolicy.None, LlmPriority.Interactive), ct);
+
+        await _sessions.RecordTokensAsync(mainSession, resp.EstimatedTokens, ct: ct);
+        var (clean0, _) = WorkerAgent.ExtractAndStripChoices(resp.Content);
+        var (clean1, ttsText) = WorkerAgent.ExtractAndStripTtsText(clean0);
+        return (clean1, string.IsNullOrWhiteSpace(ttsText) ? null : ttsText);
+    }
+
+    private static readonly string[] WaitingOrStatusSignals =
+    {
+        "還在查", "還在跑", "還在找", "還沒收到", "沒有收到", "沒收到", "尚未收到",
+        "沒看到驗證碼", "還沒出來", "查不到", "好了嗎", "好了沒", "太慢", "確認中",
+        "not yet", "still checking", "still running", "still working"
+    };
+
+    private static readonly string[] ShortStatusNudges =
+    {
+        "結果呢", "好了沒", "好了嗎", "進度", "怎麼樣", "有嗎", "收到了嗎", "來了嗎", "還沒好", "太慢"
+    };
+
+    /// <summary>
+    /// Checks whether a background task that completed during routing is relevant to this direct reply turn,
+    /// preventing unrelated questions (e.g. "what day is today?", "how to write C# code?") from being slowed down or regenerated.
+    /// </summary>
+    internal static bool IsCompletedResultRelevantToTurn(string userPrompt, string directReply, TaskResult completed)
+    {
+        var trimmedPrompt = (userPrompt ?? "").Trim();
+        var turnText = $"{trimmedPrompt} {directReply}";
+
+        if (WaitingOrStatusSignals.Any(sig => turnText.Contains(sig, StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        if (trimmedPrompt.Length <= 14 &&
+            ShortStatusNudges.Any(n => trimmedPrompt.Contains(n, StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        var turnTokens = ExtractSalientTokens(turnText);
+        if (turnTokens.Count == 0)
+            return false;
+
+        var taskTokens = ExtractSalientTokens($"{completed.Goal} {completed.Summary}");
+        foreach (var tok in turnTokens)
+        {
+            if (taskTokens.Contains(tok))
+                return true;
+        }
+        return false;
+    }
+
+    private static HashSet<string> ExtractSalientTokens(string text)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(text)) return set;
+
+        foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(text, @"[A-Za-z0-9_]{3,}"))
+        {
+            var w = m.Value;
+            if (w is "the" or "and" or "for" or "with" or "from" or "that" or "this" or "are" or "was" or "have" or "not" or "all" or "true" or "false" or "none" or "steps")
+                continue;
+            set.Add(w);
+        }
+
+        // Extract CJK 2-grams for Chinese/Japanese matching without false positives on single filler chars
+        var cjkRun = new System.Text.StringBuilder();
+        void FlushRun()
+        {
+            if (cjkRun.Length >= 2)
+            {
+                var s = cjkRun.ToString();
+                for (int i = 0; i <= s.Length - 2; i++)
+                {
+                    var bg = s.Substring(i, 2);
+                    if (bg is "一下" or "什麼" or "怎麼" or "可以" or "幫我" or "這個" or "那個" or "目前" or "現在" or "今天" or "已經" or "沒有" or "不是")
+                        continue;
+                    set.Add(bg);
+                }
+            }
+            cjkRun.Clear();
+        }
+
+        foreach (var ch in text)
+        {
+            if (ch >= '\u4E00' && ch <= '\u9FFF')
+                cjkRun.Append(ch);
+            else
+                FlushRun();
+        }
+        FlushRun();
+        return set;
     }
 
     /// <summary>供排程非靜默技能執行完畢後，統一透過 MainAgent 以角色語氣摘要後推播給使用者。</summary>

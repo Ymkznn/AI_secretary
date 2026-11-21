@@ -62,7 +62,9 @@ public sealed class SqliteStore
                 SourcesJson TEXT NOT NULL DEFAULT '[]',
                 NotificationJson TEXT NULL,
                 DraftJson TEXT NULL,
-                CreatedAt TEXT NOT NULL
+                CreatedAt TEXT NOT NULL,
+                ReplyToMessageId TEXT NULL,
+                RevealedAt TEXT NULL
             );
             CREATE INDEX IF NOT EXISTS IX_ChatMessages_Conv ON ChatMessages(ConversationId, CreatedAt);
 
@@ -324,7 +326,9 @@ public sealed class SqliteStore
             "ALTER TABLE KnowledgeFacts ADD COLUMN ExpiresAt TEXT NULL;",
             "ALTER TABLE KnowledgeFacts ADD COLUMN LastVerifiedAt TEXT NULL;",
             "ALTER TABLE AutoStateRules ADD COLUMN CooldownUntil TEXT NULL;",
-            "ALTER TABLE AutoStateRules ADD COLUMN ProposalText TEXT NULL;"
+            "ALTER TABLE AutoStateRules ADD COLUMN ProposalText TEXT NULL;",
+            "ALTER TABLE ChatMessages ADD COLUMN ReplyToMessageId TEXT NULL;",
+            "ALTER TABLE ChatMessages ADD COLUMN RevealedAt TEXT NULL;"
         })
         {
             try
@@ -337,6 +341,12 @@ public sealed class SqliteStore
             {
                 // Column already exists
             }
+        }
+
+        await using (var idxCmd = conn.CreateCommand())
+        {
+            idxCmd.CommandText = "CREATE INDEX IF NOT EXISTS IX_ChatMessages_Conv_Revealed ON ChatMessages(ConversationId, RevealedAt, CreatedAt);";
+            await idxCmd.ExecuteNonQueryAsync(ct);
         }
     }
 
@@ -391,15 +401,17 @@ public sealed class SqliteStore
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO ChatMessages (Id, ConversationId, Role, Content, StatusText, IsStreaming, TaskId, SourcesJson, NotificationJson, DraftJson, CreatedAt)
-            VALUES ($id, $conv, $role, $content, $status, $streaming, $taskId, $sources, $notif, $draft, $created)
+            INSERT INTO ChatMessages (Id, ConversationId, Role, Content, StatusText, IsStreaming, TaskId, SourcesJson, NotificationJson, DraftJson, CreatedAt, ReplyToMessageId, RevealedAt)
+            VALUES ($id, $conv, $role, $content, $status, $streaming, $taskId, $sources, $notif, $draft, $created, $replyTo, $revealed)
             ON CONFLICT(Id) DO UPDATE SET
                 Content = excluded.Content,
                 StatusText = excluded.StatusText,
                 IsStreaming = excluded.IsStreaming,
                 SourcesJson = excluded.SourcesJson,
                 NotificationJson = excluded.NotificationJson,
-                DraftJson = excluded.DraftJson;
+                DraftJson = excluded.DraftJson,
+                ReplyToMessageId = COALESCE(excluded.ReplyToMessageId, ChatMessages.ReplyToMessageId),
+                RevealedAt = COALESCE(excluded.RevealedAt, ChatMessages.RevealedAt);
             """;
         cmd.Parameters.AddWithValue("$id", msg.Id);
         cmd.Parameters.AddWithValue("$conv", msg.ConversationId);
@@ -411,7 +423,9 @@ public sealed class SqliteStore
         cmd.Parameters.AddWithValue("$sources", JsonSerializer.Serialize(msg.Sources));
         cmd.Parameters.AddWithValue("$notif", msg.Notification is null ? DBNull.Value : JsonSerializer.Serialize(msg.Notification));
         cmd.Parameters.AddWithValue("$draft", DBNull.Value);
-        cmd.Parameters.AddWithValue("$created", msg.CreatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$created", msg.CreatedAt.ToUniversalTime().ToString("O"));
+        cmd.Parameters.AddWithValue("$replyTo", (object?)msg.ReplyToMessageId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$revealed", msg.RevealedAt.HasValue ? msg.RevealedAt.Value.ToUniversalTime().ToString("O") : DBNull.Value);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
@@ -420,15 +434,15 @@ public sealed class SqliteStore
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT Id, ConversationId, Role, Content, StatusText, IsStreaming, TaskId, SourcesJson, NotificationJson, DraftJson, CreatedAt
+            SELECT Id, ConversationId, Role, Content, StatusText, IsStreaming, TaskId, SourcesJson, NotificationJson, DraftJson, CreatedAt, ReplyToMessageId, RevealedAt
             FROM (
-                SELECT Id, ConversationId, Role, Content, StatusText, IsStreaming, TaskId, SourcesJson, NotificationJson, DraftJson, CreatedAt
+                SELECT Id, ConversationId, Role, Content, StatusText, IsStreaming, TaskId, SourcesJson, NotificationJson, DraftJson, CreatedAt, ReplyToMessageId, RevealedAt
                 FROM ChatMessages
                 WHERE ConversationId = $conv
-                ORDER BY CreatedAt DESC
+                ORDER BY COALESCE(RevealedAt, CreatedAt) DESC, CreatedAt DESC
                 LIMIT $limit
             )
-            ORDER BY CreatedAt ASC;
+            ORDER BY COALESCE(RevealedAt, CreatedAt) ASC, CreatedAt ASC;
             """;
         cmd.Parameters.AddWithValue("$conv", conversationId);
         cmd.Parameters.AddWithValue("$limit", limit);
@@ -451,7 +465,9 @@ public sealed class SqliteStore
                 TaskId = reader.IsDBNull(6) ? null : reader.GetString(6),
                 Sources = JsonSerializer.Deserialize<List<MailSourceRef>>(sourcesJson) ?? new(),
                 Notification = notifJson is null ? null : JsonSerializer.Deserialize<NotificationActionPayload>(notifJson),
-                CreatedAt = DateTimeOffset.Parse(reader.GetString(10))
+                CreatedAt = DateTimeOffset.Parse(reader.GetString(10)),
+                ReplyToMessageId = reader.IsDBNull(11) ? null : reader.GetString(11),
+                RevealedAt = reader.IsDBNull(12) ? null : DateTimeOffset.Parse(reader.GetString(12))
             });
         }
         return list;

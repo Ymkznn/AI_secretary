@@ -55,9 +55,11 @@ public sealed class ChatMessageRecord
     public string? StatusText { get; set; }
     public bool IsStreaming { get; set; }
     public string? TaskId { get; set; }
+    public string? ReplyToMessageId { get; set; }
     public List<MailSourceRef> Sources { get; set; } = new();
     public NotificationActionPayload? Notification { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? RevealedAt { get; set; }
 }
 
 public enum MailRuleDecision

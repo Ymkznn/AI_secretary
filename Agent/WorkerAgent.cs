@@ -122,6 +122,12 @@ public sealed class WorkerAgent
             await handler.ExecuteAsync(ctx);
             return ctx.Outcome;
         }
+        catch (UnauthorizedAccessException ex)
+        {
+            _logger.LogDebug(ex, "Worker step {Skill} denied", record.Name);
+            observations.Add($"{record.Name} denied by Guard: {ex.Message}");
+            return StepOutcome.Denied;
+        }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogDebug(ex, "Worker step {Skill} failed", record.Name);

@@ -18,6 +18,7 @@ public sealed class MailSyncService
     private readonly MailRuleEngine _ruleEngine;
     private readonly SkillRegistry _skillRegistry;
     private readonly PlannerAgent _planner;
+    private readonly AgentBlackboard _blackboard;
     private readonly ILogger<MailSyncService> _logger;
     private readonly SemaphoreSlim _triageGate = new(2, 2);
 
@@ -28,6 +29,7 @@ public sealed class MailSyncService
         MailRuleEngine ruleEngine,
         SkillRegistry skillRegistry,
         PlannerAgent planner,
+        AgentBlackboard blackboard,
         ILogger<MailSyncService> logger)
     {
         _store = store;
@@ -36,6 +38,7 @@ public sealed class MailSyncService
         _ruleEngine = ruleEngine;
         _skillRegistry = skillRegistry;
         _planner = planner;
+        _blackboard = blackboard;
         _logger = logger;
     }
 
@@ -46,53 +49,70 @@ public sealed class MailSyncService
         CancellationToken ct = default)
     {
         var mode = string.IsNullOrWhiteSpace(source) ? "all" : source.Trim().ToLowerInvariant();
+        var bbId = $"mail_sync:{Guid.NewGuid():N}"[..18];
+        var bbGoal = $"Sync emails ({mode})";
+        _blackboard.StartTask(bbId, "mail_sync", bbGoal);
+
         int ewsCount = 0;
         int gmailCount = 0;
         var newMails = new List<MailItem>();
         var notes = new List<string>();
+        bool completed = false;
 
-        if ((mode is "all" or "ews" or "outlook") && (_mailBroker.IsConfigured || mode != "all"))
+        try
         {
-            try
+            if ((mode is "all" or "ews" or "outlook") && (_mailBroker.IsConfigured || mode != "all"))
             {
-                var ewsNew = await PollEwsOnceAsync(conversationId, onNotifyAsync, ct);
-                ewsCount = ewsNew.Count;
-                newMails.AddRange(ewsNew);
+                try
+                {
+                    var ewsNew = await PollEwsOnceAsync(conversationId, onNotifyAsync, ct);
+                    ewsCount = ewsNew.Count;
+                    newMails.AddRange(ewsNew);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogDebug(ex, "EWS sync skipped");
+                    notes.Add($"EWS skipped: {ex.Message}");
+                }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogDebug(ex, "EWS sync skipped");
-                notes.Add($"EWS skipped: {ex.Message}");
-            }
-        }
 
-        if ((mode is "all" or "gmail") && _gmail.IsAuthorized)
-        {
-            try
+            if ((mode is "all" or "gmail") && _gmail.IsAuthorized)
             {
-                var gmailNew = await PollGmailOnceAsync(conversationId, onNotifyAsync, ct);
-                gmailCount = gmailNew.Count;
-                newMails.AddRange(gmailNew);
+                try
+                {
+                    var gmailNew = await PollGmailOnceAsync(conversationId, onNotifyAsync, ct);
+                    gmailCount = gmailNew.Count;
+                    newMails.AddRange(gmailNew);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogDebug(ex, "Gmail sync skipped");
+                    notes.Add($"Gmail skipped: {ex.Message}");
+                }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogDebug(ex, "Gmail sync skipped");
-                notes.Add($"Gmail skipped: {ex.Message}");
-            }
-        }
 
-        var summary = $"Mail sync completed: EWS={ewsCount}, Gmail={gmailCount}.";
-        if (notes.Count > 0)
-            summary += " (" + string.Join("; ", notes) + ")";
-        if (newMails.Count > 0)
-        {
-            var lines = newMails
-                .OrderByDescending(m => m.ReceivedAt)
-                .Take(10)
-                .Select(m => $"- id={m.Id} | from={m.SenderName} | subject=\"{m.Subject}\" | at={m.ReceivedAt.ToLocalTime():MM-dd HH:mm} | snippet={m.Snippet}");
-            summary += "\nNew emails:\n" + string.Join("\n", lines);
+            var summary = $"Mail sync completed: EWS={ewsCount}, Gmail={gmailCount}.";
+            if (notes.Count > 0)
+                summary += " (" + string.Join("; ", notes) + ")";
+            if (newMails.Count > 0)
+            {
+                var lines = newMails
+                    .OrderByDescending(m => m.ReceivedAt)
+                    .Take(10)
+                    .Select(m => $"- id={m.Id} | from={m.SenderName} | subject=\"{m.Subject}\" | at={m.ReceivedAt.ToLocalTime():MM-dd HH:mm} | snippet={m.Snippet}");
+                summary += "\nNew emails:\n" + string.Join("\n", lines);
+            }
+
+            var dedupeKey = newMails.Count == 0 && notes.Count == 0 ? $"mail_sync_empty:{mode}" : null;
+            _blackboard.CompleteTask(bbId, "mail_sync", bbGoal, summary, succeeded: notes.Count == 0 || newMails.Count > 0, dedupeKey: dedupeKey);
+            completed = true;
+            return summary;
         }
-        return summary;
+        finally
+        {
+            if (!completed)
+                _blackboard.EnsureClosed(bbId, "Mail sync stopped or failed.");
+        }
     }
 
     private async Task<List<MailItem>> PollEwsOnceAsync(
@@ -122,12 +142,21 @@ public sealed class MailSyncService
             processed.Add(mail);
             if (decision == MailRuleDecision.NeedsAiTriage)
             {
+                var triageTaskId = $"mail_triage:{mail.Id}";
+                var triageGoal = $"Analyze new email: {mail.Subject}";
+                _blackboard.StartTask(triageTaskId, "mail_sync", triageGoal);
                 _ = Task.Run(async () =>
                 {
+                    bool triageDone = false;
                     await _triageGate.WaitAsync(ct);
                     try
                     {
                         var triage = await _planner.TriageMailEventAsync(mail, conversationId, ct);
+                        var bbSummary = triage.Urgent
+                            ? $"Urgent email [{triage.Title}]: {triage.Summary}"
+                            : $"Non-urgent email from {mail.SenderName} ({mail.Subject})";
+                        _blackboard.CompleteTask(triageTaskId, "mail_sync", triageGoal, bbSummary, succeeded: true, recordInRecent: triage.Urgent);
+                        triageDone = true;
                         if (triage.Urgent)
                         {
                             await onNotifyAsync(eventId, mail, triage.Title, triage.Summary, triage.ReRemindMinutes, triage.Actions);
@@ -139,6 +168,8 @@ public sealed class MailSyncService
                     }
                     finally
                     {
+                        if (!triageDone)
+                            _blackboard.EnsureClosed(triageTaskId);
                         _triageGate.Release();
                     }
                 }, ct);
@@ -194,12 +225,21 @@ public sealed class MailSyncService
             processed.Add(mail);
             if (decision == MailRuleDecision.NeedsAiTriage)
             {
+                var triageTaskId = $"mail_triage:{mail.Id}";
+                var triageGoal = $"Analyze new email: {mail.Subject}";
+                _blackboard.StartTask(triageTaskId, "mail_sync", triageGoal);
                 _ = Task.Run(async () =>
                 {
+                    bool triageDone = false;
                     await _triageGate.WaitAsync(ct);
                     try
                     {
                         var triage = await _planner.TriageMailEventAsync(mail, conversationId, ct);
+                        var bbSummary = triage.Urgent
+                            ? $"Urgent email [{triage.Title}]: {triage.Summary}"
+                            : $"Non-urgent email from {mail.SenderName} ({mail.Subject})";
+                        _blackboard.CompleteTask(triageTaskId, "mail_sync", triageGoal, bbSummary, succeeded: true, recordInRecent: triage.Urgent);
+                        triageDone = true;
                         if (triage.Urgent)
                         {
                             await onNotifyAsync(eventId, mail, triage.Title, triage.Summary, triage.ReRemindMinutes, triage.Actions);
@@ -211,6 +251,8 @@ public sealed class MailSyncService
                     }
                     finally
                     {
+                        if (!triageDone)
+                            _blackboard.EnsureClosed(triageTaskId);
                         _triageGate.Release();
                     }
                 }, ct);
