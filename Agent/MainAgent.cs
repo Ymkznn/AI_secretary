@@ -135,7 +135,10 @@ public sealed class MainAgent
         var activeWindowContext = ActivityMonitorService.FormatActiveWindowState(_activity.GetLastExternalTarget());
         var bbSnapshot = _blackboard.GetSnapshot(maxRecentResults: 6, maxAge: TimeSpan.FromMinutes(10));
         long routeStartVersion = bbSnapshot.Version;
-        var inFlightIdsAtRouteStart = bbSnapshot.InFlight.Select(t => t.TaskId).ToHashSet(StringComparer.Ordinal);
+        var inFlightIdsAtRouteStart = bbSnapshot
+            .GetPromptVisibleInFlight(DateTimeOffset.UtcNow)
+            .Select(t => t.TaskId)
+            .ToHashSet(StringComparer.Ordinal);
         var blackboardContext = AgentBlackboard.FormatForPrompt(bbSnapshot);
 
         var dynamicUserPrompt = MainAgentPrompts.BuildUserContextPrompt(
@@ -152,7 +155,8 @@ public sealed class MainAgent
             blackboardContext);
 
         // Fast path: 2-bit branch prediction for repeated read-only single-step intents (skips MainAgent routing LLM).
-        // Skip fast path whenever any task is in-flight so MainAgent router can observe <in_flight> and join_task cleanly.
+        // Skip fast path ONLY when a USER-INITIATED task (planner / single_skill) is in-flight,
+        // so background mail_sync/watcher/scheduled polls never disable predicted fast paths.
         var turnStartedUtc = DateTimeOffset.UtcNow;
         var basePromptMessages = new List<ModelMessage>(2 + historyMessages.Count)
         {
@@ -164,7 +168,7 @@ public sealed class MainAgent
         if (string.IsNullOrWhiteSpace(targetMailId) &&
             string.IsNullOrWhiteSpace(preferredLogicalTaskId) &&
             (activePlannerTasks is null || activePlannerTasks.Count == 0) &&
-            bbSnapshot.InFlight.Count == 0 &&
+            !bbSnapshot.HasUserInitiatedInFlight &&
             !AttachmentExtractor.AttachmentPattern.IsMatch(userPrompt))
         {
             var (predWf, predStep) = await _workflowCache.TryPredictSingleStepAsync(conversationId, userPrompt, ct);
@@ -313,8 +317,14 @@ public sealed class MainAgent
         if (action == "join_task")
         {
             var joinTargetId = targetTaskId;
-            if (string.IsNullOrWhiteSpace(joinTargetId) && bbSnapshot.InFlight.Count == 1)
-                joinTargetId = bbSnapshot.InFlight[0].TaskId;
+            if (string.IsNullOrWhiteSpace(joinTargetId))
+            {
+                // Auto-select ONLY among user-initiated in-flight tasks (planner / single_skill),
+                // never accidentally binding an ambiguous join to background mail_sync/watcher.
+                var userInFlight = bbSnapshot.InFlight.Where(t => t.IsUserInitiated).ToList();
+                if (userInFlight.Count == 1)
+                    joinTargetId = userInFlight[0].TaskId;
+            }
 
             if (!string.IsNullOrWhiteSpace(joinTargetId))
             {
@@ -642,25 +652,42 @@ public sealed class MainAgent
         long turnStartBbVersion = 0,
         string? bbTaskId = null)
     {
-        // Sync any background notifications (mail triage, reminders, watchers) delivered while Worker/Planner ran
+        // Sync concurrent background alerts separately as side notifications (never mixed into main task observations),
+        // while keeping concurrent user-initiated task completions visible if relevant.
+        var sideNotifications = new List<string>();
         var latestMsgs = await _store.GetChatMessagesAsync(conversationId, 10, ct);
         foreach (var n in latestMsgs.Where(m =>
                      m.Role == "notification" &&
                      m.CreatedAt >= turnStartedUtc &&
                      !string.IsNullOrWhiteSpace(m.Content)))
         {
-            var note = $"[Concurrent notification already shown to user during this turn ({n.CreatedAt.ToLocalTime():HH:mm:ss})]: {n.Content}";
-            if (!observations.Any(o => o.Contains(n.Content, StringComparison.Ordinal)))
-                observations.Add(note);
+            var note = $"({n.CreatedAt.ToLocalTime():HH:mm:ss}) [notification] {n.Content}";
+            if (!observations.Any(o => o.Contains(n.Content, StringComparison.Ordinal)) &&
+                !sideNotifications.Any(s => s.Contains(n.Content, StringComparison.Ordinal)))
+            {
+                sideNotifications.Add(note);
+            }
         }
 
         if (turnStartBbVersion > 0)
         {
             foreach (var r in _blackboard.GetCompletedSince(turnStartBbVersion, excludeTaskId: bbTaskId))
             {
-                var note = $"[Concurrent background result ({r.Kind}) at {r.CompletedAt.ToLocalTime():HH:mm:ss}]: {r.Goal} -> {r.Summary}";
-                if (!observations.Any(o => o.Contains(r.Summary, StringComparison.Ordinal)))
-                    observations.Add(note);
+                if (r.IsUserInitiated)
+                {
+                    var note = $"[Concurrent user task result ({r.Kind}) at {r.CompletedAt.ToLocalTime():HH:mm:ss}]: {r.Goal} -> {r.Summary}";
+                    if (!observations.Any(o => o.Contains(r.Summary, StringComparison.Ordinal)))
+                        observations.Add(note);
+                }
+                else if (r.IsSignificant)
+                {
+                    var note = $"({r.CompletedAt.ToLocalTime():HH:mm:ss}) [{r.Kind}] {r.Goal}: {r.Summary}";
+                    if (!observations.Any(o => o.Contains(r.Summary, StringComparison.Ordinal)) &&
+                        !sideNotifications.Any(s => s.Contains(r.Summary, StringComparison.Ordinal)))
+                    {
+                        sideNotifications.Add(note);
+                    }
+                }
             }
         }
 
@@ -674,7 +701,8 @@ public sealed class MainAgent
             _tts.TargetLang,
             GetReplyLanguage(),
             extraNote,
-            joinedFollowUps);
+            joinedFollowUps,
+            sideNotifications);
 
         var finalMessages = new List<ModelMessage>(cachedPrefixMessages.Count + 2);
         finalMessages.AddRange(cachedPrefixMessages);

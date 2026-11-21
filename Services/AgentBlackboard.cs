@@ -16,7 +16,10 @@ public sealed record InFlightTaskSnapshot(
     string Status,
     string? PartialSummary,
     string? OriginUserMessageId,
-    IReadOnlyList<JoinedFollowUp> JoinedFollowUps);
+    IReadOnlyList<JoinedFollowUp> JoinedFollowUps)
+{
+    public bool IsUserInitiated => AgentBlackboard.IsUserInitiatedKind(Kind);
+}
 
 public sealed record TaskResult(
     string TaskId,
@@ -25,12 +28,30 @@ public sealed record TaskResult(
     string Summary,
     bool Succeeded,
     DateTimeOffset CompletedAt,
-    long Version);
+    long Version,
+    bool IsSignificant = true)
+{
+    public bool IsUserInitiated => AgentBlackboard.IsUserInitiatedKind(Kind);
+}
 
 public sealed record BlackboardSnapshot(
     long Version,
     IReadOnlyList<InFlightTaskSnapshot> InFlight,
-    IReadOnlyList<TaskResult> RecentResults);
+    IReadOnlyList<TaskResult> RecentResults)
+{
+    public bool HasUserInitiatedInFlight => InFlight.Any(t => t.IsUserInitiated);
+
+    /// <summary>
+    /// Returns in-flight tasks that should be shown in prompt <c>&lt;in_flight&gt;</c>:
+    /// user-initiated tasks (<c>planner</c>, <c>single_skill</c>) are always visible immediately;
+    /// system background tasks (<c>mail_sync</c>, <c>watcher</c>, <c>scheduled_skill</c>, <c>state_machine</c>)
+    /// are shown only when running longer than 5 seconds to avoid noisy prompt churn.
+    /// </summary>
+    public List<InFlightTaskSnapshot> GetPromptVisibleInFlight(DateTimeOffset now)
+        => InFlight
+            .Where(t => t.IsUserInitiated || (now - t.StartedAt) >= AgentBlackboard.SystemInFlightVisibilityThreshold)
+            .ToList();
+}
 
 /// <summary>
 /// Thread-safe, in-memory shared real-time blackboard for coordinating MainAgent, PlannerAgent,
@@ -43,6 +64,11 @@ public sealed class AgentBlackboard
 {
     private const int MaxStoredResults = 24;
     private static readonly TimeSpan ResultRetention = TimeSpan.FromMinutes(15);
+    public static readonly TimeSpan SystemInFlightVisibilityThreshold = TimeSpan.FromSeconds(5);
+
+    public static bool IsUserInitiatedKind(string? kind)
+        => string.Equals(kind, "planner", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(kind, "single_skill", StringComparison.OrdinalIgnoreCase);
 
     private sealed class MutableInFlightTask
     {
@@ -273,7 +299,8 @@ public sealed class AgentBlackboard
                     Summary: CompactText(summary, 600),
                     Succeeded: succeeded,
                     CompletedAt: now,
-                    Version: ver);
+                    Version: ver,
+                    IsSignificant: recordInRecent);
                 _recentResults.Add(committedResult);
 
                 if (!string.IsNullOrWhiteSpace(dedupeKey))
@@ -341,7 +368,8 @@ public sealed class AgentBlackboard
                     Summary: CompactText(msg, 300),
                     Succeeded: false,
                     CompletedAt: now,
-                    Version: ver);
+                    Version: ver,
+                    IsSignificant: recordFailure);
                 _recentResults.Add(failureResult);
                 while (_recentResults.Count > MaxStoredResults)
                     _recentResults.RemoveAt(0);
@@ -407,17 +435,18 @@ public sealed class AgentBlackboard
     /// </summary>
     public static string FormatForPrompt(BlackboardSnapshot snapshot)
     {
-        if (snapshot.InFlight.Count == 0 && snapshot.RecentResults.Count == 0)
+        var now = DateTimeOffset.UtcNow;
+        var visibleInFlight = snapshot.GetPromptVisibleInFlight(now);
+        if (visibleInFlight.Count == 0 && snapshot.RecentResults.Count == 0)
             return "";
 
-        var now = DateTimeOffset.UtcNow;
         var sb = new StringBuilder();
 
-        if (snapshot.InFlight.Count > 0)
+        if (visibleInFlight.Count > 0)
         {
             sb.AppendLine();
             sb.AppendLine("<in_flight>");
-            foreach (var t in snapshot.InFlight)
+            foreach (var t in visibleInFlight)
             {
                 var elapsedSec = Math.Max(0, (int)(now - t.StartedAt).TotalSeconds);
                 var partial = string.IsNullOrWhiteSpace(t.PartialSummary) ? "" : $" | progress={t.PartialSummary}";

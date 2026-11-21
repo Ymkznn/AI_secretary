@@ -44,8 +44,39 @@ public sealed class SecretaryController : IDisposable
     private readonly List<PinnedReminderItem> _pinnedReminders = new();
     private readonly ConcurrentDictionary<string, DateTimeOffset> _pinnedNextRemindAt = new();
     private readonly object _pinnedLock = new();
-    private readonly SemaphoreSlim _mainTurnGate = new(1, 1);
+    private readonly object _choicesLock = new();
+    // Lock hierarchy (STRICT): _userTurnGate -> _presentGate (never reverse!).
+    // _userTurnGate serializes user routing turns (Q2 waits for Q1 routing/ack); may span routing LLM, released once background work is dispatched.
+    // _presentGate protects millisecond UI/DB presentation state ONLY (messages, choices, TTS enqueue); NEVER spans LLM calls and NEVER acquired by background work alongside _userTurnGate.
+    private readonly SemaphoreSlim _userTurnGate = new(1, 1);
+    private readonly SemaphoreSlim _presentGate = new(1, 1);
+    private static readonly AsyncLocal<bool> s_holdingPresentGate = new();
     private int _mainTurnActiveCount;
+
+    private sealed class PresentGateScope : IDisposable
+    {
+        private readonly SemaphoreSlim _gate;
+        private int _disposed;
+        public PresentGateScope(SemaphoreSlim gate) => _gate = gate;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            s_holdingPresentGate.Value = false;
+            _gate.Release();
+        }
+    }
+
+    private async Task<IDisposable> EnterPresentGateAsync(CancellationToken ct = default)
+    {
+        if (s_holdingPresentGate.Value)
+        {
+            _logger.LogError("Detected re-entrant _presentGate acquisition!");
+            System.Diagnostics.Debug.Fail("Re-entrant _presentGate acquisition detected!");
+        }
+        await _presentGate.WaitAsync(ct);
+        s_holdingPresentGate.Value = true;
+        return new PresentGateScope(_presentGate);
+    }
     private DateTimeOffset? _dndUntil;
     private bool _dndAllowUrgent = true;
     private DateTimeOffset _boostedPollUntilUtc = DateTimeOffset.MinValue;
@@ -323,21 +354,57 @@ public sealed class SecretaryController : IDisposable
     private string? _latestChoicesLogicalTaskId;
 
     public IReadOnlyList<string> GetChoicesForMessage(string messageId)
-        => string.Equals(_latestChoicesMsgId, messageId, StringComparison.Ordinal)
-            ? _latestChoices
-            : Array.Empty<string>();
+    {
+        lock (_choicesLock)
+        {
+            return string.Equals(_latestChoicesMsgId, messageId, StringComparison.Ordinal)
+                ? _latestChoices.ToList()
+                : Array.Empty<string>();
+        }
+    }
 
     public string? GetChoicesLogicalTaskIdForMessage(string messageId)
-        => string.Equals(_latestChoicesMsgId, messageId, StringComparison.Ordinal)
-            ? _latestChoicesLogicalTaskId
-            : null;
+    {
+        lock (_choicesLock)
+        {
+            return string.Equals(_latestChoicesMsgId, messageId, StringComparison.Ordinal)
+                ? _latestChoicesLogicalTaskId
+                : null;
+        }
+    }
+
+    private void SetLatestChoices(string messageId, IReadOnlyList<string> choices, string? logicalTaskId)
+    {
+        lock (_choicesLock)
+        {
+            _latestChoicesMsgId = messageId;
+            _latestChoices = choices.Take(4).ToList();
+            _latestChoicesLogicalTaskId = logicalTaskId;
+        }
+    }
+
+    private bool ClearChoicesIfMatching(string? logicalTaskId, bool force = false, bool removePinnedChatChoice = false)
+    {
+        bool matched;
+        lock (_choicesLock)
+        {
+            matched = force || string.Equals(_latestChoicesLogicalTaskId, logicalTaskId, StringComparison.Ordinal);
+        }
+        if (matched)
+            ClearChoices(removePinnedChatChoice);
+        return matched;
+    }
 
     public void ClearChoices(bool removePinnedChatChoice = true)
     {
-        var prevLogicalId = _latestChoicesLogicalTaskId;
-        _latestChoicesMsgId = null;
-        _latestChoices = new List<string>();
-        _latestChoicesLogicalTaskId = null;
+        string? prevLogicalId;
+        lock (_choicesLock)
+        {
+            prevLogicalId = _latestChoicesLogicalTaskId;
+            _latestChoicesMsgId = null;
+            _latestChoices = new List<string>();
+            _latestChoicesLogicalTaskId = null;
+        }
 
         if (removePinnedChatChoice &&
             (string.Equals(prevLogicalId, "chat-choice", StringComparison.Ordinal) ||
@@ -787,32 +854,37 @@ public sealed class SecretaryController : IDisposable
         _agentRuns[taskId] = run;
         AgentsChanged?.Invoke();
 
-        var nowUtc = DateTimeOffset.UtcNow;
-        var userMsg = new ChatMessageRecord
+        var processingStatus = await _localizer.TextAsync("ProcessingStatus", "Processing...", Array.Empty<object?>(), appCt);
+        ChatMessageRecord userMsg;
+        ChatMessageRecord assistantMsg;
+        using (await EnterPresentGateAsync(appCt))
         {
-            ConversationId = ConversationId,
-            Role = "user",
-            Content = prompt,
-            CreatedAt = nowUtc,
-            RevealedAt = nowUtc
-        };
-        await _store.UpsertChatMessageAsync(userMsg);
-
-        var assistantMsg = new ChatMessageRecord
-        {
-            ConversationId = ConversationId,
-            Role = "assistant",
-            Content = "",
-            StatusText = await _localizer.TextAsync("ProcessingStatus", "Processing...", Array.Empty<object?>(), appCt),
-            IsStreaming = true,
-            TaskId = taskId,
-            ReplyToMessageId = userMsg.Id,
-            CreatedAt = nowUtc.AddMilliseconds(5)
-        };
-        ClearChoices(removePinnedChatChoice: true);
-        if (!string.IsNullOrWhiteSpace(replyToLogicalTaskId))
-            RemovePinnedConfirmation(replyToLogicalTaskId);
-        await _store.UpsertChatMessageAsync(assistantMsg);
+            var nowUtc = DateTimeOffset.UtcNow;
+            userMsg = new ChatMessageRecord
+            {
+                ConversationId = ConversationId,
+                Role = "user",
+                Content = prompt,
+                CreatedAt = nowUtc,
+                RevealedAt = nowUtc
+            };
+            assistantMsg = new ChatMessageRecord
+            {
+                ConversationId = ConversationId,
+                Role = "assistant",
+                Content = "",
+                StatusText = processingStatus,
+                IsStreaming = true,
+                TaskId = taskId,
+                ReplyToMessageId = userMsg.Id,
+                CreatedAt = nowUtc.AddMilliseconds(5)
+            };
+            ClearChoices(removePinnedChatChoice: true);
+            if (!string.IsNullOrWhiteSpace(replyToLogicalTaskId))
+                RemovePinnedConfirmation(replyToLogicalTaskId);
+            await _store.UpsertChatMessageAsync(userMsg);
+            await _store.UpsertChatMessageAsync(assistantMsg);
+        }
         StateChanged?.Invoke();
 
         _ = Task.Run(async () =>
@@ -823,17 +895,20 @@ public sealed class SecretaryController : IDisposable
             int replyRevealed = 0;
             Func<CancellationToken, Func<string, List<MailSourceRef>, Task>, Action<string>?, Action<IReadOnlyList<string>>?, Task>? dispatchedWork = null;
 
+            bool userTurnGateAcquired = false;
             string? activePlannerTaskIdThisTurn = null;
             int plannerFinishReported = 0;
             IReadOnlyList<string>? turnLastChoices = null;
             string? turnLastSummary = null;
 
-            // Presentation gate ONLY: never held across any LLM call or Worker/Planner wait.
+            // Presentation gate ONLY: never held across any LLM call or Worker/Planner wait;
+            // UI events (StateChanged / ProactiveAlert) are fired AFTER releasing _presentGate.
             async Task RevealReplyAsync()
             {
                 if (Interlocked.Exchange(ref replyRevealed, 1) != 0) return;
-                await _mainTurnGate.WaitAsync(CancellationToken.None);
-                try
+                bool shouldAlert = false;
+                string alertContent = "";
+                using (await EnterPresentGateAsync(CancellationToken.None))
                 {
                     if (dispatchedWork is null)
                     {
@@ -841,27 +916,19 @@ public sealed class SecretaryController : IDisposable
                         if (run.PlannerState == "Running") run.PlannerState = "Done";
                         if (run.WorkerState == "Running") run.WorkerState = "Done";
                         run.CurrentStep = _localizer.TextCached("StepCompleted", "Completed");
-                        AgentsChanged?.Invoke();
 
                         if (turnLastChoices is { Count: > 0 })
                         {
-                            _latestChoicesMsgId = assistantMsg.Id;
-                            _latestChoices = turnLastChoices.Take(4).ToList();
+                            var choiceList = turnLastChoices.Take(4).ToList();
+                            var choiceLogicalId = activePlannerTaskIdThisTurn ?? "chat-choice";
+                            SetLatestChoices(assistantMsg.Id, choiceList, choiceLogicalId);
                             if (activePlannerTaskIdThisTurn is null)
-                            {
-                                _latestChoicesLogicalTaskId = "chat-choice";
-                                UpsertPinnedConfirmation("chat-choice", run.Goal, pendingText, _latestChoices);
-                            }
-                            else
-                            {
-                                _latestChoicesLogicalTaskId = activePlannerTaskIdThisTurn;
-                            }
+                                UpsertPinnedConfirmation("chat-choice", run.Goal, pendingText, choiceList);
                         }
                     }
                     else
                     {
                         run.MainState = "Done";
-                        AgentsChanged?.Invoke();
                     }
 
                     if (!string.IsNullOrWhiteSpace(pendingText))
@@ -874,9 +941,8 @@ public sealed class SecretaryController : IDisposable
                     assistantMsg.RevealedAt = DateTimeOffset.UtcNow;
 
                     await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
-                    StateChanged?.Invoke();
-                    if (dispatchedWork is null && !string.IsNullOrWhiteSpace(assistantMsg.Content))
-                        ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReply", "AI Secretary Reply"), assistantMsg.Content);
+                    shouldAlert = dispatchedWork is null && !string.IsNullOrWhiteSpace(assistantMsg.Content);
+                    alertContent = assistantMsg.Content;
 
                     if (!string.IsNullOrWhiteSpace(directTtsText) && _tts.IsEnabled && _tts.ChatMode != "notify_only")
                     {
@@ -887,10 +953,10 @@ public sealed class SecretaryController : IDisposable
                         _tts.EnqueueSummarySpeech(_localizer.TextCached("AlertTitleReply", "AI Secretary Reply"), pendingText, kind: SpeechKind.ChatReply);
                     }
                 }
-                finally
-                {
-                    _mainTurnGate.Release();
-                }
+                AgentsChanged?.Invoke();
+                StateChanged?.Invoke();
+                if (shouldAlert)
+                    ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReply", "AI Secretary Reply"), alertContent);
             }
 
             void ReleasePlannerRunningIfUnreported()
@@ -907,6 +973,11 @@ public sealed class SecretaryController : IDisposable
 
             try
             {
+                // Serialize user turns so Q2 always sees Q1's routing outcome and registered <in_flight> tasks.
+                // Released immediately once routing + ack reveal finish (never held by background work).
+                await _userTurnGate.WaitAsync(linked.Token);
+                userTurnGateAcquired = true;
+
                 CleanupExpiredPlannerTasks();
                 // Only expose paused/waiting Planner tasks in <active_planner_tasks>;
                 // currently running Planner tasks are exposed in <in_flight> so the router uses join_task instead of spawning duplicate runs.
@@ -1043,20 +1114,18 @@ public sealed class SecretaryController : IDisposable
                     preferredLogicalTaskId: replyToLogicalTaskId,
                     userMessageId: userMsg.Id);
 
-                // Reveal reply atomically via presentation gate (never held across LLM calls)
+                // Reveal reply atomically via _presentGate (while still inside _userTurnGate so lock order is strictly _userTurnGate -> _presentGate)
                 await RevealReplyAsync();
             }
             catch (OperationCanceledException)
             {
                 var stoppedText = await _localizer.TextAsync("TurnStopped", "(Stopped)", Array.Empty<object?>(), CancellationToken.None);
-                await _mainTurnGate.WaitAsync(CancellationToken.None);
-                try
+                using (await EnterPresentGateAsync(CancellationToken.None))
                 {
                     if (run.MainState == "Running") run.MainState = "Stopped";
                     if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                     if (run.WorkerState == "Running") run.WorkerState = "Stopped";
                     run.CurrentStep = _localizer.TextCached("StepStopped", "Stopped");
-                    AgentsChanged?.Invoke();
 
                     assistantMsg.IsStreaming = false;
                     assistantMsg.StatusText = null;
@@ -1065,42 +1134,37 @@ public sealed class SecretaryController : IDisposable
                         ? stoppedText
                         : assistantMsg.Content + "\n\n" + stoppedText;
                     await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
-                    StateChanged?.Invoke();
                 }
-                finally
-                {
-                    _mainTurnGate.Release();
-                }
+                AgentsChanged?.Invoke();
+                StateChanged?.Invoke();
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Task failed");
                 var errPrefix = await _localizer.TextAsync("ErrorPrefix", "Error", Array.Empty<object?>(), CancellationToken.None);
-                await _mainTurnGate.WaitAsync(CancellationToken.None);
-                try
+                using (await EnterPresentGateAsync(CancellationToken.None))
                 {
                     if (run.MainState == "Running") run.MainState = "Stopped";
                     if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                     if (run.WorkerState == "Running") run.WorkerState = "Stopped";
                     run.CurrentStep = _localizer.TextCached("StepError", "Error: {0}", ex.Message);
-                    AgentsChanged?.Invoke();
 
                     assistantMsg.IsStreaming = false;
                     assistantMsg.StatusText = null;
                     assistantMsg.RevealedAt = DateTimeOffset.UtcNow;
                     assistantMsg.Content = $"❌ {errPrefix}: {ex.Message}";
                     await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
-                    StateChanged?.Invoke();
                 }
-                finally
-                {
-                    _mainTurnGate.Release();
-                }
+                AgentsChanged?.Invoke();
+                StateChanged?.Invoke();
             }
             finally
             {
                 if (Interlocked.Decrement(ref _mainTurnActiveCount) < 0)
                     Interlocked.Exchange(ref _mainTurnActiveCount, 0);
+
+                if (userTurnGateAcquired)
+                    _userTurnGate.Release();
 
                 if (dispatchedWork is null)
                 {
@@ -1146,13 +1210,13 @@ public sealed class SecretaryController : IDisposable
                                 turnLastChoices = bgChoices;
                             });
 
-                        await _mainTurnGate.WaitAsync(linked.Token);
-                        try
+                        // Background presentation ONLY acquires _presentGate (NEVER _userTurnGate).
+                        bool hasReport = false;
+                        using (await EnterPresentGateAsync(linked.Token))
                         {
                             if (run.PlannerState == "Running") run.PlannerState = "Done";
                             if (run.WorkerState == "Running") run.WorkerState = "Done";
                             run.CurrentStep = _localizer.TextCached("StepCompleted", "Completed");
-                            AgentsChanged?.Invoke();
 
                             assistantMsg.IsStreaming = false;
                             assistantMsg.StatusText = null;
@@ -1160,6 +1224,7 @@ public sealed class SecretaryController : IDisposable
 
                             if (!string.IsNullOrWhiteSpace(bgReportText))
                             {
+                                hasReport = true;
                                 var reportNow = DateTimeOffset.UtcNow;
                                 var reportMsg = new ChatMessageRecord
                                 {
@@ -1176,22 +1241,13 @@ public sealed class SecretaryController : IDisposable
 
                                 if (bgChoices is { Count: > 0 })
                                 {
-                                    _latestChoicesMsgId = reportMsg.Id;
-                                    _latestChoices = bgChoices.ToList();
+                                    var choiceLogicalId = activePlannerTaskIdThisTurn ?? "chat-choice";
+                                    SetLatestChoices(reportMsg.Id, bgChoices, choiceLogicalId);
                                     if (activePlannerTaskIdThisTurn is null)
-                                    {
-                                        _latestChoicesLogicalTaskId = "chat-choice";
                                         UpsertPinnedConfirmation("chat-choice", run.Goal, bgReportText, bgChoices);
-                                    }
-                                    else
-                                    {
-                                        _latestChoicesLogicalTaskId = activePlannerTaskIdThisTurn;
-                                    }
                                 }
 
                                 await _store.UpsertChatMessageAsync(reportMsg, CancellationToken.None);
-                                StateChanged?.Invoke();
-                                ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), bgReportText);
 
                                 if (!string.IsNullOrWhiteSpace(bgDirectTtsText) && _tts.IsEnabled && _tts.ChatMode != "notify_only")
                                 {
@@ -1202,26 +1258,20 @@ public sealed class SecretaryController : IDisposable
                                     _tts.EnqueueSummarySpeech(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), bgReportText, kind: SpeechKind.Report);
                                 }
                             }
-                            else
-                            {
-                                StateChanged?.Invoke();
-                            }
                         }
-                        finally
-                        {
-                            _mainTurnGate.Release();
-                        }
+                        AgentsChanged?.Invoke();
+                        StateChanged?.Invoke();
+                        if (hasReport && !string.IsNullOrWhiteSpace(bgReportText))
+                            ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), bgReportText);
                     }
                     catch (OperationCanceledException)
                     {
                         var stoppedText = await _localizer.TextAsync("TurnStopped", "(Stopped)", Array.Empty<object?>(), CancellationToken.None);
-                        await _mainTurnGate.WaitAsync(CancellationToken.None);
-                        try
+                        using (await EnterPresentGateAsync(CancellationToken.None))
                         {
                             if (run.PlannerState == "Running") run.PlannerState = "Stopped";
                             if (run.WorkerState == "Running") run.WorkerState = "Stopped";
                             run.CurrentStep = _localizer.TextCached("StepStopped", "Stopped");
-                            AgentsChanged?.Invoke();
 
                             assistantMsg.IsStreaming = false;
                             assistantMsg.StatusText = null;
@@ -1230,51 +1280,44 @@ public sealed class SecretaryController : IDisposable
                                 ? stoppedText
                                 : assistantMsg.Content + "\n\n" + stoppedText;
                             await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
-                            StateChanged?.Invoke();
                         }
-                        finally
-                        {
-                            _mainTurnGate.Release();
-                        }
+                        AgentsChanged?.Invoke();
+                        StateChanged?.Invoke();
                     }
                     catch (Exception ex)
                     {
                         _logger.LogError(ex, "Background planner/worker task failed");
                         var bgFailedText = await _localizer.TextAsync("BgTaskFailed", "Background task failed: {0}", new object?[] { ex.Message }, CancellationToken.None);
-                        bool acquired = false;
                         try
                         {
-                            await _mainTurnGate.WaitAsync(appCt);
-                            acquired = true;
-                            if (run.PlannerState == "Running") run.PlannerState = "Stopped";
-                            if (run.WorkerState == "Running") run.WorkerState = "Stopped";
-                            run.CurrentStep = _localizer.TextCached("StepError", "Error: {0}", ex.Message);
-                            AgentsChanged?.Invoke();
-
-                            assistantMsg.IsStreaming = false;
-                            assistantMsg.StatusText = null;
-                            await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
-
-                            var errNow = DateTimeOffset.UtcNow;
-                            var errMsg = new ChatMessageRecord
+                            using (await EnterPresentGateAsync(appCt))
                             {
-                                ConversationId = ConversationId,
-                                Role = "assistant",
-                                Content = $"❌ {bgFailedText}",
-                                IsStreaming = false,
-                                TaskId = taskId,
-                                ReplyToMessageId = userMsg.Id,
-                                CreatedAt = errNow,
-                                RevealedAt = errNow
-                            };
-                            await _store.UpsertChatMessageAsync(errMsg, CancellationToken.None);
+                                if (run.PlannerState == "Running") run.PlannerState = "Stopped";
+                                if (run.WorkerState == "Running") run.WorkerState = "Stopped";
+                                run.CurrentStep = _localizer.TextCached("StepError", "Error: {0}", ex.Message);
+
+                                assistantMsg.IsStreaming = false;
+                                assistantMsg.StatusText = null;
+                                await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
+
+                                var errNow = DateTimeOffset.UtcNow;
+                                var errMsg = new ChatMessageRecord
+                                {
+                                    ConversationId = ConversationId,
+                                    Role = "assistant",
+                                    Content = $"❌ {bgFailedText}",
+                                    IsStreaming = false,
+                                    TaskId = taskId,
+                                    ReplyToMessageId = userMsg.Id,
+                                    CreatedAt = errNow,
+                                    RevealedAt = errNow
+                                };
+                                await _store.UpsertChatMessageAsync(errMsg, CancellationToken.None);
+                            }
+                            AgentsChanged?.Invoke();
                             StateChanged?.Invoke();
                         }
                         catch { }
-                        finally
-                        {
-                            if (acquired) _mainTurnGate.Release();
-                        }
                     }
                     finally
                     {
@@ -1314,12 +1357,7 @@ public sealed class SecretaryController : IDisposable
     public void ClosePlannerTask(string logicalId)
     {
         if (string.IsNullOrWhiteSpace(logicalId)) return;
-        bool clearedChoices = false;
-        if (string.Equals(_latestChoicesLogicalTaskId, logicalId, StringComparison.Ordinal))
-        {
-            ClearChoices(removePinnedChatChoice: false);
-            clearedChoices = true;
-        }
+        bool clearedChoices = ClearChoicesIfMatching(logicalId, removePinnedChatChoice: false);
         if (_activePlannerTasks.TryGetValue(logicalId, out var state) && Volatile.Read(ref state.RunningCount) <= 0)
         {
             _activePlannerTasks.TryRemove(logicalId, out _);
@@ -1470,16 +1508,19 @@ public sealed class SecretaryController : IDisposable
             replyText = await _stateMachine.AcceptProposalAsync(ConversationId, triggerKey, _appCts.Token);
         }
 
-        var now = DateTimeOffset.UtcNow;
-        var msg = new ChatMessageRecord
+        using (await EnterPresentGateAsync(_appCts.Token))
         {
-            ConversationId = ConversationId,
-            Role = "assistant",
-            Content = replyText,
-            CreatedAt = now,
-            RevealedAt = now
-        };
-        await _store.UpsertChatMessageAsync(msg, _appCts.Token);
+            var now = DateTimeOffset.UtcNow;
+            var msg = new ChatMessageRecord
+            {
+                ConversationId = ConversationId,
+                Role = "assistant",
+                Content = replyText,
+                CreatedAt = now,
+                RevealedAt = now
+            };
+            await _store.UpsertChatMessageAsync(msg, _appCts.Token);
+        }
         StateChanged?.Invoke();
         ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReply", "AI Secretary Reply"), replyText);
     }
@@ -1494,8 +1535,7 @@ public sealed class SecretaryController : IDisposable
                 var (reply, ttsText) = await _mainAgent.SynthesizeJoinedFollowUpReplyAsync(ConversationId, result, joinedFollowUps, _appCts.Token);
                 if (string.IsNullOrWhiteSpace(reply)) return;
 
-                await _mainTurnGate.WaitAsync(_appCts.Token);
-                try
+                using (await EnterPresentGateAsync(_appCts.Token))
                 {
                     var now = DateTimeOffset.UtcNow;
                     var msg = new ChatMessageRecord
@@ -1509,18 +1549,14 @@ public sealed class SecretaryController : IDisposable
                         RevealedAt = now
                     };
                     await _store.UpsertChatMessageAsync(msg, CancellationToken.None);
-                    StateChanged?.Invoke();
-                    ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), reply);
 
                     if (!string.IsNullOrWhiteSpace(ttsText) && _tts.IsEnabled && _tts.ChatMode != "notify_only")
                         _tts.EnqueueJapaneseSpeech(ttsText);
                     else
                         _tts.EnqueueSummarySpeech(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), reply, kind: SpeechKind.Report);
                 }
-                finally
-                {
-                    _mainTurnGate.Release();
-                }
+                StateChanged?.Invoke();
+                ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), reply);
             }
             catch (Exception ex)
             {
@@ -1609,11 +1645,10 @@ public sealed class SecretaryController : IDisposable
         }
         else if (removed?.Kind == PinnedItemKind.Confirmation)
         {
-            if (string.Equals(_latestChoicesLogicalTaskId, removed.LogicalTaskId, StringComparison.Ordinal) ||
-                string.Equals(id, "confirm:chat-choice", StringComparison.Ordinal))
-            {
-                ClearChoices(removePinnedChatChoice: false);
-            }
+            ClearChoicesIfMatching(
+                removed.LogicalTaskId,
+                force: string.Equals(id, "confirm:chat-choice", StringComparison.Ordinal),
+                removePinnedChatChoice: false);
             if (!string.IsNullOrWhiteSpace(removed.LogicalTaskId) &&
                 !string.Equals(removed.LogicalTaskId, "chat-choice", StringComparison.Ordinal))
             {
@@ -1764,8 +1799,7 @@ public sealed class SecretaryController : IDisposable
         var created = await _store.TryCreateNotificationAsync(convId, payload, ct);
         if (!created) return;
 
-        await _mainTurnGate.WaitAsync(ct);
-        try
+        using (await EnterPresentGateAsync(ct))
         {
             var now = DateTimeOffset.UtcNow;
             var msg = new ChatMessageRecord
@@ -1780,19 +1814,14 @@ public sealed class SecretaryController : IDisposable
             };
             await _store.UpsertChatMessageAsync(msg, ct);
             AddPinnedReminder(new PinnedReminderItem(payload.NotificationId, title, summary, mail?.Id, payload, reRemindMinutes));
-            StateChanged?.Invoke();
-            RaiseProactiveAlert(title, summary);
         }
-        finally
-        {
-            _mainTurnGate.Release();
-        }
+        StateChanged?.Invoke();
+        RaiseProactiveAlert(title, summary);
     }
 
     private async Task PushPetMessageAsync(string content, CancellationToken ct = default)
     {
-        await _mainTurnGate.WaitAsync(ct);
-        try
+        using (await EnterPresentGateAsync(ct))
         {
             var now = DateTimeOffset.UtcNow;
             var msg = new ChatMessageRecord
@@ -1804,13 +1833,9 @@ public sealed class SecretaryController : IDisposable
                 RevealedAt = now
             };
             await _store.UpsertChatMessageAsync(msg, ct);
-            StateChanged?.Invoke();
-            RaiseProactiveAlert(_localizer.TextCached("AlertTitleDefault", "AI Secretary"), content);
         }
-        finally
-        {
-            _mainTurnGate.Release();
-        }
+        StateChanged?.Invoke();
+        RaiseProactiveAlert(_localizer.TextCached("AlertTitleDefault", "AI Secretary"), content);
     }
 
     private void RaiseProactiveAlert(string title, string content)

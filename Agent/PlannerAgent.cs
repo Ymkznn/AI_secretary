@@ -269,6 +269,7 @@ public sealed class PlannerAgent
                 foreach (var r in concurrentBb)
                 {
                     if (r.Version > lastBbVersion) lastBbVersion = r.Version;
+                    if (!r.IsUserInitiated && !r.IsSignificant) continue;
                     var note = $"[Concurrent background result ({r.Kind}) at {r.CompletedAt.ToLocalTime():HH:mm:ss}]: {r.Goal} -> {r.Summary}";
                     if (!observations.Any(o => o.Contains(r.Summary, StringComparison.Ordinal)))
                     {

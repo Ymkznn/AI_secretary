@@ -103,8 +103,13 @@ public sealed class MailSyncService
                 summary += "\nNew emails:\n" + string.Join("\n", lines);
             }
 
-            var dedupeKey = newMails.Count == 0 && notes.Count == 0 ? $"mail_sync_empty:{mode}" : null;
-            _blackboard.CompleteTask(bbId, "mail_sync", bbGoal, summary, succeeded: notes.Count == 0 || newMails.Count > 0, dedupeKey: dedupeKey);
+            bool hasNotableChanges = newMails.Count > 0 || notes.Count > 0;
+            var dedupeKey = hasNotableChanges ? null : $"mail_sync_empty:{mode}";
+            _blackboard.CompleteTask(
+                bbId, "mail_sync", bbGoal, summary,
+                succeeded: notes.Count == 0 || newMails.Count > 0,
+                recordInRecent: hasNotableChanges,
+                dedupeKey: dedupeKey);
             completed = true;
             return summary;
         }
