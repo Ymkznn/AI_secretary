@@ -27,6 +27,7 @@ public sealed record AttentionContextResult(
 public sealed class AttentionContextService
 {
     public const int StaleThresholdSeconds = 120;
+    public const int RecentChatSuppressionMinutes = 3;
     public const int MaxBlockChars = 1150; // ~500 tokens max
     private static readonly TimeSpan SelectionFetchTimeout = TimeSpan.FromMilliseconds(300);
     private static readonly TimeSpan ImplicitFeedbackWindow = TimeSpan.FromSeconds(90);
@@ -109,6 +110,11 @@ public sealed class AttentionContextService
         var effectiveCapturedAt = (cachedMatchesTab && cachedPage!.CapturedAt > target.CapturedAt)
             ? cachedPage.CapturedAt
             : target.CapturedAt;
+
+        // Behavioral signal: if the assistant just replied within the last 3 minutes and the user has NOT
+        // switched to an external window since that reply, "這個/上面" almost certainly refers to the chat reply, not the screen.
+        if (ShouldSkipForRecentChat(effectiveCapturedAt, recentMessages, now))
+            return null;
 
         int ageSec = Math.Max(0, (int)(now - effectiveCapturedAt).TotalSeconds);
         bool isStale = ageSec > StaleThresholdSeconds;
@@ -261,6 +267,28 @@ public sealed class AttentionContextService
 
         if (logId > 0)
             _lastLogs[conversationId] = new LastDeixisLog(logId, DateTimeOffset.UtcNow);
+    }
+
+    internal static bool ShouldSkipForRecentChat(
+        DateTimeOffset externalCapturedAt,
+        IReadOnlyList<ChatMessageRecord> recentMessages,
+        DateTimeOffset now)
+    {
+        if (recentMessages.Count == 0)
+            return false;
+
+        var lastAssistant = recentMessages
+            .LastOrDefault(m => string.Equals(m.Role, "assistant", StringComparison.OrdinalIgnoreCase)
+                                && !m.IsStreaming
+                                && !string.IsNullOrWhiteSpace(m.Content));
+        if (lastAssistant is null)
+            return false;
+
+        var lastAssistantAt = lastAssistant.RevealedAt ?? lastAssistant.CreatedAt;
+        var sinceReply = now - lastAssistantAt;
+        return sinceReply >= TimeSpan.Zero
+               && sinceReply <= TimeSpan.FromMinutes(RecentChatSuppressionMinutes)
+               && externalCapturedAt < lastAssistantAt;
     }
 
     internal static string FormatFreshBlock(

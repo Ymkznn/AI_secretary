@@ -49,6 +49,7 @@ public sealed class ActivityMonitorService : IDisposable
     private nint _lastRawHwnd;
     private string? _lastVisitedTitle;
     private bool _wasSelfForeground;
+    private int _uiaSelectionInFlight;
 
     private static readonly HashSet<string> SensitiveProcesses = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -120,9 +121,24 @@ public sealed class ActivityMonitorService : IDisposable
         if (target.Hwnd == IntPtr.Zero || SensitiveProcesses.Contains(target.ProcessName))
             return null;
 
+        // Single-flight guard: if a previous UIA inspection on a large document is still unwinding after timeout,
+        // skip this attempt instead of piling up background thread-pool work.
+        if (Interlocked.CompareExchange(ref _uiaSelectionInFlight, 1, 0) != 0)
+            return null;
+
         try
         {
-            var work = Task.Run(() => ReadDesktopSelectionSync(target.Hwnd, target.ProcessId));
+            var work = Task.Run(() =>
+            {
+                try
+                {
+                    return ReadDesktopSelectionSync(target.Hwnd, target.ProcessId);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _uiaSelectionInFlight, 0);
+                }
+            });
             using var delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var completed = await Task.WhenAny(work, Task.Delay(timeout, delayCts.Token));
             if (completed == work)
