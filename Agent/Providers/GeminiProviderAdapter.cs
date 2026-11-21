@@ -93,6 +93,30 @@ public sealed class GeminiProviderAdapter : ILlmProviderAdapter
         return new TokenUsage(nonCachedInput, 0, cache, output);
     }
 
+    public string? ExtractStopReason(JsonElement root)
+    {
+        if (root.TryGetProperty("candidates", out var candidates) &&
+            candidates.ValueKind == JsonValueKind.Array &&
+            candidates.GetArrayLength() > 0 &&
+            candidates[0].TryGetProperty("finishReason", out var fr) &&
+            fr.ValueKind == JsonValueKind.String)
+        {
+            var val = fr.GetString()?.Trim();
+            if (!string.IsNullOrWhiteSpace(val)) return val;
+        }
+
+        if (root.TryGetProperty("promptFeedback", out var pf) &&
+            pf.ValueKind == JsonValueKind.Object &&
+            pf.TryGetProperty("blockReason", out var br) &&
+            br.ValueKind == JsonValueKind.String)
+        {
+            var val = br.GetString()?.Trim();
+            if (!string.IsNullOrWhiteSpace(val)) return val;
+        }
+
+        return null;
+    }
+
     private static object[] BuildParts(string text)
     {
         var enriched = AttachmentExtractor.EnrichTextWithDocumentAttachments(text);

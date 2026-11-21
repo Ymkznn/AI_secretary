@@ -44,7 +44,8 @@ public sealed record ModelResponse(
     int InputTokens = 0,
     int OutputTokens = 0,
     int CacheTokens = 0,
-    int CacheWriteTokens = 0);
+    int CacheWriteTokens = 0,
+    string? StopReason = null);
 
 public interface IModelGateway
 {

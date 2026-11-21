@@ -276,7 +276,9 @@ public sealed class SqliteStore
                 Output INTEGER NOT NULL DEFAULT 0,
                 LatencyMs INTEGER NOT NULL DEFAULT 0,
                 Succeeded INTEGER NOT NULL DEFAULT 1,
-                Error TEXT NULL
+                Error TEXT NULL,
+                StopReason TEXT NULL,
+                RawTextLength INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS IX_LlmCallLogs_Ts ON LlmCallLogs(TimestampUtc DESC);
             CREATE TABLE IF NOT EXISTS LearningEvents (
@@ -337,7 +339,9 @@ public sealed class SqliteStore
             "ALTER TABLE AutoStateRules ADD COLUMN CooldownUntil TEXT NULL;",
             "ALTER TABLE AutoStateRules ADD COLUMN ProposalText TEXT NULL;",
             "ALTER TABLE ChatMessages ADD COLUMN ReplyToMessageId TEXT NULL;",
-            "ALTER TABLE ChatMessages ADD COLUMN RevealedAt TEXT NULL;"
+            "ALTER TABLE ChatMessages ADD COLUMN RevealedAt TEXT NULL;",
+            "ALTER TABLE LlmCallLogs ADD COLUMN StopReason TEXT NULL;",
+            "ALTER TABLE LlmCallLogs ADD COLUMN RawTextLength INTEGER NOT NULL DEFAULT 0;"
         })
         {
             try
@@ -2422,8 +2426,8 @@ public sealed class SqliteStore
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO LlmCallLogs (TimestampUtc, Agent, Tier, Model, CachePolicy, Priority, UncachedInput, CacheWrite, CacheRead, Output, LatencyMs, Succeeded, Error)
-            VALUES (@ts, @agent, @tier, @model, @cp, @prio, @inTok, @cw, @cr, @outTok, @lat, @ok, @err);
+            INSERT INTO LlmCallLogs (TimestampUtc, Agent, Tier, Model, CachePolicy, Priority, UncachedInput, CacheWrite, CacheRead, Output, LatencyMs, Succeeded, Error, StopReason, RawTextLength)
+            VALUES (@ts, @agent, @tier, @model, @cp, @prio, @inTok, @cw, @cr, @outTok, @lat, @ok, @err, @stop, @rawLen);
             """;
         cmd.Parameters.AddWithValue("@ts", rec.TimestampUtc.ToString("O"));
         cmd.Parameters.AddWithValue("@agent", rec.Agent);
@@ -2438,6 +2442,8 @@ public sealed class SqliteStore
         cmd.Parameters.AddWithValue("@lat", rec.LatencyMs);
         cmd.Parameters.AddWithValue("@ok", rec.Succeeded ? 1 : 0);
         cmd.Parameters.AddWithValue("@err", string.IsNullOrWhiteSpace(rec.Error) ? DBNull.Value : rec.Error);
+        cmd.Parameters.AddWithValue("@stop", string.IsNullOrWhiteSpace(rec.StopReason) ? DBNull.Value : rec.StopReason);
+        cmd.Parameters.AddWithValue("@rawLen", rec.RawTextLength);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
@@ -2445,7 +2451,7 @@ public sealed class SqliteStore
     {
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT Id, TimestampUtc, Agent, Tier, Model, CachePolicy, Priority, UncachedInput, CacheWrite, CacheRead, Output, LatencyMs, Succeeded, Error FROM LlmCallLogs ORDER BY Id DESC LIMIT @lim;";
+        cmd.CommandText = "SELECT Id, TimestampUtc, Agent, Tier, Model, CachePolicy, Priority, UncachedInput, CacheWrite, CacheRead, Output, LatencyMs, Succeeded, Error, StopReason, RawTextLength FROM LlmCallLogs ORDER BY Id DESC LIMIT @lim;";
         cmd.Parameters.AddWithValue("@lim", Math.Clamp(limit, 1, 200));
         var list = new List<LlmCallLogRecord>();
         await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -2465,7 +2471,9 @@ public sealed class SqliteStore
                 Output: r.GetInt32(10),
                 LatencyMs: r.GetInt32(11),
                 Succeeded: r.GetInt32(12) != 0,
-                Error: r.IsDBNull(13) ? null : r.GetString(13)));
+                Error: r.IsDBNull(13) ? null : r.GetString(13),
+                StopReason: r.IsDBNull(14) ? null : r.GetString(14),
+                RawTextLength: r.IsDBNull(15) ? 0 : r.GetInt32(15)));
         }
         return list;
     }

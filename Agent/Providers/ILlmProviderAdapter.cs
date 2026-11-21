@@ -15,4 +15,5 @@ public interface ILlmProviderAdapter
     string BuildRequestJson(IReadOnlyList<ModelMessage> messages, string model, CachePolicy cachePolicy = CachePolicy.Conversation);
     string ExtractResponseText(JsonElement root);
     TokenUsage ExtractUsage(JsonElement root);
+    string? ExtractStopReason(JsonElement root) => null;
 }

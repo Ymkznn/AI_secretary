@@ -177,6 +177,22 @@ public sealed class UiLocalizer
         return SafeFormat(englishTemplate, args);
     }
 
+    /// <summary>
+    /// Strictly zero-LLM synchronous lookup: returns cached localized template if already pre-cached,
+    /// otherwise formats <paramref name="fallbackTemplate"/> directly without spawning any background translation LLM call.
+    /// </summary>
+    public string TextCachedOnly(string key, string fallbackTemplate, params object?[] args)
+    {
+        if (string.IsNullOrWhiteSpace(fallbackTemplate))
+            return "";
+
+        var lang = CurrentLanguage;
+        if (_cache.TryGetValue(lang, out var langCache) && langCache.TryGetValue(key, out var cachedTpl))
+            return SafeFormat(cachedTpl, args);
+
+        return SafeFormat(fallbackTemplate, args);
+    }
+
     private async Task<string> TranslateAndCacheDedupAsync(string lang, string key, string englishTemplate, CancellationToken ct)
     {
         var lazy = _inFlight.GetOrAdd(

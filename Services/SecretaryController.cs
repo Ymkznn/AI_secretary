@@ -1272,6 +1272,7 @@ public sealed class SecretaryController : IDisposable
 
                         // Background presentation ONLY acquires _presentGate (NEVER _userTurnGate).
                         bool hasReport = false;
+                        string? alertBody = null;
                         using (await EnterPresentGateAsync(linked.Token))
                         {
                             if (run.PlannerState == "Running") run.PlannerState = "Done";
@@ -1282,47 +1283,42 @@ public sealed class SecretaryController : IDisposable
                             assistantMsg.StatusText = null;
                             await _store.UpsertChatMessageAsync(assistantMsg, CancellationToken.None);
 
-                            if (!string.IsNullOrWhiteSpace(bgReportText))
+                            // Last line of defense: never leave the user stuck on "正在規劃步驟..." with no report.
+                            var (persistedReport, persistedMsg) = await PersistBackgroundReportOrFallbackAsync(
+                                _store,
+                                ConversationId,
+                                taskId,
+                                userMsg.Id,
+                                assistantMsg,
+                                bgReportText,
+                                bgSources,
+                                _localizer,
+                                CancellationToken.None);
+
+                            hasReport = true;
+                            alertBody = persistedReport;
+
+                            if (bgChoices is { Count: > 0 })
                             {
-                                hasReport = true;
-                                var reportNow = DateTimeOffset.UtcNow;
-                                var reportMsg = new ChatMessageRecord
-                                {
-                                    ConversationId = ConversationId,
-                                    Role = "assistant",
-                                    Content = bgReportText,
-                                    Sources = bgSources ?? new List<MailSourceRef>(),
-                                    IsStreaming = false,
-                                    TaskId = taskId,
-                                    ReplyToMessageId = userMsg.Id,
-                                    CreatedAt = reportNow,
-                                    RevealedAt = reportNow
-                                };
+                                var choiceLogicalId = activePlannerTaskIdThisTurn ?? "chat-choice";
+                                SetLatestChoices(persistedMsg.Id, bgChoices, choiceLogicalId);
+                                if (activePlannerTaskIdThisTurn is null)
+                                    UpsertPinnedConfirmation("chat-choice", run.Goal, persistedReport, bgChoices);
+                            }
 
-                                if (bgChoices is { Count: > 0 })
-                                {
-                                    var choiceLogicalId = activePlannerTaskIdThisTurn ?? "chat-choice";
-                                    SetLatestChoices(reportMsg.Id, bgChoices, choiceLogicalId);
-                                    if (activePlannerTaskIdThisTurn is null)
-                                        UpsertPinnedConfirmation("chat-choice", run.Goal, bgReportText, bgChoices);
-                                }
-
-                                await _store.UpsertChatMessageAsync(reportMsg, CancellationToken.None);
-
-                                if (!string.IsNullOrWhiteSpace(bgDirectTtsText) && _tts.IsEnabled && _tts.ChatMode != "notify_only")
-                                {
-                                    _tts.EnqueueJapaneseSpeech(bgDirectTtsText);
-                                }
-                                else if (string.IsNullOrWhiteSpace(bgDirectTtsText))
-                                {
-                                    _tts.EnqueueSummarySpeech(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), bgReportText, kind: SpeechKind.Report);
-                                }
+                            if (!string.IsNullOrWhiteSpace(bgDirectTtsText) && _tts.IsEnabled && _tts.ChatMode != "notify_only")
+                            {
+                                _tts.EnqueueJapaneseSpeech(bgDirectTtsText);
+                            }
+                            else if (string.IsNullOrWhiteSpace(bgDirectTtsText))
+                            {
+                                _tts.EnqueueSummarySpeech(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), persistedReport, kind: SpeechKind.Report);
                             }
                         }
                         AgentsChanged?.Invoke();
                         StateChanged?.Invoke();
-                        if (hasReport && !string.IsNullOrWhiteSpace(bgReportText))
-                            ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), bgReportText);
+                        if (hasReport && !string.IsNullOrWhiteSpace(alertBody))
+                            ProactiveAlert?.Invoke(_localizer.TextCached("AlertTitleReport", "AI Secretary Report"), alertBody);
                     }
                     catch (OperationCanceledException)
                     {
@@ -1400,6 +1396,77 @@ public sealed class SecretaryController : IDisposable
                 });
             }
         });
+    }
+
+    /// <summary>
+    /// Last line of defense for background Planner/Worker reporting: guarantees a non-empty message is ALWAYS
+    /// persisted to ChatMessages (never silently dropped, never stuck on "正在規劃步驟...").
+    /// </summary>
+    internal static async Task<(string Content, ChatMessageRecord Message)> PersistBackgroundReportOrFallbackAsync(
+        SqliteStore store,
+        string conversationId,
+        string taskId,
+        string userMessageId,
+        ChatMessageRecord assistantAckMsg,
+        string? bgReportText,
+        List<MailSourceRef>? bgSources,
+        UiLocalizer localizer,
+        CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (!string.IsNullOrWhiteSpace(bgReportText))
+        {
+            var reportMsg = new ChatMessageRecord
+            {
+                ConversationId = conversationId,
+                Role = "assistant",
+                Content = bgReportText,
+                Sources = bgSources ?? new List<MailSourceRef>(),
+                IsStreaming = false,
+                TaskId = taskId,
+                ReplyToMessageId = userMessageId,
+                CreatedAt = now,
+                RevealedAt = now
+            };
+            await store.UpsertChatMessageAsync(reportMsg, ct);
+            return (bgReportText, reportMsg);
+        }
+
+        // bgReportText was unexpectedly empty (e.g. background delegate didn't emit text):
+        // update the ack placeholder in-place if it's a generic planning/processing placeholder,
+        // or append a fallback report message so the user always sees what happened.
+        var fallback = localizer.TextCachedOnly("EmptyReplyGeneric", "這次沒有產生回覆，請再試一次。");
+        var ackText = (assistantAckMsg.Content ?? "").Trim();
+        bool isPlaceholderAck = string.IsNullOrWhiteSpace(ackText) ||
+                                ackText.Contains("正在規劃", StringComparison.Ordinal) ||
+                                ackText.Contains("處理中", StringComparison.Ordinal) ||
+                                ackText.Contains("Processing", StringComparison.OrdinalIgnoreCase) ||
+                                ackText.Contains("Working on it", StringComparison.OrdinalIgnoreCase);
+
+        if (isPlaceholderAck)
+        {
+            assistantAckMsg.Content = fallback;
+            assistantAckMsg.IsStreaming = false;
+            assistantAckMsg.StatusText = null;
+            assistantAckMsg.RevealedAt = now;
+            await store.UpsertChatMessageAsync(assistantAckMsg, ct);
+            return (fallback, assistantAckMsg);
+        }
+
+        var fallbackMsg = new ChatMessageRecord
+        {
+            ConversationId = conversationId,
+            Role = "assistant",
+            Content = fallback,
+            Sources = bgSources ?? new List<MailSourceRef>(),
+            IsStreaming = false,
+            TaskId = taskId,
+            ReplyToMessageId = userMessageId,
+            CreatedAt = now,
+            RevealedAt = now
+        };
+        await store.UpsertChatMessageAsync(fallbackMsg, ct);
+        return (fallback, fallbackMsg);
     }
 
     public void StopTask(string taskId)

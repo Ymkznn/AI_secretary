@@ -133,6 +133,8 @@ public sealed class FoundryModelGateway : IModelGateway
             var root = doc.RootElement;
 
             string text = adapter.ExtractResponseText(root);
+            string? stopReason = adapter.ExtractStopReason(root);
+            int rawTextLength = text.Length;
             var usage = adapter.ExtractUsage(root);
             int uncachedIn = usage.UncachedInput;
             int cacheWrite = usage.CacheWrite;
@@ -140,13 +142,13 @@ public sealed class FoundryModelGateway : IModelGateway
             int outTok = usage.Output;
             if (uncachedIn == 0 && cacheWrite == 0 && cacheRead == 0)
                 uncachedIn = Math.Max(16, messages.Sum(m => m.Content.Length) / 3);
-            if (outTok == 0)
-                outTok = Math.Max(8, text.Length / 3);
+            if (outTok == 0 && rawTextLength > 0)
+                outTok = Math.Max(8, rawTextLength / 3);
 
-            await AccumulateAndLogUsageAsync(options, model, uncachedIn, cacheWrite, cacheRead, outTok, (int)sw.ElapsedMilliseconds, ct);
+            await AccumulateAndLogUsageAsync(options, model, uncachedIn, cacheWrite, cacheRead, outTok, (int)sw.ElapsedMilliseconds, stopReason, rawTextLength, ct);
 
             var tokens = Math.Max(64, uncachedIn + cacheWrite + cacheRead + outTok);
-            return new ModelResponse(text, tokens, uncachedIn, outTok, cacheRead, cacheWrite);
+            return new ModelResponse(text, tokens, uncachedIn, outTok, cacheRead, cacheWrite, stopReason);
         }
     }
 
@@ -299,6 +301,8 @@ public sealed class FoundryModelGateway : IModelGateway
         int cacheRead,
         int outTok,
         int latencyMs,
+        string? stopReason,
+        int rawTextLength,
         CancellationToken ct)
     {
         await UsageLock.WaitAsync(ct);
@@ -321,7 +325,10 @@ public sealed class FoundryModelGateway : IModelGateway
                 CacheRead: cacheRead,
                 Output: outTok,
                 LatencyMs: latencyMs,
-                Succeeded: true), ct);
+                Succeeded: true,
+                Error: null,
+                StopReason: stopReason,
+                RawTextLength: rawTextLength), ct);
         }
         catch (Exception ex)
         {

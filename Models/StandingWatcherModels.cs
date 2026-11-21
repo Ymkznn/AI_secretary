@@ -137,7 +137,9 @@ public sealed record LlmCallLogRecord(
     int Output,
     int LatencyMs,
     bool Succeeded,
-    string? Error = null);
+    string? Error = null,
+    string? StopReason = null,
+    int RawTextLength = 0);
 
 public sealed record AgentUsageSummary(
     string Agent,

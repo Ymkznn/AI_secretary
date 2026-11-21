@@ -309,6 +309,13 @@ public sealed class MainAgent
 
         await _sessions.RecordTokensAsync(mainSession, routeResp.EstimatedTokens, ct: ct);
 
+        if (string.IsNullOrWhiteSpace(routeResp.Content))
+        {
+            onStageChanged?.Invoke("main_done", _localizer.TextCached("StageMainDone", "MainAgent replied directly"));
+            await onReplyAsync(BuildEmptyReplyFallback(routeResp.StopReason, _localizer), new List<MailSourceRef>());
+            return;
+        }
+
         var (action, targetTaskId, closeTaskId, tier, memoryWorthy, directReply, ack, ttsText, choices, skill, args, goal) = ParseRoute(routeResp.Content, userPrompt);
         var effectiveGoal = string.IsNullOrWhiteSpace(goal) ? userPrompt : goal;
 
@@ -729,9 +736,8 @@ public sealed class MainAgent
         WorkerAgent.CleanupTempScreenshots(observations);
         await _sessions.RecordTokensAsync(mainSession, finalResp.EstimatedTokens, ct: ct);
 
-        var (clean0, finalChoices) = WorkerAgent.ExtractAndStripChoices(finalResp.Content);
-        var (clean1, finalTtsText) = WorkerAgent.ExtractAndStripTtsText(clean0);
-        var (cleanFinal, isTaskDone) = ExtractAndStripTaskStatus(clean1, finalChoices.Count > 0);
+        var (cleanFinal, finalChoices, finalTtsText, isTaskDone, usedFallback) =
+            ResolveFinalReplyOrFallback(finalResp, _localizer);
 
         if (!string.IsNullOrWhiteSpace(bbTaskId) && !string.IsNullOrWhiteSpace(cleanFinal))
             _blackboard.RefineResultSummary(bbTaskId, cleanFinal);
@@ -743,8 +749,52 @@ public sealed class MainAgent
         await onReplyAsync(cleanFinal, sources);
         onTaskCompleted?.Invoke(isTaskDone);
 
-        if (completedSteps.Count > 0)
+        if (completedSteps.Count > 0 && !usedFallback)
             _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, completedSteps, observations, cleanFinal);
+    }
+
+    internal static bool IsRefusalStopReason(string? stopReason)
+    {
+        if (string.IsNullOrWhiteSpace(stopReason)) return false;
+        var norm = stopReason.Trim().ToLowerInvariant();
+        return norm is "refusal" or "content_filter" or "safety" or "recitation" or "blocklist" or "prohibited_content" or "spii"
+               || norm.Contains("refus", StringComparison.Ordinal)
+               || norm.Contains("content_filter", StringComparison.Ordinal);
+    }
+
+    internal static bool IsLengthTruncatedStopReason(string? stopReason)
+    {
+        if (string.IsNullOrWhiteSpace(stopReason)) return false;
+        var norm = stopReason.Trim().ToLowerInvariant();
+        return norm is "max_tokens" or "length" or "max_output_tokens";
+    }
+
+    /// <summary>
+    /// Zero-LLM deterministic explanation when a model returns empty text after tag stripping
+    /// (e.g. API refusal, content_filter, max_tokens truncation, or tag-only output).
+    /// Uses <see cref="UiLocalizer.TextCachedOnly"/> so we NEVER issue another LLM call (even background translation) for error text.
+    /// </summary>
+    internal static string BuildEmptyReplyFallback(string? stopReason, UiLocalizer localizer)
+    {
+        if (IsRefusalStopReason(stopReason))
+            return localizer.TextCachedOnly("EmptyReplyRefusal", "這題被模型的安全機制擋下了，可以換個方式描述，例如只問觀念。");
+        if (IsLengthTruncatedStopReason(stopReason))
+            return localizer.TextCachedOnly("EmptyReplyMaxTokens", "回覆太長被截斷了。");
+        return localizer.TextCachedOnly("EmptyReplyGeneric", "這次沒有產生回覆，請再試一次。");
+    }
+
+    internal static (string CleanReply, IReadOnlyList<string> Choices, string? TtsText, bool IsTaskDone, bool UsedFallback)
+        ResolveFinalReplyOrFallback(ModelResponse resp, UiLocalizer localizer)
+    {
+        var (clean0, choices) = WorkerAgent.ExtractAndStripChoices(resp.Content ?? "");
+        var (clean1, ttsText) = WorkerAgent.ExtractAndStripTtsText(clean0);
+        var (cleanFinal, isTaskDone) = ExtractAndStripTaskStatus(clean1, choices.Count > 0);
+
+        if (!string.IsNullOrWhiteSpace(cleanFinal))
+            return (cleanFinal, choices, string.IsNullOrWhiteSpace(ttsText) ? null : ttsText, isTaskDone, false);
+
+        var fallback = BuildEmptyReplyFallback(resp.StopReason, localizer);
+        return (fallback, Array.Empty<string>(), null, true, true);
     }
 
     /// <summary>
@@ -779,9 +829,7 @@ public sealed class MainAgent
             ct);
         await _sessions.RecordTokensAsync(mainSession, resp.EstimatedTokens, ct: ct);
 
-        var (clean0, choices) = WorkerAgent.ExtractAndStripChoices(resp.Content);
-        var (clean1, ttsText) = WorkerAgent.ExtractAndStripTtsText(clean0);
-        var (cleanFinal, _) = ExtractAndStripTaskStatus(clean1, choices.Count > 0);
+        var (cleanFinal, choices, ttsText, _, _) = ResolveFinalReplyOrFallback(resp, _localizer);
 
         if (choices.Count > 0)
             onChoices?.Invoke(choices);
@@ -817,9 +865,8 @@ public sealed class MainAgent
         }, new LlmCallOptions("MainAgent.JoinedSystemReply", ModelTier.Simple, CachePolicy.None, LlmPriority.Interactive), ct);
 
         await _sessions.RecordTokensAsync(mainSession, resp.EstimatedTokens, ct: ct);
-        var (clean0, _) = WorkerAgent.ExtractAndStripChoices(resp.Content);
-        var (clean1, ttsText) = WorkerAgent.ExtractAndStripTtsText(clean0);
-        return (clean1, string.IsNullOrWhiteSpace(ttsText) ? null : ttsText);
+        var (cleanFinal, _, ttsText, _, _) = ResolveFinalReplyOrFallback(resp, _localizer);
+        return (cleanFinal, ttsText);
     }
 
     private static readonly string[] WaitingOrStatusSignals =

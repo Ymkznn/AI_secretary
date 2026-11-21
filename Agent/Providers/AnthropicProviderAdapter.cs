@@ -126,6 +126,16 @@ public sealed class AnthropicProviderAdapter : ILlmProviderAdapter
         return new TokenUsage(uncachedInput, cacheWrite, cacheRead, output);
     }
 
+    public string? ExtractStopReason(JsonElement root)
+    {
+        if (root.TryGetProperty("stop_reason", out var sr) && sr.ValueKind == JsonValueKind.String)
+        {
+            var val = sr.GetString()?.Trim();
+            if (!string.IsNullOrWhiteSpace(val)) return val;
+        }
+        return null;
+    }
+
     private static object BuildContent(string text, bool withCacheControl)
     {
         var enriched = AttachmentExtractor.EnrichTextWithDocumentAttachments(text);

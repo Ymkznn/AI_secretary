@@ -71,6 +71,36 @@ public sealed class OpenAiCompatibleProviderAdapter : ILlmProviderAdapter
         return new TokenUsage(nonCachedInput, 0, cache, output);
     }
 
+    public string? ExtractStopReason(JsonElement root)
+    {
+        if (root.TryGetProperty("choices", out var choices) &&
+            choices.ValueKind == JsonValueKind.Array &&
+            choices.GetArrayLength() > 0 &&
+            choices[0].TryGetProperty("finish_reason", out var fr) &&
+            fr.ValueKind == JsonValueKind.String)
+        {
+            var val = fr.GetString()?.Trim();
+            if (!string.IsNullOrWhiteSpace(val)) return val;
+        }
+
+        if (root.TryGetProperty("incomplete_details", out var inc) &&
+            inc.ValueKind == JsonValueKind.Object &&
+            inc.TryGetProperty("reason", out var reasonEl) &&
+            reasonEl.ValueKind == JsonValueKind.String)
+        {
+            var val = reasonEl.GetString()?.Trim();
+            if (!string.IsNullOrWhiteSpace(val)) return val;
+        }
+
+        if (root.TryGetProperty("status", out var st) && st.ValueKind == JsonValueKind.String)
+        {
+            var val = st.GetString()?.Trim();
+            if (!string.IsNullOrWhiteSpace(val)) return val;
+        }
+
+        return null;
+    }
+
     private static object BuildContent(string text)
     {
         var enriched = AttachmentExtractor.EnrichTextWithDocumentAttachments(text);
