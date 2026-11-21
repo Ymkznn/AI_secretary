@@ -65,7 +65,7 @@ public sealed class ActivityMonitorService : IDisposable
 
     private static readonly HashSet<string> BrowserProcesses = new(StringComparer.OrdinalIgnoreCase)
     {
-        "chrome", "msedge", "firefox", "brave", "opera", "vivaldi"
+        "chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "arc"
     };
 
     public event Action<ExternalWindowTarget, string?>? WindowFocused;
@@ -247,16 +247,86 @@ public sealed class ActivityMonitorService : IDisposable
         return null;
     }
 
-    public Task<(bool Ok, string Message)> TryFillOtpInExternalWindowAsync(string code, string? serviceHint = null, CancellationToken ct = default, string? displayHandle = null)
+    /// <summary>
+    /// Tightened target selector for L1 / manual UIA OTP fallback (L2 NEVER uses UIA).
+    /// NEVER blindly falls back to an unrelated non-browser window (such as LINE, Discord, or Notepad).
+    /// </summary>
+    internal static ExternalWindowTarget? SelectOtpUiaTarget(
+        IReadOnlyList<ExternalWindowTarget> targets,
+        string? serviceHint,
+        string? expectedDomain,
+        string? senderName,
+        bool allowBrowserFallback = true)
     {
-        // Zero-LLM path: uses TextCached only so L2 OTP auto-fill never triggers a localization LLM call.
+        if (targets is null || targets.Count == 0)
+            return null;
+
+        var eligible = targets.Where(t => !SensitiveProcesses.Contains(t.ProcessName)).ToList();
+        if (eligible.Count == 0)
+            return null;
+
+        var domain = string.IsNullOrWhiteSpace(expectedDomain) || string.Equals(expectedDomain.Trim(), "unknown", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : expectedDomain.Trim().ToLowerInvariant();
+        var domainStem = domain is not null ? OtpExtractor.ExtractDomainStem(domain) : "";
+
+        bool MatchesDomainOrSender(ExternalWindowTarget t)
+        {
+            if (domain is not null)
+            {
+                if (t.Title.Contains(domain, StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (domainStem.Length >= 3 && t.Title.Contains(domainStem, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            if (!string.IsNullOrWhiteSpace(senderName) && SharesKeyword(t.Title, senderName))
+                return true;
+            return false;
+        }
+
+        // 1) Strongest match: browser window whose title matches expectedDomain or senderName
+        var matchedBrowser = eligible.FirstOrDefault(t => IsBrowserProcess(t.ProcessName) && MatchesDomainOrSender(t));
+        if (matchedBrowser is not null)
+            return matchedBrowser;
+
+        // 2) Native desktop app (non-browser) whose title explicitly matches expectedDomain or senderName
+        var matchedNative = eligible.FirstOrDefault(t => !IsBrowserProcess(t.ProcessName) && MatchesDomainOrSender(t));
+        if (matchedNative is not null)
+            return matchedNative;
+
+        // 3) When neither domain nor sender metadata is available, allow explicit serviceHint title match
+        if (domain is null && string.IsNullOrWhiteSpace(senderName) && !string.IsNullOrWhiteSpace(serviceHint))
+        {
+            var hintMatch = eligible.FirstOrDefault(t => IsBrowserProcess(t.ProcessName) && SharesKeyword(t.Title, serviceHint))
+                         ?? eligible.FirstOrDefault(t => SharesKeyword(t.Title, serviceHint));
+            if (hintMatch is not null)
+                return hintMatch;
+        }
+
+        // 4) Browser-only fallback: ONLY when allowed AND the most recent external window itself is a browser
+        //    (e.g. Firefox without extension showing a generic "Sign in" title). Never targets LINE/Discord/Notepad.
+        if (allowBrowserFallback && IsBrowserProcess(eligible[0].ProcessName))
+            return eligible[0];
+
+        return null;
+    }
+
+    public Task<(bool Ok, string Message)> TryFillOtpInExternalWindowAsync(
+        string code,
+        string? serviceHint = null,
+        CancellationToken ct = default,
+        string? displayHandle = null,
+        string? expectedDomain = null,
+        string? senderName = null,
+        bool allowBrowserFallback = true)
+    {
+        // Zero-LLM path: uses TextCached only.
         if (string.IsNullOrWhiteSpace(code))
             return Task.FromResult((false, _localizer.TextCached("OtpEmpty", "Verification code is empty.")));
 
         var handleTag = string.IsNullOrWhiteSpace(displayHandle) ? "otp" : displayHandle;
         var targets = GetRecentExternalTargets();
-        var target = targets.FirstOrDefault(t => !string.IsNullOrWhiteSpace(serviceHint) && SharesKeyword(t.Title, serviceHint))
-                     ?? targets.FirstOrDefault();
+        var target = SelectOtpUiaTarget(targets, serviceHint, expectedDomain, senderName, allowBrowserFallback);
 
         if (target is null)
             return Task.FromResult((false, _localizer.TextCached("OtpTargetMissing", "No matching external browser or login window found.")));

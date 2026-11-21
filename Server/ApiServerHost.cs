@@ -68,8 +68,10 @@ public sealed class ApiServerHost : IAsyncDisposable
             requestId,
             fills = fills.Select(f => new { fieldId = f.FieldId, value = f.Value, label = f.Label, name = f.Name }).ToList()
         });
-        _browserBridge.FillOtpRequested += (requestId, code) => BroadcastEvent("browser_fill_otp", new { requestId, code });
-        _browserBridge.ClearOtpRequested += requestId => BroadcastEvent("browser_clear_otp", new { requestId });
+        _browserBridge.FillOtpRequested += (requestId, code, expectedDomain, requireOtpField) =>
+            BroadcastEvent("browser_fill_otp", new { requestId, code, expectedDomain, requireOtpField });
+        _browserBridge.ClearOtpRequested += (requestId, expectedDomain) =>
+            BroadcastEvent("browser_clear_otp", new { requestId, expectedDomain });
         _browserBridge.TitleRequested += requestId => BroadcastEvent("browser_title_request", new { requestId });
         _browserBridge.SelectionRequested += requestId => BroadcastEvent("browser_selection_request", new { requestId });
     }

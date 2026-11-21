@@ -156,8 +156,9 @@ public sealed class MailSyncService
 
             if (decision == MailRuleDecision.NeedsAiTriage)
             {
+                var safeMail = RedactMailForTriage(mail);
                 var triageTaskId = $"mail_triage:{mail.Id}";
-                var triageGoal = $"Analyze new email: {mail.Subject}";
+                var triageGoal = $"Analyze new email: {safeMail.Subject}";
                 _blackboard.StartTask(triageTaskId, "mail_sync", triageGoal);
                 _ = Task.Run(async () =>
                 {
@@ -165,16 +166,16 @@ public sealed class MailSyncService
                     await _triageGate.WaitAsync(ct);
                     try
                     {
-                        var triage = await _planner.TriageMailEventAsync(mail, conversationId, ct);
-                        var (safeTitle, safeSummary, safeActions) = VaultAndRedactTriage(mail, triage, deterministicHandle);
+                        var triage = await _planner.TriageMailEventAsync(safeMail, conversationId, ct);
+                        var (safeTitle, safeSummary, safeActions) = VaultAndRedactTriage(safeMail, triage, deterministicHandle);
                         var bbSummary = triage.Urgent
                             ? $"Urgent email [{safeTitle}]: {safeSummary}"
-                            : $"Non-urgent email from {mail.SenderName} ({mail.Subject})";
+                            : $"Non-urgent email from {safeMail.SenderName} ({safeMail.Subject})";
                         _blackboard.CompleteTask(triageTaskId, "mail_sync", triageGoal, bbSummary, succeeded: true, recordInRecent: triage.Urgent);
                         triageDone = true;
                         if (triage.Urgent)
                         {
-                            await onNotifyAsync(eventId, mail, safeTitle, safeSummary, triage.ReRemindMinutes, safeActions);
+                            await onNotifyAsync(eventId, safeMail, safeTitle, safeSummary, triage.ReRemindMinutes, safeActions);
                         }
                     }
                     catch (Exception ex)
@@ -242,8 +243,9 @@ public sealed class MailSyncService
 
             if (decision == MailRuleDecision.NeedsAiTriage)
             {
+                var safeMail = RedactMailForTriage(mail);
                 var triageTaskId = $"mail_triage:{mail.Id}";
-                var triageGoal = $"Analyze new email: {mail.Subject}";
+                var triageGoal = $"Analyze new email: {safeMail.Subject}";
                 _blackboard.StartTask(triageTaskId, "mail_sync", triageGoal);
                 _ = Task.Run(async () =>
                 {
@@ -251,16 +253,16 @@ public sealed class MailSyncService
                     await _triageGate.WaitAsync(ct);
                     try
                     {
-                        var triage = await _planner.TriageMailEventAsync(mail, conversationId, ct);
-                        var (safeTitle, safeSummary, safeActions) = VaultAndRedactTriage(mail, triage, deterministicHandle);
+                        var triage = await _planner.TriageMailEventAsync(safeMail, conversationId, ct);
+                        var (safeTitle, safeSummary, safeActions) = VaultAndRedactTriage(safeMail, triage, deterministicHandle);
                         var bbSummary = triage.Urgent
                             ? $"Urgent email [{safeTitle}]: {safeSummary}"
-                            : $"Non-urgent email from {mail.SenderName} ({mail.Subject})";
+                            : $"Non-urgent email from {safeMail.SenderName} ({safeMail.Subject})";
                         _blackboard.CompleteTask(triageTaskId, "mail_sync", triageGoal, bbSummary, succeeded: true, recordInRecent: triage.Urgent);
                         triageDone = true;
                         if (triage.Urgent)
                         {
-                            await onNotifyAsync(eventId, mail, safeTitle, safeSummary, triage.ReRemindMinutes, safeActions);
+                            await onNotifyAsync(eventId, safeMail, safeTitle, safeSummary, triage.ReRemindMinutes, safeActions);
                         }
                     }
                     catch (Exception ex)
@@ -282,6 +284,17 @@ public sealed class MailSyncService
 
         return processed;
     }
+
+    internal MailItem RedactMailForTriage(MailItem mail)
+        => RedactMailForTriage(_vault, mail);
+
+    internal static MailItem RedactMailForTriage(SecretVaultService vault, MailItem mail)
+        => mail with
+        {
+            Subject = vault.RedactKnownSecrets(mail.Subject),
+            Snippet = vault.RedactKnownSecrets(mail.Snippet),
+            Body = vault.RedactKnownSecrets(mail.Body)
+        };
 
     private string? TryEmitDeterministicOtpEvent(MailItem mail)
     {

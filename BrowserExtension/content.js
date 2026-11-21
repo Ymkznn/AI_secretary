@@ -317,18 +317,45 @@
     return rect.width > 0 && rect.height > 0;
   }
 
-  function fillOtp(rawCode) {
+  const STRICT_OTP_HINT_RE = /otp|code|verify|verification|one[-_ ]?time|passcode|驗證碼|認證碼|動態密碼|認証コード/i;
+  const LOOSE_OTP_HINT_RE = /otp|one[-_ ]?time|code|verify|verification|token|auth|pin|passcode|2fa|mfa|驗證|認證|動態密碼|認証/i;
+
+  function isStrictOtpInput(el) {
+    if (!el || (el.tagName || '').toLowerCase() !== 'input') return false;
+    const ac = (el.getAttribute('autocomplete') || '').toLowerCase().trim();
+    if (ac === 'one-time-code') return true;
+    const maxLen = Number(el.maxLength || 0);
+    const inputMode = (el.getAttribute('inputmode') || el.inputMode || '').toLowerCase().trim();
+    const lbl = findLabel(el, el.ownerDocument);
+    const meta = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${lbl}`;
+    return STRICT_OTP_HINT_RE.test(meta) && maxLen >= 4 && maxLen <= 8 && inputMode === 'numeric';
+  }
+
+  function isStrictMultiBoxOtp(singleCharBoxes) {
+    if (singleCharBoxes.length < 4 || singleCharBoxes.length > 8) return false;
+    return singleCharBoxes.some(el => {
+      const ac = (el.getAttribute('autocomplete') || '').toLowerCase().trim();
+      const im = (el.getAttribute('inputmode') || el.inputMode || '').toLowerCase().trim();
+      const meta = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''}`;
+      return ac === 'one-time-code' || im === 'numeric' || STRICT_OTP_HINT_RE.test(meta);
+    }) || STRICT_OTP_HINT_RE.test(document.title || '');
+  }
+
+  function fillOtp(rawCode, requireStrictOtpField = false) {
     const code = String(rawCode ?? '').trim();
     if (!code) return { filled: false, title: document.title, url: location.href, error: 'empty code' };
 
     const inputs = queryAllDeep(document, 'input').filter(isVisibleInput);
     if (inputs.length === 0) {
-      return { filled: false, title: document.title, url: location.href, error: 'no visible inputs' };
+      return { filled: false, title: document.title, url: location.href, error: requireStrictOtpField ? 'no_otp_field' : 'no visible inputs' };
     }
 
     // Case A: Multi-box OTP (e.g. 4-8 single-character boxes)
     const singleCharBoxes = inputs.filter(el => el.maxLength === 1);
-    if (singleCharBoxes.length >= 4 && singleCharBoxes.length <= 8) {
+    const multiAllowed = requireStrictOtpField
+      ? isStrictMultiBoxOtp(singleCharBoxes)
+      : (singleCharBoxes.length >= 4 && singleCharBoxes.length <= 8);
+    if (multiAllowed) {
       const targetBoxes = singleCharBoxes.slice(0, code.length);
       if (targetBoxes.length === code.length) {
         for (let i = 0; i < targetBoxes.length; i++) {
@@ -338,16 +365,17 @@
       }
     }
 
-    // Case B: Single OTP input (scored by semantic & input hints)
-    const otpRegex = /otp|one[-_ ]?time|code|verify|verification|token|auth|pin|passcode|2fa|mfa|驗證|認証/i;
+    // Case B: Single OTP input (strict verification required on L2 auto-fill so generic search/text boxes are never filled)
     let best = null;
     let bestScore = -1;
 
     for (const el of inputs) {
+      if (requireStrictOtpField && !isStrictOtpInput(el)) continue;
+
       const type = (el.type || 'text').toLowerCase();
       const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
-      const hintText = `${el.id} ${el.name} ${el.placeholder} ${el.getAttribute('aria-label') || ''}`;
-      const isOtpHint = otpRegex.test(hintText);
+      const hintText = `${el.id} ${el.name} ${el.placeholder} ${el.getAttribute('aria-label') || ''} ${findLabel(el, el.ownerDocument)}`;
+      const isOtpHint = LOOSE_OTP_HINT_RE.test(hintText);
       if (type === 'password' && !isOtpHint && ac !== 'one-time-code') continue;
 
       let score = 1;
@@ -363,7 +391,7 @@
     }
 
     if (!best) {
-      return { filled: false, title: document.title, url: location.href, error: 'no matching otp input' };
+      return { filled: false, title: document.title, url: location.href, error: requireStrictOtpField ? 'no_otp_field' : 'no matching otp input' };
     }
 
     setNativeValue(best, code);
@@ -377,22 +405,21 @@
     }
 
     const singleCharBoxes = inputs.filter(el => el.maxLength === 1);
-    if (singleCharBoxes.length >= 4 && singleCharBoxes.length <= 8) {
+    if (isStrictMultiBoxOtp(singleCharBoxes)) {
       for (const box of singleCharBoxes) {
         setNativeValue(box, '');
       }
       return { filled: true, mode: `clear_multi(${singleCharBoxes.length})`, title: document.title, url: location.href };
     }
 
-    const otpRegex = /otp|one[-_ ]?time|code|verify|verification|token|auth|pin|passcode|2fa|mfa|驗證|認證|動態密碼|認証/i;
     let best = null;
     let bestScore = -1;
     for (const el of inputs) {
       const type = (el.type || 'text').toLowerCase();
       const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
-      const hintText = `${el.id} ${el.name} ${el.placeholder} ${el.getAttribute('aria-label') || ''}`;
-      const isOtpHint = otpRegex.test(hintText);
-      if (type === 'password' && !isOtpHint && ac !== 'one-time-code') continue;
+      const hintText = `${el.id} ${el.name} ${el.placeholder} ${el.getAttribute('aria-label') || ''} ${findLabel(el, el.ownerDocument)}`;
+      const isOtpHint = LOOSE_OTP_HINT_RE.test(hintText);
+      if (ac !== 'one-time-code' && !isOtpHint) continue;
       let score = 1;
       if (ac === 'one-time-code') score += 10;
       if (isOtpHint) score += 5;
@@ -400,7 +427,7 @@
       if (score > bestScore) { bestScore = score; best = el; }
     }
     if (!best) {
-      return { filled: false, title: document.title, url: location.href, error: 'no matching otp input to clear' };
+      return { filled: false, title: document.title, url: location.href, error: 'no_otp_field' };
     }
     setNativeValue(best, '');
     return { filled: true, mode: 'clear_single', title: document.title, url: location.href };
@@ -496,7 +523,7 @@
         const res = h.applyFills(msg.fills, msg.framePrefix || '');
         sendResponse({ applied: res.appliedCount, result: res });
       } else if (msg?.type === 'FILL_OTP') {
-        sendResponse(h.fillOtp(msg.code));
+        sendResponse(h.fillOtp(msg.code, Boolean(msg.requireOtpField)));
       } else if (msg?.type === 'CLEAR_OTP') {
         sendResponse(h.clearOtp());
       }

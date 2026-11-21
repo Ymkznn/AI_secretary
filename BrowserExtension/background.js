@@ -20,10 +20,49 @@ function scheduleReportPageSignal(tab) {
 }
 let lastPingAt = 0;
 
+const TWO_LEVEL_PUBLIC_SUFFIXES = new Set([
+  'com.tw', 'org.tw', 'net.tw', 'edu.tw', 'gov.tw', 'idv.tw', 'game.tw', 'ebiz.tw', 'club.tw',
+  'co.jp', 'ne.jp', 'or.jp', 'go.jp', 'ac.jp', 'ed.jp', 'gr.jp',
+  'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'me.uk', 'net.uk',
+  'com.hk', 'org.hk', 'net.hk', 'edu.hk', 'gov.hk',
+  'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au',
+  'com.sg', 'org.sg', 'net.sg', 'edu.sg', 'gov.sg',
+  'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn',
+  'co.kr', 'or.kr', 'ne.kr', 'go.kr', 'ac.kr',
+  'co.nz', 'org.nz', 'net.nz', 'govt.nz',
+  'com.br', 'com.my', 'com.mx', 'com.tr', 'co.in', 'co.id', 'co.th', 'com.vn', 'com.ph'
+]);
+
+function extractRegistrableDomain(raw) {
+  if (!raw) return '';
+  let host = '';
+  try {
+    const s = String(raw).trim();
+    if (!s) return '';
+    if (s.includes('://')) {
+      host = new URL(s).hostname.toLowerCase();
+    } else {
+      host = s.toLowerCase().replace(/\.+$/, '');
+    }
+  } catch {
+    return '';
+  }
+  if (!host || host === 'localhost' || /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')) {
+    return host;
+  }
+  const parts = host.split('.').filter(Boolean);
+  if (parts.length <= 2) return parts.join('.');
+  const lastTwo = `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+  if (TWO_LEVEL_PUBLIC_SUFFIXES.has(lastTwo)) {
+    return `${parts[parts.length - 3]}.${lastTwo}`;
+  }
+  return lastTwo;
+}
+
 async function getTargetTab() {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!tab || !tab.id || tab.incognito) return null;
-  if (tab.url && !/^https?:/i.test(tab.url)) return null;
+  if (!tab.url || !/^https?:/i.test(tab.url)) return null;
   return tab;
 }
 
@@ -404,24 +443,32 @@ async function handleApplyFills(requestId, fills) {
   } catch {}
 }
 
-async function handleFillOtp(requestId, code) {
-  let result = { filled: false, error: 'no active tab' };
+async function handleFillOtp(requestId, code, expectedDomain = null, requireOtpField = false) {
+  let result = { filled: false, error: 'no_eligible_tab' };
   try {
     const tab = await getTargetTab();
     if (tab) {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id, allFrames: true },
-        files: ['content.js']
-      });
-      const frameResults = await chrome.scripting.executeScript({
-        target: { tabId: tab.id, allFrames: true },
-        args: [code],
-        func: (otpCode) => {
-          return window.__aiSecretaryHelper ? window.__aiSecretaryHelper.fillOtp(otpCode) : null;
-        }
-      });
-      const hit = (frameResults || []).map(r => r?.result).find(r => r?.filled);
-      result = hit || (frameResults || []).map(r => r?.result).find(Boolean) || { filled: false, error: 'no response' };
+      const wantDomain = extractRegistrableDomain(expectedDomain);
+      const actualDomain = extractRegistrableDomain(tab.url);
+      if (requireOtpField && !wantDomain) {
+        result = { filled: false, error: 'domain_mismatch', url: tab.url || '', title: tab.title || '' };
+      } else if (wantDomain && (!actualDomain || actualDomain !== wantDomain)) {
+        result = { filled: false, error: 'domain_mismatch', url: tab.url || '', title: tab.title || '' };
+      } else {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          files: ['content.js']
+        });
+        const frameResults = await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          args: [code, Boolean(requireOtpField)],
+          func: (otpCode, strict) => {
+            return window.__aiSecretaryHelper ? window.__aiSecretaryHelper.fillOtp(otpCode, strict) : null;
+          }
+        });
+        const hit = (frameResults || []).map(r => r?.result).find(r => r?.filled);
+        result = hit || (frameResults || []).map(r => r?.result).find(Boolean) || { filled: false, error: requireOtpField ? 'no_otp_field' : 'no response' };
+      }
     }
   } catch (e) {
     result = { filled: false, error: String(e?.message || e) };
@@ -436,21 +483,27 @@ async function handleFillOtp(requestId, code) {
   } catch {}
 }
 
-async function handleClearOtp(requestId) {
-  let result = { filled: false, error: 'no active tab' };
+async function handleClearOtp(requestId, expectedDomain = null) {
+  let result = { filled: false, error: 'no_eligible_tab' };
   try {
     const tab = await getTargetTab();
     if (tab) {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id, allFrames: true },
-        files: ['content.js']
-      });
-      const frameResults = await chrome.scripting.executeScript({
-        target: { tabId: tab.id, allFrames: true },
-        func: () => (window.__aiSecretaryHelper ? window.__aiSecretaryHelper.clearOtp() : null)
-      });
-      const hit = (frameResults || []).map(r => r?.result).find(r => r?.filled);
-      result = hit || (frameResults || []).map(r => r?.result).find(Boolean) || { filled: false, error: 'no response' };
+      const wantDomain = extractRegistrableDomain(expectedDomain);
+      const actualDomain = extractRegistrableDomain(tab.url);
+      if (wantDomain && (!actualDomain || actualDomain !== wantDomain)) {
+        result = { filled: false, error: 'domain_mismatch', url: tab.url || '', title: tab.title || '' };
+      } else {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          files: ['content.js']
+        });
+        const frameResults = await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          func: () => (window.__aiSecretaryHelper ? window.__aiSecretaryHelper.clearOtp() : null)
+        });
+        const hit = (frameResults || []).map(r => r?.result).find(r => r?.filled);
+        result = hit || (frameResults || []).map(r => r?.result).find(Boolean) || { filled: false, error: 'no response' };
+      }
     }
   } catch (e) {
     result = { filled: false, error: String(e?.message || e) };
@@ -616,14 +669,16 @@ function connectSse() {
     lastPingAt = Date.now();
     try {
       const data = JSON.parse(ev.data);
-      if (data?.requestId && data?.code) handleFillOtp(data.requestId, data.code);
+      if (data?.requestId && data?.code) {
+        handleFillOtp(data.requestId, data.code, data.expectedDomain || null, Boolean(data.requireOtpField));
+      }
     } catch {}
   });
   sse.addEventListener('browser_clear_otp', (ev) => {
     lastPingAt = Date.now();
     try {
       const data = JSON.parse(ev.data);
-      if (data?.requestId) handleClearOtp(data.requestId);
+      if (data?.requestId) handleClearOtp(data.requestId, data.expectedDomain || null);
     } catch {}
   });
   sse.addEventListener('browser_title_request', (ev) => {

@@ -51,13 +51,14 @@ public sealed class FillOtpSkill : IBasicSkill
             return;
         }
 
-        // Convert any direct input into a single-use vault handle so observations NEVER log plaintext OTP digits.
+        // Resolve handle WITHOUT consuming it yet; only consume after fill succeeds.
         string handle;
         string realCode;
+        SecretMetadata? meta;
         if (SecretVaultService.IsOtpHandle(rawArg))
         {
             handle = rawArg.Trim().ToLowerInvariant();
-            if (!_vault.TryConsume(handle, out realCode, out _))
+            if (!_vault.TryResolve(handle, out realCode, out meta))
             {
                 ctx.MarkFailed();
                 ctx.Observations.Add($"fill_otp: handle {handle} has already been used or expired.");
@@ -67,7 +68,7 @@ public sealed class FillOtpSkill : IBasicSkill
         else
         {
             handle = _vault.StoreOtp(rawArg);
-            if (!_vault.TryConsume(handle, out realCode, out _))
+            if (!_vault.TryResolve(handle, out realCode, out meta))
             {
                 ctx.MarkFailed();
                 ctx.Observations.Add("fill_otp: failed to resolve OTP handle.");
@@ -79,24 +80,56 @@ public sealed class FillOtpSkill : IBasicSkill
         if (string.IsNullOrWhiteSpace(hint) || hint.Contains("{{", StringComparison.Ordinal))
             hint = ev?.Title ?? _skills.LastObservedOtpHint;
 
+        var expectedDomain = !string.IsNullOrWhiteSpace(meta?.SenderDomain) &&
+                             !string.Equals(meta.SenderDomain, "unknown", StringComparison.OrdinalIgnoreCase)
+            ? meta.SenderDomain
+            : null;
+
         var skillName = ctx.EffectiveName(Name);
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{skillName}", StatusText));
-        var extRes = await _browserBridge.RequestFillOtpAsync(realCode, TimeSpan.FromMilliseconds(1500), ctx.Ct);
+        var extRes = await _browserBridge.RequestFillOtpAsync(
+            realCode,
+            TimeSpan.FromMilliseconds(1500),
+            ctx.Ct,
+            expectedDomain: expectedDomain,
+            requireOtpField: false);
         if (extRes is { Filled: true })
         {
+            _vault.MarkConsumed(handle);
             var title = string.IsNullOrWhiteSpace(extRes.Title) ? "browser tab" : extRes.Title.Trim();
             ctx.Observations.Add($"{skillName} succeeded via Browser Extension ({extRes.Mode ?? "dom"}) on \"{title}\" (filled {handle}, not submitted).");
             ctx.CompletedSteps.Add(skillName);
             return;
         }
 
-        var (ok, msg) = await _activity.TryFillOtpInExternalWindowAsync(realCode, hint, ctx.Ct, handle);
-        ctx.Observations.Add(ok
-            ? $"{skillName} succeeded via UIA: filled {handle} ({msg})"
-            : $"{skillName} failed: {msg}");
-        if (ok)
-            ctx.CompletedSteps.Add(skillName);
-        else
+        bool domainMismatched = string.Equals(extRes?.Error, "domain_mismatch", StringComparison.OrdinalIgnoreCase);
+        if (domainMismatched &&
+            _activity.GetLastExternalTarget() is { } lastWin &&
+            ActivityMonitorService.IsBrowserProcess(lastWin.ProcessName))
+        {
             ctx.MarkFailed();
+            ctx.Observations.Add($"{skillName} rejected: active browser tab domain does not match expected domain '{expectedDomain}' ({handle} remains available).");
+            return;
+        }
+
+        var (ok, msg) = await _activity.TryFillOtpInExternalWindowAsync(
+            realCode,
+            hint,
+            ctx.Ct,
+            displayHandle: handle,
+            expectedDomain: expectedDomain,
+            senderName: meta?.SenderName,
+            allowBrowserFallback: !domainMismatched);
+        if (ok)
+        {
+            _vault.MarkConsumed(handle);
+            ctx.Observations.Add($"{skillName} succeeded via UIA: filled {handle} ({msg})");
+            ctx.CompletedSteps.Add(skillName);
+        }
+        else
+        {
+            ctx.Observations.Add($"{skillName} failed: {msg} ({handle} remains available).");
+            ctx.MarkFailed();
+        }
     }
 }

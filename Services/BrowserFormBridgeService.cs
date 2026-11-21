@@ -64,8 +64,10 @@ public sealed class BrowserFormBridgeService
     public event Action<string, string?, int>? DomRequested;
     /// <summary>(requestId, fills). The extension must POST the outcome to /api/browser/fill-result/{requestId}.</summary>
     public event Action<string, IReadOnlyList<BrowserFillAction>>? ApplyFillsRequested;
-    public event Action<string, string>? FillOtpRequested;
-    public event Action<string>? ClearOtpRequested;
+    /// <summary>(requestId, code, expectedDomain, requireOtpField).</summary>
+    public event Action<string, string, string?, bool>? FillOtpRequested;
+    /// <summary>(requestId, expectedDomain).</summary>
+    public event Action<string, string?>? ClearOtpRequested;
     public event Action<string>? TitleRequested;
     public event Action<string>? SelectionRequested;
 
@@ -75,11 +77,19 @@ public sealed class BrowserFormBridgeService
     public Task<BrowserDomSnapshot?> RequestActiveTabDomAsync(string? selector, int maxChars, TimeSpan timeout, CancellationToken ct = default)
         => WaitWithTimeoutAsync(_domWaiters, id => DomRequested?.Invoke(id, selector, maxChars), timeout, ct);
 
-    public Task<BrowserOtpFillResult?> RequestFillOtpAsync(string code, TimeSpan timeout, CancellationToken ct = default)
-        => WaitWithTimeoutAsync(_otpWaiters, id => FillOtpRequested?.Invoke(id, code), timeout, ct);
+    public Task<BrowserOtpFillResult?> RequestFillOtpAsync(
+        string code,
+        TimeSpan timeout,
+        CancellationToken ct = default,
+        string? expectedDomain = null,
+        bool requireOtpField = false)
+        => WaitWithTimeoutAsync(_otpWaiters, id => FillOtpRequested?.Invoke(id, code, expectedDomain, requireOtpField), timeout, ct);
 
-    public Task<BrowserOtpFillResult?> RequestClearOtpAsync(TimeSpan timeout, CancellationToken ct = default)
-        => WaitWithTimeoutAsync(_clearOtpWaiters, id => ClearOtpRequested?.Invoke(id), timeout, ct);
+    public Task<BrowserOtpFillResult?> RequestClearOtpAsync(
+        TimeSpan timeout,
+        CancellationToken ct = default,
+        string? expectedDomain = null)
+        => WaitWithTimeoutAsync(_clearOtpWaiters, id => ClearOtpRequested?.Invoke(id, expectedDomain), timeout, ct);
 
     public Task<BrowserTabTitleResult?> RequestActiveTabTitleAsync(TimeSpan timeout, CancellationToken ct = default)
         => WaitWithTimeoutAsync(_titleWaiters, id => TitleRequested?.Invoke(id), timeout, ct);

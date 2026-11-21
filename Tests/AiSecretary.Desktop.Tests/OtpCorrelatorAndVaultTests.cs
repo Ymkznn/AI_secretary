@@ -264,4 +264,203 @@ public sealed class OtpCorrelatorAndVaultTests
             try { if (File.Exists(tempDb + "-shm")) File.Delete(tempDb + "-shm"); } catch { }
         }
     }
+
+    [Fact]
+    public async Task L2AutoFill_DomainMismatch_RejectsFill_AndHandleRemainsUsable()
+    {
+        var clock = new DateTimeOffset(2026, 11, 21, 10, 0, 0, TimeSpan.Zero);
+        var vault = new SecretVaultService(() => clock);
+        var handle = vault.StoreOtp("482910", "pchome.com.tw", "PChome", "m-pc");
+
+        var page = new OtpPageSignal(
+            Url: "https://member.pchome.com.tw/login/otp",
+            Host: "member.pchome.com.tw",
+            RegistrableDomain: "pchome.com.tw",
+            Title: "PChome 24h 登入驗證",
+            Headings: new[] { "輸入驗證碼" },
+            OtpFieldPresent: true,
+            OtpFieldFocused: true,
+            ObservedAtUtc: clock);
+
+        var browserWindow = new ExternalWindowTarget(
+            Hwnd: (nint)1001, ProcessId: 42, ProcessName: "chrome",
+            Title: "PChome 24h 登入驗證 - Google Chrome", CapturedAt: clock);
+
+        string? capturedExpectedDomain = null;
+        bool? capturedRequireOtp = null;
+
+        // Simulate extension rejecting due to active tab domain mismatch (e.g. tab switched right before fill)
+        var mismatchRes = await SecretaryController.TryExecuteL2AutoFillAsync(
+            vault,
+            page,
+            handle,
+            browserWindow,
+            (code, expectedDomain, requireOtpField, _) =>
+            {
+                capturedExpectedDomain = expectedDomain;
+                capturedRequireOtp = requireOtpField;
+                return Task.FromResult<BrowserOtpFillResult?>(
+                    new BrowserOtpFillResult(Filled: false, Url: "https://www.google.com/", Title: "Google", Error: "domain_mismatch"));
+            },
+            CancellationToken.None);
+
+        Assert.Equal("pchome.com.tw", capturedExpectedDomain);
+        Assert.True(capturedRequireOtp);
+        Assert.Equal(SecretaryController.L2OtpFillOutcome.DowngradedToL1, mismatchRes.Outcome);
+        Assert.Equal("domain_mismatch", mismatchRes.Reason);
+
+        // Handle MUST still be resolvable & usable after domain mismatch!
+        Assert.True(vault.TryResolve(handle, out var stillAliveCode, out _));
+        Assert.Equal("482910", stillAliveCode);
+
+        // Once user switches back to matching domain, fill succeeds and THEN consumes the handle.
+        var okRes = await SecretaryController.TryExecuteL2AutoFillAsync(
+            vault,
+            page,
+            handle,
+            browserWindow,
+            (code, expectedDomain, requireOtpField, _) =>
+                Task.FromResult<BrowserOtpFillResult?>(
+                    new BrowserOtpFillResult(Filled: true, Title: page.Title, Url: page.Url, Mode: "single")),
+            CancellationToken.None);
+
+        Assert.Equal(SecretaryController.L2OtpFillOutcome.Filled, okRes.Outcome);
+        Assert.False(vault.TryResolve(handle, out _, out _));
+        Assert.False(vault.TryConsume(handle, out _, out _));
+    }
+
+    [Fact]
+    public async Task FailedFill_DoesNotConsumeHandle_UntilFillActuallySucceeds()
+    {
+        var clock = new DateTimeOffset(2026, 11, 21, 10, 0, 0, TimeSpan.Zero);
+        var vault = new SecretVaultService(() => clock);
+        var handle = vault.StoreOtp("135883", "tenso.com", "tenso", "m-tenso");
+
+        var page = new OtpPageSignal(
+            Url: "https://login.tenso.com/verify",
+            Host: "login.tenso.com",
+            RegistrableDomain: "tenso.com",
+            Title: "tenso Verify",
+            Headings: Array.Empty<string>(),
+            OtpFieldPresent: true,
+            OtpFieldFocused: true,
+            ObservedAtUtc: clock);
+
+        var browserWindow = new ExternalWindowTarget(
+            Hwnd: (nint)1002, ProcessId: 43, ProcessName: "msedge",
+            Title: "tenso Verify - Microsoft Edge", CapturedAt: clock);
+
+        // 1) Extension timeout (returns null) -> handle NOT consumed
+        var timeoutRes = await SecretaryController.TryExecuteL2AutoFillAsync(
+            vault, page, handle, browserWindow,
+            (_, _, _, _) => Task.FromResult<BrowserOtpFillResult?>(null),
+            CancellationToken.None);
+        Assert.Equal(SecretaryController.L2OtpFillOutcome.DowngradedToL1, timeoutRes.Outcome);
+        Assert.True(vault.TryResolve(handle, out var codeAfterTimeout, out _));
+        Assert.Equal("135883", codeAfterTimeout);
+
+        // 2) Extension reports no_otp_field (same domain, navigated away from OTP page) -> handle NOT consumed
+        var noFieldRes = await SecretaryController.TryExecuteL2AutoFillAsync(
+            vault, page, handle, browserWindow,
+            (_, _, _, _) => Task.FromResult<BrowserOtpFillResult?>(new BrowserOtpFillResult(false, Error: "no_otp_field")),
+            CancellationToken.None);
+        Assert.Equal(SecretaryController.L2OtpFillOutcome.DowngradedToL1, noFieldRes.Outcome);
+        Assert.Equal("no_otp_field", noFieldRes.Reason);
+        Assert.True(vault.TryResolve(handle, out var codeAfterNoField, out _));
+        Assert.Equal("135883", codeAfterNoField);
+
+        // 3) Explicitly marking consumed after a successful fill/copy invalidates the handle while preserving redaction tombstone
+        Assert.True(vault.MarkConsumed(handle));
+        Assert.False(vault.MarkConsumed(handle));
+        Assert.False(vault.TryResolve(handle, out _, out _));
+        Assert.Contains(handle, vault.RedactKnownSecrets("Delayed log: 135883"));
+        Assert.DoesNotContain("135883", vault.RedactKnownSecrets("Delayed log: 135883"));
+    }
+
+    [Fact]
+    public async Task L2AutoFill_NeverInvokesUiaFallback_AndBlocksNonBrowserOrIncognitoTargets()
+    {
+        var clock = new DateTimeOffset(2026, 11, 21, 10, 0, 0, TimeSpan.Zero);
+        var vault = new SecretVaultService(() => clock);
+        var handle = vault.StoreOtp("654321", "tenso.com", "tenso", "m-tenso-2");
+
+        var page = new OtpPageSignal(
+            Url: "https://login.tenso.com/verify",
+            Host: "login.tenso.com",
+            RegistrableDomain: "tenso.com",
+            Title: "tenso - Two-Step Verification",
+            Headings: Array.Empty<string>(),
+            OtpFieldPresent: true,
+            OtpFieldFocused: true,
+            ObservedAtUtc: clock);
+
+        int extensionCalls = 0;
+
+        // Case 1: User switched to LINE before OTP email arrived -> C# pre-check downgrades to L1 immediately (0 extension calls, 0 UIA calls)
+        var lineWin = new ExternalWindowTarget((nint)2001, 101, "LINE", "LINE - 小明", clock);
+        var lineRes = await SecretaryController.TryExecuteL2AutoFillAsync(
+            vault, page, handle, lineWin,
+            (_, _, _, _) => { extensionCalls++; return Task.FromResult<BrowserOtpFillResult?>(new BrowserOtpFillResult(true)); },
+            CancellationToken.None);
+        Assert.Equal(SecretaryController.L2OtpFillOutcome.DowngradedToL1, lineRes.Outcome);
+        Assert.Equal("window_mismatch", lineRes.Reason);
+        Assert.Equal(0, extensionCalls);
+        Assert.True(vault.TryResolve(handle, out _, out _));
+
+        // Case 2: User switched to Notepad -> downgraded to L1, 0 extension calls
+        var notepadWin = new ExternalWindowTarget((nint)2002, 102, "notepad", "未命名 - 記事本", clock);
+        var notepadRes = await SecretaryController.TryExecuteL2AutoFillAsync(
+            vault, page, handle, notepadWin,
+            (_, _, _, _) => { extensionCalls++; return Task.FromResult<BrowserOtpFillResult?>(new BrowserOtpFillResult(true)); },
+            CancellationToken.None);
+        Assert.Equal(SecretaryController.L2OtpFillOutcome.DowngradedToL1, notepadRes.Outcome);
+        Assert.Equal(0, extensionCalls);
+
+        // Case 3: User switched to chrome://settings or Incognito tab -> browser title no longer matches -> downgraded to L1
+        var settingsWin = new ExternalWindowTarget((nint)2003, 103, "chrome", "Settings - Google Chrome", clock);
+        var incognitoWin = new ExternalWindowTarget((nint)2004, 104, "chrome", "New Incognito Tab - Google Chrome", clock);
+        Assert.False(SecretaryController.IsExternalWindowMatchingOtpPage(settingsWin, page));
+        Assert.False(SecretaryController.IsExternalWindowMatchingOtpPage(incognitoWin, page));
+
+        // Case 4: Even when L1/manual UIA target selector runs, LINE/Notepad/Discord are NEVER blindly picked!
+        var onlyChatApps = new[] { lineWin, notepadWin };
+        Assert.Null(ActivityMonitorService.SelectOtpUiaTarget(onlyChatApps, serviceHint: "驗證碼已就緒（tenso）", expectedDomain: "tenso.com", senderName: "tenso"));
+
+        // If a non-browser foreground app is active AND Chrome is in the background on an unrelated tab, do NOT blindly hijack the unrelated Chrome tab
+        var unrelatedChrome = new ExternalWindowTarget((nint)2005, 105, "chrome", "YouTube - Google Chrome", clock.AddSeconds(-30));
+        Assert.Null(ActivityMonitorService.SelectOtpUiaTarget(new[] { lineWin, unrelatedChrome }, serviceHint: "tenso", expectedDomain: "tenso.com", senderName: "tenso"));
+
+        // Matching native app or matching browser IS allowed on L1 UIA fallback
+        var matchingBrowser = new ExternalWindowTarget((nint)2006, 106, "firefox", "tenso - Two-Step Verification - Mozilla Firefox", clock);
+        Assert.Equal(matchingBrowser, ActivityMonitorService.SelectOtpUiaTarget(new[] { lineWin, matchingBrowser }, serviceHint: null, expectedDomain: "tenso.com", senderName: "tenso"));
+    }
+
+    [Fact]
+    public void MailRedactionBeforeTriage_ReplacesVaultedOtpWithHandleInSubjectSnippetAndBody()
+    {
+        var clock = new DateTimeOffset(2026, 11, 21, 10, 0, 0, TimeSpan.Zero);
+        var vault = new SecretVaultService(() => clock);
+        var rawMail = new MailItem(
+            Id: "m-redact",
+            Subject: "您的登入驗證碼 839201",
+            SenderName: "tenso",
+            SenderEmail: "noreply@mail.tenso.com",
+            ReceivedAt: clock,
+            Importance: MailImportance.High,
+            Snippet: "驗證碼為 839201，請於 10 分鐘內輸入",
+            Body: "您好，您的登入驗證碼是 839201。",
+            IsRead: false,
+            ThreadId: "t-1");
+
+        Assert.True(OtpExtractor.TryExtractFromMail(rawMail, out var extracted));
+        var handle = vault.StoreOtp(extracted, "tenso.com", rawMail.SenderName, rawMail.Id);
+
+        var safeMail = MailSyncService.RedactMailForTriage(vault, rawMail);
+        Assert.DoesNotContain("839201", safeMail.Subject);
+        Assert.DoesNotContain("839201", safeMail.Snippet);
+        Assert.DoesNotContain("839201", safeMail.Body);
+        Assert.Contains(handle, safeMail.Subject);
+        Assert.Contains(handle, safeMail.Snippet);
+        Assert.Contains(handle, safeMail.Body);
+    }
 }

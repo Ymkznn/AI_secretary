@@ -545,11 +545,18 @@ public partial class MainWindow : Window
                             var handle = btn.Prompt;
                             AddTracked(btn.Label, btn.IsPrimary, async () =>
                             {
-                                if (_controller.TryConsumeOtpForClipboard(handle, out var realCode, out var displayHandle)
-                                    && TrySetClipboardText(realCode))
+                                if (_controller.TryResolveOtpForClipboard(handle, out var realCode, out var displayHandle))
                                 {
-                                    await DismissNotificationPinnedAsync();
-                                    OutputStatusText.Text = await _controller.LocalizeAsync("OtpCopiedSafeStatus", "Copied {0} to clipboard!", displayHandle);
+                                    if (TrySetClipboardText(realCode))
+                                    {
+                                        _controller.MarkOtpConsumed(displayHandle);
+                                        await DismissNotificationPinnedAsync();
+                                        OutputStatusText.Text = await _controller.LocalizeAsync("OtpCopiedSafeStatus", "Copied {0} to clipboard!", displayHandle);
+                                    }
+                                    else
+                                    {
+                                        OutputStatusText.Text = "剪貼簿暫時被佔用，請再試一次。";
+                                    }
                                 }
                                 else
                                 {
@@ -582,15 +589,16 @@ public partial class MainWindow : Window
                     case "fill_otp_l1":
                         if (!string.IsNullOrWhiteSpace(btn.Prompt))
                         {
-                            var parts = btn.Prompt.Split('|', 2);
+                            var parts = btn.Prompt.Split('|', 3);
                             var handle = parts[0];
                             var domain = parts.Length > 1 ? parts[1] : null;
+                            var recordL1Accept = parts.Length < 3 || !string.Equals(parts[2], "downgraded", StringComparison.OrdinalIgnoreCase);
                             var titleHint = n.Title;
                             AddTracked(btn.Label, btn.IsPrimary, async () =>
                             {
                                 try
                                 {
-                                    var (ok, msg) = await _controller.FillOtpByHandleAsync(handle, titleHint, domain, recordL1Accept: true);
+                                    var (ok, msg) = await _controller.FillOtpByHandleAsync(handle, titleHint, domain, recordL1Accept: recordL1Accept);
                                     if (ok)
                                         await DismissNotificationPinnedAsync();
                                     OutputStatusText.Text = msg;

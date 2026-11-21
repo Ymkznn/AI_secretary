@@ -144,6 +144,53 @@ public sealed class SecretVaultService
     }
 
     /// <summary>
+    /// Resolves an active, unexpired OTP handle WITHOUT consuming it.
+    /// Callers should call <see cref="MarkConsumed"/> only after the fill or copy operation succeeds
+    /// so a failed fill never destroys the user's OTP handle.
+    /// </summary>
+    public bool TryResolve(string? handle, out string secretValue, out SecretMetadata? metadata)
+    {
+        secretValue = "";
+        metadata = null;
+        if (string.IsNullOrWhiteSpace(handle)) return false;
+
+        var key = handle.Trim();
+        var now = _utcNow();
+        lock (_lock)
+        {
+            PruneExpiredLocked(now);
+            if (!_entries.TryGetValue(key, out var entry))
+                return false;
+
+            secretValue = entry.Value;
+            metadata = entry.Metadata;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Atomically marks an active OTP handle as consumed (removing it from the active vault and leaving
+    /// an un-consumable redaction tombstone until <see cref="SecretMetadata.ExpiresAt"/>).
+    /// Returns <c>true</c> if the handle was active and consumed; <c>false</c> if already consumed or expired.
+    /// </summary>
+    public bool MarkConsumed(string? handle)
+    {
+        if (string.IsNullOrWhiteSpace(handle)) return false;
+
+        var key = handle.Trim();
+        var now = _utcNow();
+        lock (_lock)
+        {
+            PruneExpiredLocked(now);
+            if (!_entries.Remove(key, out var entry))
+                return false;
+
+            CleanupAndTombstoneLocked(key, entry);
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Single-use consumption: atomically removes the entry from the vault and returns its plaintext value.
     /// Any subsequent call with the same handle returns <c>false</c>.
     /// </summary>
@@ -161,24 +208,28 @@ public sealed class SecretVaultService
             if (!_entries.Remove(key, out var entry))
                 return false;
 
-            if (!string.IsNullOrWhiteSpace(entry.Metadata.MailId) &&
-                _mailIdToHandle.TryGetValue(entry.Metadata.MailId, out var mapped) &&
-                string.Equals(mapped, key, StringComparison.OrdinalIgnoreCase))
-            {
-                _mailIdToHandle.Remove(entry.Metadata.MailId);
-            }
-
-            if (string.Equals(_lastActiveHandle, key, StringComparison.OrdinalIgnoreCase))
-                _lastActiveHandle = null;
-
-            // Keep an un-consumable redaction tombstone until ExpiresAt so delayed triage/snippets
-            // still redact the plaintext code and cannot resurrect a consumed OTP.
-            _recentlyConsumed.Add(new ConsumedRedactionEntry(entry.Value, entry.Metadata.Handle, entry.Metadata.MailId, entry.Metadata.ExpiresAt));
-
+            CleanupAndTombstoneLocked(key, entry);
             secretValue = entry.Value;
             metadata = entry.Metadata;
             return true;
         }
+    }
+
+    private void CleanupAndTombstoneLocked(string key, VaultEntry entry)
+    {
+        if (!string.IsNullOrWhiteSpace(entry.Metadata.MailId) &&
+            _mailIdToHandle.TryGetValue(entry.Metadata.MailId, out var mapped) &&
+            string.Equals(mapped, key, StringComparison.OrdinalIgnoreCase))
+        {
+            _mailIdToHandle.Remove(entry.Metadata.MailId);
+        }
+
+        if (string.Equals(_lastActiveHandle, key, StringComparison.OrdinalIgnoreCase))
+            _lastActiveHandle = null;
+
+        // Keep an un-consumable redaction tombstone until ExpiresAt so delayed triage/snippets
+        // still redact the plaintext code and cannot resurrect a consumed OTP.
+        _recentlyConsumed.Add(new ConsumedRedactionEntry(entry.Value, entry.Metadata.Handle, entry.Metadata.MailId, entry.Metadata.ExpiresAt));
     }
 
     /// <summary>

@@ -2321,7 +2321,7 @@ public sealed class SecretaryController : IDisposable
     public Task HandleBrowserPageSignalAsync(BrowserPageSignal signal, CancellationToken ct = default)
         => _activity.HandleBrowserPageSignalAsync(signal, ct);
 
-    public bool TryConsumeOtpForClipboard(string? handleOrCode, out string secretValue, out string displayHandle)
+    public bool TryResolveOtpForClipboard(string? handleOrCode, out string secretValue, out string displayHandle)
     {
         secretValue = "";
         displayHandle = "otp";
@@ -2331,12 +2331,119 @@ public sealed class SecretaryController : IDisposable
         if (SecretVaultService.IsOtpHandle(raw))
         {
             displayHandle = raw.ToLowerInvariant();
-            return _vault.TryConsume(displayHandle, out secretValue, out _);
+            return _vault.TryResolve(displayHandle, out secretValue, out _);
         }
 
-        // Legacy fallback if an older persisted notification held a raw code: vault & immediately consume.
+        // Legacy fallback if an older persisted notification held a raw code: vault & resolve (consume after copy succeeds).
         displayHandle = _vault.StoreOtp(raw);
-        return _vault.TryConsume(displayHandle, out secretValue, out _);
+        return _vault.TryResolve(displayHandle, out secretValue, out _);
+    }
+
+    public bool MarkOtpConsumed(string? handle) => _vault.MarkConsumed(handle);
+
+    public bool TryConsumeOtpForClipboard(string? handleOrCode, out string secretValue, out string displayHandle)
+    {
+        if (TryResolveOtpForClipboard(handleOrCode, out secretValue, out displayHandle))
+        {
+            _vault.MarkConsumed(displayHandle);
+            return true;
+        }
+        return false;
+    }
+
+    internal enum L2OtpFillOutcome
+    {
+        Filled,
+        DowngradedToL1,
+        HandleUnavailable
+    }
+
+    internal sealed record L2OtpExecutionResult(
+        L2OtpFillOutcome Outcome,
+        string Reason,
+        BrowserOtpFillResult? ExtensionResult = null);
+
+    /// <summary>
+    /// C#-side pre-check before any L2 auto-fill: the last active external window MUST be a browser process
+    /// and its window title MUST match the detected OTP page title (and the page MUST have a valid registrable domain).
+    /// </summary>
+    internal static bool IsExternalWindowMatchingOtpPage(ExternalWindowTarget? lastExternal, OtpPageSignal? page)
+    {
+        if (lastExternal is null || page is null)
+            return false;
+        if (!ActivityMonitorService.IsBrowserProcess(lastExternal.ProcessName))
+            return false;
+        if (string.IsNullOrWhiteSpace(page.RegistrableDomain) ||
+            string.Equals(page.RegistrableDomain, "unknown", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var pageTitle = (page.Title ?? "").Trim();
+        var winTitle = (lastExternal.Title ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(pageTitle) || string.IsNullOrWhiteSpace(winTitle))
+            return false;
+
+        if (winTitle.Contains(pageTitle, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Handle long page titles truncated with an ellipsis by the browser window title bar.
+        if (pageTitle.Length > 24 && winTitle.Contains(pageTitle[..24], StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
+    }
+
+    /// <summary>
+    /// Safe zero-LLM L2 OTP auto-fill pipeline:
+    /// 1. Pre-check C# last external window (browser + matching page title).
+    /// 2. Resolve handle WITHOUT consuming (<see cref="SecretVaultService.TryResolve"/>).
+    /// 3. Fill ONLY via Browser Extension with <c>expectedDomain</c> + <c>requireOtpField=true</c> (NEVER calls UIA fallback).
+    /// 4. Call <see cref="SecretVaultService.MarkConsumed"/> ONLY when extension reports <c>Filled == true</c>.
+    /// </summary>
+    internal static async Task<L2OtpExecutionResult> TryExecuteL2AutoFillAsync(
+        SecretVaultService vault,
+        OtpPageSignal page,
+        string handle,
+        ExternalWindowTarget? lastExternalWindow,
+        Func<string, string, bool, CancellationToken, Task<BrowserOtpFillResult?>> fillViaExtensionAsync,
+        CancellationToken ct)
+    {
+        if (!IsExternalWindowMatchingOtpPage(lastExternalWindow, page))
+            return new L2OtpExecutionResult(L2OtpFillOutcome.DowngradedToL1, "window_mismatch");
+
+        if (!vault.TryResolve(handle, out var realCode, out _))
+            return new L2OtpExecutionResult(L2OtpFillOutcome.HandleUnavailable, "handle_unavailable");
+
+        BrowserOtpFillResult? extRes;
+        try
+        {
+            extRes = await fillViaExtensionAsync(realCode, page.RegistrableDomain, true, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return new L2OtpExecutionResult(L2OtpFillOutcome.DowngradedToL1, $"extension_error:{ex.Message}");
+        }
+
+        if (extRes is { Filled: true })
+        {
+            vault.MarkConsumed(handle);
+            return new L2OtpExecutionResult(L2OtpFillOutcome.Filled, extRes.Mode ?? "dom", extRes);
+        }
+
+        var err = string.IsNullOrWhiteSpace(extRes?.Error) ? "extension_failed" : extRes.Error;
+        return new L2OtpExecutionResult(L2OtpFillOutcome.DowngradedToL1, err, extRes);
+    }
+
+    private static string? NormalizeExpectedDomain(string? domain)
+    {
+        if (string.IsNullOrWhiteSpace(domain)) return null;
+        var clean = domain.Trim().ToLowerInvariant();
+        if (clean == "unknown") return null;
+        var reg = OtpExtractor.ExtractRegistrableDomain(clean);
+        return string.IsNullOrWhiteSpace(reg) ? null : reg;
     }
 
     public async Task<(bool Ok, string Message)> FillOtpByHandleAsync(
@@ -2356,28 +2463,33 @@ public sealed class SecretaryController : IDisposable
         if (SecretVaultService.IsOtpHandle(raw))
         {
             handle = raw.ToLowerInvariant();
-            if (!_vault.TryConsume(handle, out realCode, out meta))
+            if (!_vault.TryResolve(handle, out realCode, out meta))
                 return (false, $"驗證碼代號 {handle} 已使用或過期。");
         }
         else
         {
             handle = _vault.StoreOtp(raw);
-            if (!_vault.TryConsume(handle, out realCode, out meta))
+            if (!_vault.TryResolve(handle, out realCode, out meta))
                 return (false, "無法取得驗證碼。");
         }
 
-        var (ok, msg) = await FillOtpDirectInternalAsync(realCode, handle, serviceHint, ct);
-        if (ok && recordL1Accept)
+        var expectedDomain = NormalizeExpectedDomain(domain) ?? NormalizeExpectedDomain(meta?.SenderDomain);
+        var (ok, msg) = await FillOtpForL1OrManualAsync(realCode, handle, serviceHint, expectedDomain, meta?.SenderName, ct);
+        if (ok)
         {
-            var effectiveDomain = !string.IsNullOrWhiteSpace(domain) ? domain : (meta?.SenderDomain ?? "unknown");
-            var outcome = await _autonomy.RecordAcceptedAsync(AutonomyPolicyService.ActionFillOtp, effectiveDomain, atLevel: 1, ct);
-            if (outcome.ShouldOfferPromotion)
+            _vault.MarkConsumed(handle);
+            if (recordL1Accept)
             {
-                UpsertPinnedConfirmation(
-                    $"otp-promote:{effectiveDomain}",
-                    $"自動填入驗證碼（{effectiveDomain}）",
-                    $"你在 {effectiveDomain} 已接受 3 次驗證碼填入，以後直接幫你自動填（附 10 秒復原、絕不自動送出）嗎？",
-                    new[] { "好，以後自動填", "維持先問我" });
+                var policyDomain = expectedDomain ?? "unknown";
+                var outcome = await _autonomy.RecordAcceptedAsync(AutonomyPolicyService.ActionFillOtp, policyDomain, atLevel: 1, ct);
+                if (outcome.ShouldOfferPromotion)
+                {
+                    UpsertPinnedConfirmation(
+                        $"otp-promote:{policyDomain}",
+                        $"自動填入驗證碼（{policyDomain}）",
+                        $"你在 {policyDomain} 已接受 3 次驗證碼填入，以後直接幫你自動填（附 10 秒復原、絕不自動送出）嗎？",
+                        new[] { "好，以後自動填", "維持先問我" });
+                }
             }
         }
         return (ok, msg);
@@ -2385,7 +2497,8 @@ public sealed class SecretaryController : IDisposable
 
     public async Task<(bool Ok, string Message)> UndoAutoFilledOtpAsync(string domain, CancellationToken ct = default)
     {
-        var extRes = await _browserBridge.RequestClearOtpAsync(TimeSpan.FromMilliseconds(1500), ct);
+        var expectedDomain = NormalizeExpectedDomain(domain);
+        var extRes = await _browserBridge.RequestClearOtpAsync(TimeSpan.FromMilliseconds(1500), ct, expectedDomain: expectedDomain);
         var newLevel = await _autonomy.RecordRejectedOrUndoneAsync(
             AutonomyPolicyService.ActionFillOtp,
             domain,
@@ -2394,9 +2507,13 @@ public sealed class SecretaryController : IDisposable
             ct: ct);
         AgentsChanged?.Invoke();
 
-        return extRes is { Filled: true }
-            ? (true, $"已清空驗證碼欄位，並將 {domain} 降級為 L{newLevel}（下次先詢問）。")
-            : (false, $"未能自動清空欄位（請手動清除），已將 {domain} 降級為 L{newLevel}（下次先詢問）。");
+        if (extRes is { Filled: true })
+            return (true, $"已清空驗證碼欄位，並將 {domain} 降級為 L{newLevel}（下次先詢問）。");
+
+        if (string.Equals(extRes?.Error, "domain_mismatch", StringComparison.OrdinalIgnoreCase))
+            return (false, $"目前作用中分頁網域與 {domain} 不符，未清空欄位（請手動確認），已將 {domain} 降級為 L{newLevel}（下次先詢問）。");
+
+        return (false, $"未能自動清空欄位（請手動清除），已將 {domain} 降級為 L{newLevel}（下次先詢問）。");
     }
 
     public async Task RejectL1OtpPromptAsync(string domain, CancellationToken ct = default)
@@ -2448,7 +2565,8 @@ public sealed class SecretaryController : IDisposable
     }
 
     /// <summary>
-    /// Dual-signal OTP correlator handler. L2 auto-fill path runs with ZERO LLM calls!
+    /// Dual-signal OTP correlator handler. L2 auto-fill path runs with ZERO LLM calls,
+    /// NEVER falls back to UIA, and downgrades to L1 prompt card if window/domain/OTP-field verification fails.
     /// </summary>
     private void OnOtpSituationDetected(OtpCorrelationDecision decision)
     {
@@ -2485,55 +2603,75 @@ public sealed class SecretaryController : IDisposable
                 if (level <= 0)
                     return;
 
+                bool downgradedFromL2 = false;
                 if (level >= 2)
                 {
-                    // ZERO-LLM L2 auto-fill path: consume single-use handle -> fill DOM (never submit!) -> 10s Undo toast.
-                    if (!_vault.TryConsume(cand.Mail.Handle, out var realCode, out _))
+                    // ZERO-LLM L2 auto-fill path:
+                    // C# browser/title check -> TryResolve -> Extension ONLY (expectedDomain + strict OTP field) -> MarkConsumed on success.
+                    // NEVER invokes UIA fallback; downgrades cleanly to L1 prompt card on any mismatch/failure.
+                    var l2Res = await TryExecuteL2AutoFillAsync(
+                        _vault,
+                        page,
+                        cand.Mail.Handle,
+                        _activity.GetLastExternalTarget(),
+                        (code, expectedDomain, requireOtpField, token) =>
+                            _browserBridge.RequestFillOtpAsync(code, TimeSpan.FromMilliseconds(1500), token, expectedDomain, requireOtpField),
+                        ct);
+
+                    if (l2Res.Outcome == L2OtpFillOutcome.HandleUnavailable)
                         return;
 
-                    _boostedPollUntilUtc = DateTimeOffset.MinValue;
-                    var (ok, _) = await FillOtpDirectInternalAsync(realCode, cand.Mail.Handle, page.Title, ct);
-                    if (!ok)
-                        return;
-
-                    var undoId = $"otp-undo:{cand.Mail.Handle}";
-                    var title = $"已自動填入驗證碼（{domain}）";
-                    var summary = $"已將 {cand.Mail.Handle} 填入「{page.Title}」（未自動送出）。10 秒內可點「復原」清空欄位。";
-                    var actions = new List<NotificationButtonOption>
+                    if (l2Res.Outcome == L2OtpFillOutcome.Filled)
                     {
-                        new("undo_otp", "復原（清空欄位）", $"{domain}|{cand.Mail.Handle}", IsPrimary: true)
-                    };
-                    var payload = new NotificationActionPayload(undoId, undoId, cand.Mail.MailId, title, summary, "Unread", actions);
-                    AddPinnedReminder(new PinnedReminderItem(undoId, title, summary, cand.Mail.MailId, payload, 0));
-                    ProactiveAlert?.Invoke(title, summary);
-
-                    // Auto-dismiss Undo card after 10 seconds and record accepted L2 fill if not undone.
-                    _ = Task.Run(async () =>
-                    {
-                        try
+                        _boostedPollUntilUtc = DateTimeOffset.MinValue;
+                        var undoId = $"otp-undo:{cand.Mail.Handle}";
+                        var title = $"已自動填入驗證碼（{domain}）";
+                        var summary = $"已將 {cand.Mail.Handle} 填入「{page.Title}」（未自動送出）。10 秒內可點「復原」清空欄位。";
+                        var actions = new List<NotificationButtonOption>
                         {
-                            await Task.Delay(TimeSpan.FromSeconds(10), ct);
-                            bool stillPinned;
-                            lock (_pinnedLock)
-                                stillPinned = _pinnedReminders.Any(p => p.Id == undoId);
-                            if (stillPinned)
+                            new("undo_otp", "復原（清空欄位）", $"{domain}|{cand.Mail.Handle}", IsPrimary: true)
+                        };
+                        var payload = new NotificationActionPayload(undoId, undoId, cand.Mail.MailId, title, summary, "Unread", actions);
+                        AddPinnedReminder(new PinnedReminderItem(undoId, title, summary, cand.Mail.MailId, payload, 0));
+                        ProactiveAlert?.Invoke(title, summary);
+
+                        // Auto-dismiss Undo card after 10 seconds and record accepted L2 fill if not undone.
+                        _ = Task.Run(async () =>
+                        {
+                            try
                             {
-                                await DismissPinnedReminderAsync(undoId);
-                                await _autonomy.RecordAcceptedAsync(AutonomyPolicyService.ActionFillOtp, domain, atLevel: 2, ct);
+                                await Task.Delay(TimeSpan.FromSeconds(10), ct);
+                                bool stillPinned;
+                                lock (_pinnedLock)
+                                    stillPinned = _pinnedReminders.Any(p => p.Id == undoId);
+                                if (stillPinned)
+                                {
+                                    await DismissPinnedReminderAsync(undoId);
+                                    await _autonomy.RecordAcceptedAsync(AutonomyPolicyService.ActionFillOtp, domain, atLevel: 2, ct);
+                                }
                             }
-                        }
-                        catch { }
-                    }, ct);
-                    return;
+                            catch { }
+                        }, ct);
+                        return;
+                    }
+
+                    downgradedFromL2 = true;
+                    _logger.LogDebug("L2 OTP auto-fill downgraded to L1 for {Domain}: {Reason}", domain, l2Res.Reason);
                 }
 
-                // Level 1: prompt user to click (never auto-fill).
+                // Level 1 (or safety-downgraded from L2): prompt user to click (never auto-fill; handle remains unconsumed).
+                _boostedPollUntilUtc = DateTimeOffset.MinValue;
                 var l1Id = $"otp-l1:{cand.Mail.Handle}";
                 var l1Title = $"驗證碼已就緒（{cand.Mail.SenderName}）";
-                var l1Summary = $"偵測到「{page.Title}」有驗證碼欄位，要幫你填入 {cand.Mail.Handle} 嗎？（絕不自動送出）";
+                var l1Summary = downgradedFromL2
+                    ? $"收到來自 {cand.Mail.SenderName} 的驗證碼 {cand.Mail.Handle}，但目前焦點不在「{page.Title}」，未自動填入。切回該頁面後可點擊填入或複製。"
+                    : $"偵測到「{page.Title}」有驗證碼欄位，要幫你填入 {cand.Mail.Handle} 嗎？（絕不自動送出）";
+                var fillPrompt = downgradedFromL2
+                    ? $"{cand.Mail.Handle}|{domain}|downgraded"
+                    : $"{cand.Mail.Handle}|{domain}";
                 var l1Actions = new List<NotificationButtonOption>
                 {
-                    new("fill_otp_l1", "填入驗證碼", $"{cand.Mail.Handle}|{domain}", IsPrimary: true),
+                    new("fill_otp_l1", "填入驗證碼", fillPrompt, IsPrimary: true),
                     new("copy_otp", "複製驗證碼", cand.Mail.Handle, IsPrimary: false),
                     new("reject_otp_l1", "這次不用", domain, IsPrimary: false)
                 };
@@ -2548,14 +2686,21 @@ public sealed class SecretaryController : IDisposable
         });
     }
 
-    private async Task<(bool Ok, string Message)> FillOtpDirectInternalAsync(
+    private async Task<(bool Ok, string Message)> FillOtpForL1OrManualAsync(
         string realCode,
         string displayHandle,
         string? serviceHint,
+        string? expectedDomain,
+        string? senderName,
         CancellationToken ct)
     {
-        // Zero-LLM path: uses TextCached only so L2 OTP auto-fill never touches any LLM.
-        var extRes = await _browserBridge.RequestFillOtpAsync(realCode, TimeSpan.FromMilliseconds(1500), ct);
+        // Zero-LLM path: uses TextCached only.
+        var extRes = await _browserBridge.RequestFillOtpAsync(
+            realCode,
+            TimeSpan.FromMilliseconds(1500),
+            ct,
+            expectedDomain: expectedDomain,
+            requireOtpField: false);
         if (extRes is { Filled: true })
         {
             var title = string.IsNullOrWhiteSpace(extRes.Title)
@@ -2566,7 +2711,22 @@ public sealed class SecretaryController : IDisposable
             return (true, msg);
         }
 
-        return await _activity.TryFillOtpInExternalWindowAsync(realCode, serviceHint, ct, displayHandle);
+        bool domainMismatched = string.Equals(extRes?.Error, "domain_mismatch", StringComparison.OrdinalIgnoreCase);
+        if (domainMismatched &&
+            _activity.GetLastExternalTarget() is { } lastWin &&
+            ActivityMonitorService.IsBrowserProcess(lastWin.ProcessName))
+        {
+            return (false, $"目前瀏覽器分頁網域與 {expectedDomain} 不符，未填入（{displayHandle} 仍可使用，請切回目標分頁或改用複製）。");
+        }
+
+        return await _activity.TryFillOtpInExternalWindowAsync(
+            realCode,
+            serviceHint,
+            ct,
+            displayHandle: displayHandle,
+            expectedDomain: expectedDomain,
+            senderName: senderName,
+            allowBrowserFallback: !domainMismatched);
     }
 
     public Task<(bool Ok, string Message)> FillOtpInExternalWindowAsync(
