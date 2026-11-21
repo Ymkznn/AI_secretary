@@ -161,6 +161,17 @@ public sealed class MemoryReflectionAgent : IDisposable
             var summary = item.TryGetProperty("summary", out var sEl) ? sEl.GetString()?.Trim() : null;
             var detail = item.TryGetProperty("detail", out var dEl) ? dEl.GetString()?.Trim() : null;
             var evidence = item.TryGetProperty("evidence", out var eEl) ? eEl.GetString()?.Trim() : null;
+            List<string>? parsedTags = null;
+            if (item.TryGetProperty("tags", out var tagsEl) && tagsEl.ValueKind == JsonValueKind.Array)
+            {
+                parsedTags = tagsEl.EnumerateArray()
+                    .Where(t => t.ValueKind == JsonValueKind.String)
+                    .Select(t => t.GetString()?.Trim())
+                    .Where(t => !string.IsNullOrWhiteSpace(t))
+                    .Cast<string>()
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+            }
             DateTimeOffset? expiresAt = null;
             if (item.TryGetProperty("ttl_hours", out var ttlEl) && ttlEl.ValueKind == JsonValueKind.Number && ttlEl.TryGetInt32(out var ttlHours) && ttlHours > 0)
                 expiresAt = DateTimeOffset.UtcNow.AddHours(Math.Clamp(ttlHours, 1, 24 * 90));
@@ -176,7 +187,7 @@ public sealed class MemoryReflectionAgent : IDisposable
                         category: string.IsNullOrWhiteSpace(category) ? "general" : category,
                         evidence: evidence,
                         confidence: string.Equals(state, "Candidate", StringComparison.OrdinalIgnoreCase) ? "inferred" : "observed",
-                        tags: null,
+                        tags: parsedTags,
                         ct: ct,
                         memoryKey: memKey,
                         state: string.IsNullOrWhiteSpace(state) ? defaultState : state,

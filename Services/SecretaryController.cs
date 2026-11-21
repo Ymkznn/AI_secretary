@@ -130,13 +130,22 @@ public sealed class SecretaryController : IDisposable
         => _interaction.GetPendingRequests();
 
     public bool ResolveConfirmation(string requestId, bool approved)
-        => _interaction.ResolveConfirmation(requestId, approved);
+    {
+        MarkUserInteraction();
+        return _interaction.ResolveConfirmation(requestId, approved);
+    }
 
     public bool ResolvePathPermission(string requestId, PathPermissionDecision decision)
-        => _interaction.ResolvePathPermission(requestId, decision);
+    {
+        MarkUserInteraction();
+        return _interaction.ResolvePathPermission(requestId, decision);
+    }
 
     public bool ResolveCommandApproval(string requestId, CommandApprovalDecision decision)
-        => _interaction.ResolveCommandApproval(requestId, decision);
+    {
+        MarkUserInteraction();
+        return _interaction.ResolveCommandApproval(requestId, decision);
+    }
     public event Action<PendingInteractionRequest>? InteractionAdded
     {
         add => _interaction.PendingRequestAdded += value;
@@ -882,6 +891,8 @@ public sealed class SecretaryController : IDisposable
 
     public async Task SendUserPromptAsync(string prompt, string? targetMailId = null, string? replyToLogicalTaskId = null)
     {
+        MarkUserInteraction();
+
         if (!string.IsNullOrWhiteSpace(replyToLogicalTaskId) &&
             replyToLogicalTaskId.StartsWith("state-propose:", StringComparison.Ordinal))
         {
@@ -895,7 +906,6 @@ public sealed class SecretaryController : IDisposable
             return;
         }
 
-        _lastUserActivityUtc = DateTimeOffset.UtcNow;
         var taskId = Guid.NewGuid().ToString("N");
         var appCt = _appCts.Token;
         var linked = CancellationTokenSource.CreateLinkedTokenSource(appCt);
@@ -2234,14 +2244,31 @@ public sealed class SecretaryController : IDisposable
         }
     }
 
+    private const string RecentCustomSharesSyncKey = "proactive_recent_custom_shares";
+    private readonly object _proactiveStateLock = new();
+    private readonly List<ProactiveTopicKind> _recentProactiveTopics = new();
+    private List<string>? _recentCustomSharesCache;
+    private int _unansweredProactiveCount;
     private int _nextProactiveIdleMinutes = -1;
+    private ProactiveAwarenessLevel _lastAwarenessLevel = ProactiveAwarenessLevel.Normal;
+    private string _lastAwarenessSource = "default";
+
+    /// <summary>Resets proactive exponential backoff back to base interval on any user interaction.</summary>
+    private void MarkUserInteraction()
+    {
+        _lastUserActivityUtc = DateTimeOffset.UtcNow;
+        Interlocked.Exchange(ref _unansweredProactiveCount, 0);
+        RollNextProactiveMinutes();
+    }
 
     private int RollNextProactiveMinutes()
     {
         var sched = _settings.Current.Scheduler;
         int min = Math.Clamp(sched.ProactiveIdleMinMinutes > 0 ? sched.ProactiveIdleMinMinutes : sched.ProactiveIdleMinutes, 5, 180);
         int max = Math.Clamp(sched.ProactiveIdleMaxMinutes > 0 ? sched.ProactiveIdleMaxMinutes : sched.ProactiveIdleMinutes, min, 180);
-        _nextProactiveIdleMinutes = min == max ? min : Random.Shared.Next(min, max + 1);
+        int unanswered = Volatile.Read(ref _unansweredProactiveCount);
+        _nextProactiveIdleMinutes = ProactiveBackoffCalculator.ComputeNextIntervalMinutes(
+            min, max, unanswered, sched.ProactiveBackoffMaxMinutes);
         return _nextProactiveIdleMinutes;
     }
 
@@ -2299,7 +2326,23 @@ public sealed class SecretaryController : IDisposable
         AgentsChanged?.Invoke();
     }
 
-    public string GetPresenceStatusLabel() => _presence.FormatStatusLabel();
+    public string GetPresenceStatusLabel()
+    {
+        var lvl = _lastAwarenessLevel switch
+        {
+            ProactiveAwarenessLevel.Low => "低",
+            ProactiveAwarenessLevel.High => "高",
+            _ => "普通"
+        };
+        var src = _lastAwarenessSource switch
+        {
+            "override" => "口頭覆寫",
+            "llm" => "人設判讀",
+            _ => "預設"
+        };
+        var interval = _nextProactiveIdleMinutes > 0 ? $"{_nextProactiveIdleMinutes}m" : "-";
+        return $"{_presence.FormatStatusLabel()}｜主動度：{lvl}（{src}）｜下輪 {interval}";
+    }
     public void NotifyDisplayPowerState(bool isOn) => _presence.NotifyDisplayPowerState(isOn);
 
     private void OnWelcomeBackDetected(WelcomeBackEvent ev)
@@ -2381,37 +2424,147 @@ public sealed class SecretaryController : IDisposable
             return;
 
         _lastProactiveChatUtc = DateTimeOffset.UtcNow;
-        RollNextProactiveMinutes();
 
-        List<string> pinnedTitles;
+        List<string> pinnedReminders;
+        List<string> pendingConfirmations;
         lock (_pinnedLock)
-            pinnedTitles = _pinnedReminders.Select(p => p.Title).ToList();
+        {
+            pendingConfirmations = _pinnedReminders
+                .Where(p => p.Kind == PinnedItemKind.Confirmation)
+                .Select(p => string.IsNullOrWhiteSpace(p.Summary) ? p.Title : $"{p.Title}: {p.Summary}")
+                .ToList();
+            pinnedReminders = _pinnedReminders
+                .Where(p => p.Kind != PinnedItemKind.Confirmation)
+                .Select(p => p.Title)
+                .ToList();
+        }
 
-        var activeWindow = await BuildProactiveWindowLabelAsync(ct);
-        var (reply, ttsText) = await _mainAgent.GenerateProactiveStyleLineAsync(ConversationId, pinnedTitles, ct, activeWindow);
-        if (string.IsNullOrWhiteSpace(reply) || HasRunningTasks || IsDndActive())
+        List<string> upcomingSchedules = new();
+        try
+        {
+            var pending = await _store.GetPendingRemindersAsync(ct);
+            var horizon = DateTimeOffset.Now.AddHours(24);
+            upcomingSchedules = pending
+                .Where(r => r.RemindAt <= horizon)
+                .Take(4)
+                .Select(r => $"{r.RemindAt.ToLocalTime():MM/dd HH:mm} {r.Title}")
+                .ToList();
+        }
+        catch { }
+
+        List<ProactiveTopicKind> recentTopics;
+        lock (_proactiveStateLock)
+            recentTopics = _recentProactiveTopics.ToList();
+
+        var recentCustomShares = await LoadRecentCustomSharesAsync(ct);
+        var activitySnap = await BuildProactiveActivitySnapshotAsync(ct);
+
+        var result = await _mainAgent.GenerateProactiveStyleLineAsync(
+            ConversationId,
+            pinnedReminders,
+            pendingConfirmations,
+            upcomingSchedules,
+            activitySnap,
+            recentTopics,
+            recentCustomShares,
+            ct);
+
+        if (result is not null)
+        {
+            _lastAwarenessLevel = result.AwarenessLevel;
+            _lastAwarenessSource = result.AwarenessSource;
+        }
+
+        // Skip (or suppressed) does NOT count as unanswered check-in.
+        if (result is null || result.Skipped || string.IsNullOrWhiteSpace(result.Reply) || HasRunningTasks || IsDndActive())
+        {
+            RollNextProactiveMinutes();
+            AgentsChanged?.Invoke();
             return;
+        }
+
+        lock (_proactiveStateLock)
+        {
+            _recentProactiveTopics.Add(result.SelectedTopic);
+            while (_recentProactiveTopics.Count > 6)
+                _recentProactiveTopics.RemoveAt(0);
+        }
+
+        if (result.SelectedTopic == ProactiveTopicKind.CustomUserTopic && !string.IsNullOrWhiteSpace(result.SharedSummary))
+            await AppendRecentCustomShareAsync(result.SharedSummary, ct);
+
+        Interlocked.Increment(ref _unansweredProactiveCount);
+        RollNextProactiveMinutes();
 
         var proactiveNow = DateTimeOffset.UtcNow;
         var msg = new ChatMessageRecord
         {
             ConversationId = ConversationId,
             Role = "assistant",
-            Content = reply,
+            Content = result.Reply,
+            TaskId = "proactive",
             CreatedAt = proactiveNow,
             RevealedAt = proactiveNow
         };
         await _store.UpsertChatMessageAsync(msg, ct);
+        AgentsChanged?.Invoke();
         var alertTitle = _localizer.TextCached("AlertTitleDefault", "AI Secretary");
         void RevealProactive()
         {
             StateChanged?.Invoke();
-            ProactiveAlert?.Invoke(alertTitle, reply);
+            ProactiveAlert?.Invoke(alertTitle, result.Reply);
         }
-        if (!string.IsNullOrWhiteSpace(ttsText))
-            _tts.EnqueueJapaneseSpeech(ttsText, RevealProactive);
+        if (!string.IsNullOrWhiteSpace(result.TtsText))
+            _tts.EnqueueJapaneseSpeech(result.TtsText, RevealProactive);
         else
-            _tts.EnqueueSummarySpeech(alertTitle, reply, RevealProactive);
+            _tts.EnqueueSummarySpeech(alertTitle, result.Reply, RevealProactive);
+    }
+
+    private async Task<List<string>> LoadRecentCustomSharesAsync(CancellationToken ct)
+    {
+        lock (_proactiveStateLock)
+        {
+            if (_recentCustomSharesCache is not null)
+                return _recentCustomSharesCache.ToList();
+        }
+
+        var list = new List<string>();
+        try
+        {
+            var json = await _store.GetSyncValueAsync(RecentCustomSharesSyncKey, ct);
+            if (!string.IsNullOrWhiteSpace(json))
+            {
+                var parsed = JsonSerializer.Deserialize<List<string>>(json);
+                if (parsed is not null)
+                    list.AddRange(parsed.Where(s => !string.IsNullOrWhiteSpace(s)).TakeLast(5));
+            }
+        }
+        catch { }
+
+        lock (_proactiveStateLock)
+        {
+            _recentCustomSharesCache ??= list;
+            return _recentCustomSharesCache.ToList();
+        }
+    }
+
+    private async Task AppendRecentCustomShareAsync(string summary, CancellationToken ct)
+    {
+        List<string> snapshot;
+        lock (_proactiveStateLock)
+        {
+            _recentCustomSharesCache ??= new List<string>();
+            _recentCustomSharesCache.Add(summary.Trim());
+            while (_recentCustomSharesCache.Count > 5)
+                _recentCustomSharesCache.RemoveAt(0);
+            snapshot = _recentCustomSharesCache.ToList();
+        }
+
+        try
+        {
+            await _store.SetSyncValueAsync(RecentCustomSharesSyncKey, JsonSerializer.Serialize(snapshot), ct);
+        }
+        catch { }
     }
 
     private static readonly HashSet<string> BrowserProcessNames = new(StringComparer.OrdinalIgnoreCase)
@@ -2419,32 +2572,50 @@ public sealed class SecretaryController : IDisposable
         "msedge", "chrome", "firefox", "brave", "opera", "vivaldi", "arc"
     };
 
-    private async Task<string?> BuildProactiveWindowLabelAsync(CancellationToken ct)
+    private async Task<ProactiveActivitySnapshot?> BuildProactiveActivitySnapshotAsync(CancellationToken ct)
     {
         var lastWin = _activity.GetLastExternalTarget();
         if (lastWin is null)
             return null;
 
-        var uiaTitle = string.IsNullOrWhiteSpace(lastWin.Title) ? lastWin.ProcessName : lastWin.Title.Trim();
+        var uiaTitle = string.IsNullOrWhiteSpace(lastWin.Title) ? null : lastWin.Title.Trim();
         if (!BrowserProcessNames.Contains(lastWin.ProcessName))
-            return $"{lastWin.ProcessName}: {uiaTitle}";
+            return new ProactiveActivitySnapshot(lastWin.ProcessName, uiaTitle, Url: null, IsIncognito: false);
 
-        // If foreground is a browser, try asking the Extension for the active tab title (returns null/incognito if private or not installed).
+        string? browserUrl = null;
+        string? browserTitle = uiaTitle;
+        bool isIncognito = false;
+
         try
         {
             var ext = await _browserBridge.RequestActiveTabTitleAsync(TimeSpan.FromMilliseconds(750), ct);
             if (ext is not null)
             {
+                isIncognito = ext.Incognito;
                 if (ext.Incognito)
-                    return $"{lastWin.ProcessName} (private browsing)";
+                    return new ProactiveActivitySnapshot(lastWin.ProcessName, Title: null, Url: null, IsIncognito: true);
                 if (!string.IsNullOrWhiteSpace(ext.Title))
-                    return $"{lastWin.ProcessName}: {ext.Title.Trim()}";
+                    browserTitle = ext.Title.Trim();
+                if (!string.IsNullOrWhiteSpace(ext.Url))
+                    browserUrl = ext.Url.Trim();
             }
         }
         catch { }
 
-        // Fallback when extension is not installed or timed out: use Windows UIA foreground window title.
-        return $"{lastWin.ProcessName}: {uiaTitle}";
+        if (string.IsNullOrWhiteSpace(browserUrl))
+        {
+            var sig = _activity.GetLastBrowserPageSignal();
+            if (sig is not null && DateTimeOffset.UtcNow - sig.CapturedAt <= TimeSpan.FromMinutes(10))
+                browserUrl = sig.Url;
+        }
+
+        return new ProactiveActivitySnapshot(lastWin.ProcessName, browserTitle, browserUrl, isIncognito);
+    }
+
+    private async Task<string?> BuildProactiveWindowLabelAsync(CancellationToken ct)
+    {
+        var snap = await BuildProactiveActivitySnapshotAsync(ct);
+        return ProactiveTopicEngine.FormatActivityForPrompt(snap, _lastAwarenessLevel);
     }
 
     private async Task RunScheduledSkillSilentlyAsync(ReminderRecord r, CancellationToken ct)

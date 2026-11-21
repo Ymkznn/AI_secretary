@@ -33,6 +33,7 @@ public sealed class SchedulerSettings
     public int ProactiveIdleMinutes { get; set; } = 20;
     public int ProactiveIdleMinMinutes { get; set; } = 12;
     public int ProactiveIdleMaxMinutes { get; set; } = 30;
+    public int ProactiveBackoffMaxMinutes { get; set; } = 60;
     public bool ProactiveEnabledWithStyle { get; set; } = true;
     public bool AfkSilenceEnabled { get; set; } = true;
     public int AfkSilenceMinutes { get; set; } = 15;

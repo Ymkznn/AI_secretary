@@ -20,7 +20,8 @@ public sealed record BrowserDomSnapshot(
 
 public sealed record BrowserTabTitleResult(
     string? Title = null,
-    bool Incognito = false);
+    bool Incognito = false,
+    string? Url = null);
 
 public sealed record BrowserSelectionResult(
     string? Url = null,

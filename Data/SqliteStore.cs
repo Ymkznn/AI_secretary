@@ -1522,7 +1522,8 @@ public sealed class SqliteStore
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT FactId, ConversationId, Category, Summary, Detail, Evidence, Confidence, TagsJson, CreatedAt, UpdatedAt
+            SELECT FactId, ConversationId, Category, Summary, Detail, Evidence, Confidence, TagsJson, CreatedAt, UpdatedAt,
+                   COALESCE(MemoryKey, ''), COALESCE(State, 'Confirmed'), COALESCE(ReinforceCount, 1), ExpiresAt, LastVerifiedAt
             FROM KnowledgeFacts
             WHERE ConversationId = $conv
               AND Category = 'user_pref'
@@ -1551,7 +1552,103 @@ public sealed class SqliteStore
                 reader.GetString(6),
                 tags,
                 DateTimeOffset.Parse(reader.GetString(8)),
-                DateTimeOffset.Parse(reader.GetString(9))));
+                DateTimeOffset.Parse(reader.GetString(9)),
+                MemoryKey: reader.GetString(10),
+                State: reader.GetString(11),
+                ReinforceCount: reader.GetInt32(12),
+                ExpiresAt: reader.IsDBNull(13) ? null : DateTimeOffset.Parse(reader.GetString(13)),
+                LastVerifiedAt: reader.IsDBNull(14) ? null : DateTimeOffset.Parse(reader.GetString(14))));
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// Returns Confirmed, non-expired preference/proactive-topic facts (newest first) for proactive awareness overrides
+    /// and standing user-requested idle topics, never including unconfirmed Candidates.
+    /// </summary>
+    public async Task<List<KnowledgeFactRecord>> GetConfirmedProactivePrefsAsync(
+        string conversationId,
+        CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT FactId, ConversationId, Category, Summary, Detail, Evidence, Confidence, TagsJson, CreatedAt, UpdatedAt,
+                   COALESCE(MemoryKey, ''), COALESCE(State, 'Confirmed'), COALESCE(ReinforceCount, 1), ExpiresAt, LastVerifiedAt
+            FROM KnowledgeFacts
+            WHERE ConversationId = $conv
+              AND lower(Category) IN ('user_pref', 'proactive_topic')
+              AND COALESCE(State, 'Confirmed') = 'Confirmed'
+              AND (ExpiresAt IS NULL OR ExpiresAt > $now)
+            ORDER BY UpdatedAt DESC
+            LIMIT 50;
+            """;
+        cmd.Parameters.AddWithValue("$conv", conversationId);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+
+        var list = new List<KnowledgeFactRecord>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var tagsJson = reader.IsDBNull(7) ? "[]" : reader.GetString(7);
+            var tags = JsonSerializer.Deserialize<List<string>>(tagsJson) ?? new List<string>();
+            list.Add(new KnowledgeFactRecord(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                reader.GetString(6),
+                tags,
+                DateTimeOffset.Parse(reader.GetString(8)),
+                DateTimeOffset.Parse(reader.GetString(9)),
+                MemoryKey: reader.GetString(10),
+                State: reader.GetString(11),
+                ReinforceCount: reader.GetInt32(12),
+                ExpiresAt: reader.IsDBNull(13) ? null : DateTimeOffset.Parse(reader.GetString(13)),
+                LastVerifiedAt: reader.IsDBNull(14) ? null : DateTimeOffset.Parse(reader.GetString(14))));
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// Returns up to <paramref name="limit"/> recent user-authored messages since <paramref name="sinceUtc"/>
+    /// in chronological order, strictly excluding all assistant messages to prevent proactive self-imitation.
+    /// </summary>
+    public async Task<List<string>> GetRecentUserOnlyMessagesAsync(
+        string conversationId,
+        DateTimeOffset sinceUtc,
+        int limit = 3,
+        CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT Content
+            FROM (
+                SELECT Content, CreatedAt, RevealedAt
+                FROM ChatMessages
+                WHERE ConversationId = $conv
+                  AND Role = 'user'
+                  AND COALESCE(RevealedAt, CreatedAt) >= $since
+                  AND trim(COALESCE(Content, '')) <> ''
+                ORDER BY COALESCE(RevealedAt, CreatedAt) DESC, CreatedAt DESC
+                LIMIT $limit
+            )
+            ORDER BY COALESCE(RevealedAt, CreatedAt) ASC, CreatedAt ASC;
+            """;
+        cmd.Parameters.AddWithValue("$conv", conversationId);
+        cmd.Parameters.AddWithValue("$since", sinceUtc.ToString("O"));
+        cmd.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 10));
+
+        var list = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var c = reader.GetString(0)?.Trim();
+            if (!string.IsNullOrWhiteSpace(c))
+                list.Add(c);
         }
         return list;
     }

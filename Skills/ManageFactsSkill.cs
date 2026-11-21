@@ -21,9 +21,10 @@ public sealed class ManageFactsSkill : IBasicSkill
     public string MainAgentSpec => """
         manage_facts
            - Purpose: Record, search, inspect, update, or delete structured long-term memory facts (user_pref, document, project, email, general), AND manage cascade-deleted annotations attached to any of the 6 memory types (fact|workflow|auto_state|schedule|calendar|watcher).
+           - Proactive idle-chat tags (use with category="user_pref"): tag `"proactive_topic"` for explicit ongoing idle-chat topics the user wants shared periodically (e.g., trivia/new knowledge; NOT one-off requests); tag `"proactive_awareness"` with canonical value `low`, `normal`, or `high` in `detail` when the user asks to comment less/more on their active screen during idle check-ins.
            - Args: {"action": "record|search|detail|update|delete|annotate|list_annotations|update_annotation|delete_annotation", "fact_id": "for detail/update/delete", "summary": "...", "detail": "...", "evidence": "...", "category": "document|user_pref|project|email|general", "confidence": "observed|inferred", "tags": ["..."], "keyword": "for search", "limit": 10, "target_type": "fact|workflow|auto_state|schedule|calendar|watcher", "target_id": "for annotate/list_annotations", "annotation_id": "for update_annotation/delete_annotation", "note": "annotation text"}
         """;
-    public string PlannerSpec => """manage_facts: Record/search/detail/update/delete facts, or annotate/list_annotations/update_annotation/delete_annotation on any memory (fact|workflow|auto_state|schedule|calendar|watcher). args: {"action":"record|search|detail|update|delete|annotate|list_annotations|update_annotation|delete_annotation","fact_id":"...","summary":"...","detail":"...","category":"user_pref|document|project|email|general","tags":[],"keyword":"...","target_type":"...","target_id":"...","annotation_id":"...","note":"..."}""";
+    public string PlannerSpec => """manage_facts: Record/search/detail/update/delete facts (with user_pref tags `proactive_topic` for standing idle topics or `proactive_awareness` with `low|normal|high` in detail for screen-comment override), or annotate/list_annotations/update_annotation/delete_annotation on any memory. args: {"action":"record|search|detail|update|delete|annotate|list_annotations|update_annotation|delete_annotation","fact_id":"...","summary":"...","detail":"...","category":"user_pref|document|project|email|general","tags":[],"keyword":"...","target_type":"...","target_id":"...","annotation_id":"...","note":"..."}""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
@@ -78,9 +79,15 @@ public sealed class ManageFactsSkill : IBasicSkill
         var category = ctx.GetArg("category") ?? "general";
         var confidence = ctx.GetArg("confidence") ?? "observed";
         var tags = ctx.GetStringArrayArg("tags");
+        string? memoryKey = null;
+        if (tags is not null && tags.Any(t => string.Equals(t, Services.ProactiveTopicEngine.AwarenessTag, StringComparison.OrdinalIgnoreCase)))
+        {
+            memoryKey = Services.ProactiveTopicEngine.AwarenessTag;
+            category = "user_pref";
+        }
 
         await ctx.OnStatusAsync(await ctx.TextAsync($"skill_status:{ctx.EffectiveName(Name)}", StatusText));
-        var fact = await _skills.RecordFactAsync(ctx.ConversationId, summary, detail, evidence, confidence, category, tags, ctx.Ct);
+        var fact = await _skills.RecordFactAsync(ctx.ConversationId, summary, detail, evidence, confidence, category, tags, ctx.Ct, memoryKey: memoryKey);
         ctx.Observations.Add($"manage_facts: recorded id={fact.FactId} category={fact.Category} confidence={fact.Confidence} summary=\"{fact.Summary}\".");
         ctx.CompletedSteps.Add($"manage_facts:record:{fact.FactId}");
     }

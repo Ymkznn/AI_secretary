@@ -527,9 +527,9 @@ async function handleTabTitle(requestId) {
     const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     if (tab) {
       if (tab.incognito) {
-        result = { title: null, incognito: true };
+        result = { title: null, incognito: true, url: null };
       } else {
-        result = { title: tab.title || '', incognito: false };
+        result = { title: tab.title || '', incognito: false, url: tab.url || '' };
       }
     }
   } catch {}

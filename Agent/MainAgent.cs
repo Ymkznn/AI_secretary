@@ -1003,28 +1003,129 @@ public sealed class MainAgent
     }
 
     /// <summary>
-    /// 依目前啟用的角色語氣設定，產生一句主動關心使用者的搭話與對應語系的語音台詞。
+    /// Resolves effective proactive screen-awareness level with strict precedence:
+    /// Verbal override (Confirmed user_pref tagged proactive_awareness) > cached LLM classification by SHA-256 > default Normal.
     /// </summary>
-    public async Task<(string? Reply, string? TtsText)> GenerateProactiveStyleLineAsync(
+    internal static async Task<(ProactiveAwarenessLevel Level, string Source)> ResolveProactiveAwarenessAsync(
+        SqliteStore store,
+        IModelGateway model,
         string conversationId,
-        IReadOnlyList<string> pinnedTitles,
-        CancellationToken ct = default,
-        string? activeWindow = null)
+        string activeStylePrompt,
+        IReadOnlyList<KnowledgeFactRecord> confirmedProactivePrefs,
+        ILogger? logger,
+        CancellationToken ct)
+    {
+        // 1) Verbal override ALWAYS wins (zero LLM calls needed when overridden).
+        var (overrideLevel, overrideSrc) = ProactiveTopicEngine.ResolveEffectiveAwareness(confirmedProactivePrefs, llmClassifiedLevel: null);
+        if (overrideSrc == "override")
+            return (overrideLevel, "override");
+
+        // 2) Lookup cached 1-time LLM classification by style prompt SHA-256.
+        var hash = ProactiveTopicEngine.ComputeStyleHash(activeStylePrompt);
+        var cacheKey = $"style_awareness:{hash}";
+        var cachedRaw = await store.GetSyncValueAsync(cacheKey, ct);
+        var cachedLevel = ProactiveTopicEngine.TryParseAwarenessLevel(cachedRaw);
+        if (cachedLevel.HasValue)
+            return ProactiveTopicEngine.ResolveEffectiveAwareness(confirmedProactivePrefs, cachedLevel);
+
+        // 3) First time seeing this style hash: classify once with Simple LLM (language-agnostic); default Normal on failure.
+        try
+        {
+            using var classifyCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            classifyCts.CancelAfter(TimeSpan.FromSeconds(15));
+
+            var resp = await model.CompleteAsync(new[]
+            {
+                new ModelMessage("system", MainAgentPrompts.BuildStyleAwarenessClassifySystemPrompt()),
+                new ModelMessage("user", MainAgentPrompts.BuildStyleAwarenessClassifyUserPrompt(activeStylePrompt))
+            }, new LlmCallOptions("MainAgent.StyleClassify", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), classifyCts.Token);
+
+            var raw = (resp.Content ?? "").Trim();
+            var first = raw.IndexOf('{');
+            var last = raw.LastIndexOf('}');
+            if (first >= 0 && last > first) raw = raw[first..(last + 1)];
+
+            ProactiveAwarenessLevel? parsed = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(raw);
+                if (doc.RootElement.TryGetProperty("level", out var lvlEl))
+                    parsed = ProactiveTopicEngine.TryParseAwarenessLevel(lvlEl.GetString());
+            }
+            catch
+            {
+                parsed = ProactiveTopicEngine.TryParseAwarenessLevel(raw);
+            }
+
+            if (parsed.HasValue)
+            {
+                await store.SetSyncValueAsync(cacheKey, ProactiveTopicEngine.ToCanonicalString(parsed.Value), ct);
+                return ProactiveTopicEngine.ResolveEffectiveAwareness(confirmedProactivePrefs, parsed.Value);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger?.LogDebug(ex, "Style awareness classification failed; defaulting to normal.");
+        }
+
+        return (ProactiveAwarenessLevel.Normal, "default");
+    }
+
+    /// <summary>
+    /// 依目前啟用的角色語氣設定與程式抽選出的單一話題，產生一句主動關心搭話或允許跳過（{"skip": true}）。
+    /// 不再將歷史中的自家主動搭話送入模型，徹底切斷自我模仿。
+    /// </summary>
+    public async Task<ProactiveGenerationResult?> GenerateProactiveStyleLineAsync(
+        string conversationId,
+        IReadOnlyList<string> pinnedReminders,
+        IReadOnlyList<string> pendingConfirmations,
+        IReadOnlyList<string> upcomingSchedules,
+        ProactiveActivitySnapshot? activity,
+        IReadOnlyList<ProactiveTopicKind> recentTopics,
+        IReadOnlyList<string> recentSharedCustomSummaries,
+        CancellationToken ct = default)
     {
         var activeStylePrompt = _tts.GetActiveStylePrompt() ?? _styles.GetActiveStylePrompt();
         if (string.IsNullOrWhiteSpace(activeStylePrompt))
-            return (null, null);
+            return null;
 
-        var recent = await _store.GetChatMessagesAsync(conversationId, 20, ct);
-        var history = BuildRecentHistory(recent, maxMessages: 15, perMessageMaxChars: 400, totalMaxChars: 4500);
-        var pinnedText = pinnedTitles.Count == 0 ? "(None)" : string.Join(", ", pinnedTitles);
+        var nowLocal = DateTimeOffset.Now;
+        var confirmedPrefs = await _store.GetConfirmedProactivePrefsAsync(conversationId, ct);
+        var (awarenessLevel, awarenessSource) = await ResolveProactiveAwarenessAsync(
+            _store, _model, conversationId, activeStylePrompt, confirmedPrefs, _logger, ct);
+
+        // OngoingThread sources strictly exclude assistant messages:
+        // 1) last 24h user-only messages (max 3), 2) pending confirmations, 3) recent significant Blackboard results.
+        var userMsgs24h = await _store.GetRecentUserOnlyMessagesAsync(conversationId, DateTimeOffset.UtcNow.AddHours(-24), 3, ct);
+        var bbSnap = _blackboard.GetSnapshot(maxRecentResults: 4, maxAge: TimeSpan.FromHours(6));
+        var bbHighlights = bbSnap.RecentResults
+            .Where(r => r.IsSignificant && !string.IsNullOrWhiteSpace(r.Summary))
+            .TakeLast(3)
+            .Select(r => $"{r.Goal}: {r.Summary}")
+            .ToList();
+
+        var ctx = new ProactiveTopicContext(
+            Now: nowLocal,
+            RecentUserMessages24h: userMsgs24h,
+            PendingConfirmations: pendingConfirmations,
+            RecentBlackboardResults: bbHighlights,
+            PinnedReminders: pinnedReminders,
+            UpcomingSchedules: upcomingSchedules,
+            Activity: activity,
+            CustomTopics: confirmedPrefs,
+            RecentSharedCustomSummaries: recentSharedCustomSummaries,
+            RecentTopics: recentTopics,
+            AwarenessLevel: awarenessLevel);
+
+        var selection = ProactiveTopicEngine.PickTopic(ctx);
         var ttsEnabled = _tts.IsEnabled && _tts.ChatMode != "notify_only";
-        var sys = MainAgentPrompts.BuildProactiveSystemPrompt(activeStylePrompt, _tts.ChatMode == "full", _tts.TargetLang, GetReplyLanguage(), ttsEnabled);
-        var user = MainAgentPrompts.BuildProactiveUserPrompt(
-            DateTimeOffset.Now,
-            pinnedText,
-            string.IsNullOrWhiteSpace(history) ? "(None)" : history,
-            activeWindow);
+        var sys = MainAgentPrompts.BuildProactiveSystemPrompt(
+            activeStylePrompt,
+            _tts.ChatMode == "full",
+            _tts.TargetLang,
+            GetReplyLanguage(),
+            ttsEnabled);
+        var user = MainAgentPrompts.BuildProactiveUserPrompt(nowLocal, selection, recentTopics);
 
         try
         {
@@ -1034,20 +1135,61 @@ public sealed class MainAgent
                 new ModelMessage("user", user)
             }, new LlmCallOptions("MainAgent.Proactive", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), ct);
 
-            var s = resp.Content.Trim();
+            var s = (resp.Content ?? "").Trim();
             var first = s.IndexOf('{');
             var last = s.LastIndexOf('}');
             if (first >= 0 && last > first) s = s[first..(last + 1)];
 
             using var doc = JsonDocument.Parse(s);
+            if (doc.RootElement.TryGetProperty("skip", out var skipEl) &&
+                skipEl.ValueKind == JsonValueKind.True)
+            {
+                return new ProactiveGenerationResult(
+                    Reply: null,
+                    TtsText: null,
+                    Skipped: true,
+                    SelectedTopic: selection.Topic,
+                    SharedSummary: null,
+                    AwarenessLevel: awarenessLevel,
+                    AwarenessSource: awarenessSource);
+            }
+
             var reply = doc.RootElement.TryGetProperty("reply", out var r) ? r.GetString()?.Trim() : null;
-            var ttsText = doc.RootElement.TryGetProperty("tts_text", out var tt) ? tt.GetString()?.Trim() : null;
-            return (string.IsNullOrWhiteSpace(reply) ? null : reply, string.IsNullOrWhiteSpace(ttsText) ? null : ttsText);
+            var ttsText = doc.RootElement.TryGetProperty("tts_text", out var tt) && tt.ValueKind == JsonValueKind.String
+                ? tt.GetString()?.Trim()
+                : null;
+            var sharedSummary = doc.RootElement.TryGetProperty("shared_summary", out var ss) && ss.ValueKind == JsonValueKind.String
+                ? ss.GetString()?.Trim()
+                : null;
+
+            if (string.IsNullOrWhiteSpace(reply))
+            {
+                return new ProactiveGenerationResult(
+                    Reply: null,
+                    TtsText: null,
+                    Skipped: true,
+                    SelectedTopic: selection.Topic,
+                    SharedSummary: null,
+                    AwarenessLevel: awarenessLevel,
+                    AwarenessSource: awarenessSource);
+            }
+
+            if (selection.Topic == ProactiveTopicKind.CustomUserTopic && string.IsNullOrWhiteSpace(sharedSummary))
+                sharedSummary = reply.Length > 60 ? reply[..60] + "…" : reply;
+
+            return new ProactiveGenerationResult(
+                Reply: reply,
+                TtsText: string.IsNullOrWhiteSpace(ttsText) ? null : ttsText,
+                Skipped: false,
+                SelectedTopic: selection.Topic,
+                SharedSummary: sharedSummary,
+                AwarenessLevel: awarenessLevel,
+                AwarenessSource: awarenessSource);
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "Proactive style line generation skipped");
-            return (null, null);
+            return null;
         }
     }
 

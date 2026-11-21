@@ -78,11 +78,14 @@ public static class SystemAutomationPrompts
             - Always provide a short snake_case `memory_key` (e.g., "sleep_schedule", "mail_folder:expense", "reply_style") so repeated observations reinforce the same key instead of duplicating.
             - `state`: use "Confirmed" for directly observed tool results or explicit user rules; use "Candidate" for tentative/inferred chat observations (2nd occurrence auto-promotes to Confirmed).
             - `ttl_hours`: optional integer for temporary conditions (e.g., "these few days", "today only"); omit or null for long-term memory.
-            - Do NOT record one-off transient values (OTP codes, single email body, greetings, jokes).
+            - Do NOT record one-off transient values (OTP codes, single email body, greetings).
+            - Special proactive chat tags (on `category: "user_pref"`, include in `"tags"` array):
+              * `"proactive_topic"`: recurring idle-chat topics the user wants shared periodically (e.g., trivia, new knowledge, security tips). Distinguish one-off requests (e.g., asking for a single joke right now -> either skip or record ONLY as `"state": "Candidate"` with a stable `memory_key` so it promotes to `"Confirmed"` only if requested multiple times) vs explicit ongoing requests (e.g., asking to share new knowledge regularly/occasionally going forward -> `"state": "Confirmed"` + `"tags": ["proactive_topic"]`).
+              * `"proactive_awareness"`: when the user explicitly tells the assistant to comment less or more on what they are doing on screen during idle check-ins (verbal override). Always use `"memory_key": "proactive_awareness"`, `"category": "user_pref"`, `"state": "Confirmed"`, `"tags": ["proactive_awareness"]`, and include the exact canonical word `low`, `normal`, or `high` in `detail` (e.g., `detail: "low - user asked not to comment on active windows"`).
             - Prefer `update` or `delete` when an existing fact is outdated or contradicted.
             - If nothing reusable or corrective was learned, return {"ops": []}.
             - Output ONLY raw JSON (max 2 ops, no markdown fences):
-            {"ops": [{"op": "record|update|delete", "fact_id": "for update/delete", "memory_key": "snake_case_key", "category": "open_category_tag", "state": "Confirmed|Candidate", "ttl_hours": null, "summary": "concise summary", "detail": "clear reusable detail", "evidence": "short basis"}]}
+            {"ops": [{"op": "record|update|delete", "fact_id": "for update/delete", "memory_key": "snake_case_key", "category": "open_category_tag", "state": "Confirmed|Candidate", "ttl_hours": null, "tags": ["optional_tag"], "summary": "concise summary", "detail": "clear reusable detail", "evidence": "short basis"}]}
             """;
 
     public static string BuildMemoryReflectionUserPrompt(

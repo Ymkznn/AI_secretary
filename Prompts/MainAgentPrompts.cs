@@ -207,25 +207,89 @@ public static class MainAgentPrompts
 
         return $$"""
             Roleplay the following persona and proactively greet/check in with the desktop user in 1-2 natural sentences.
-            - Based on current time, active window, recent conversation, and pinned items, vary your check-in topics naturally (e.g., reacting to what the user is watching/working on, light banter, encouragement, or time-of-day remarks) without stiff customer-service phrasing.
-            - Avoid repeating the same care topic (such as drinking water, tea, or resting) back-to-back across consecutive check-ins; only bring it up occasionally when it hasn't been mentioned recently.
-            - Do NOT start every check-in by calling the user's name; omit their name most of the time (especially if recent messages already used it).
+            - The program has already selected ONE `selected_topic` for this check-in. Stay naturally focused on `selected_topic` using ONLY the fields supplied in the user prompt (never invent or guess screen/window contents if `current_activity` is not provided).
+            - Avoid repeating themes listed in `recent_topics` or repeating any content listed in `recent_shared_items`.
+            - Avoid repeating generic care clichés (drinking water, tea, resting) back-to-back; keep phrasing varied and natural, without stiff customer-service tone.
+            - Do NOT start every check-in by calling the user's name; omit their name most of the time.
+            - If there is genuinely nothing natural or worthwhile to say right now, you MAY skip this check-in by returning ONLY: {"skip": true}
             - On-screen `reply` MUST be written strictly in '{{replyLang}}' (NEVER output English prose unless `replyLang` is English).
             - `tts_text` must be {{ttsRule}}.
-            - Output pure JSON only: {"reply": "...", "tts_text": "..."}
+            - Output pure JSON only: {"reply": "...", "tts_text": "...", "shared_summary": "optional <=40-char summary ONLY when selected_topic is custom_user_topic"} OR {"skip": true}
 
             {{activeStylePrompt}}
             """;
     }
 
-    public static string BuildProactiveUserPrompt(DateTimeOffset now, string pinnedText, string history, string? activeWindow = null)
-        => $"""
-            now: {now:yyyy-MM-dd HH:mm (dddd)}
-            active_window: {(string.IsNullOrWhiteSpace(activeWindow) ? "(None)" : activeWindow)}
-            pinned_items: {pinnedText}
-            recent_history:
-            {history}
+    public static string BuildProactiveUserPrompt(
+        DateTimeOffset now,
+        Services.SelectedProactiveTopic selection,
+        IReadOnlyList<Services.ProactiveTopicKind> recentTopics)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"now: {now:yyyy-MM-dd HH:mm (dddd)}");
+        sb.AppendLine($"selected_topic: {Services.ProactiveTopicEngine.ToCanonicalTopicKey(selection.Topic)}");
+        sb.AppendLine($"recent_topics (do not repeat): {(recentTopics.Count == 0 ? "(none)" : string.Join(", ", recentTopics.Select(Services.ProactiveTopicEngine.ToCanonicalTopicKey)))}");
+
+        switch (selection.Topic)
+        {
+            case Services.ProactiveTopicKind.OngoingThread:
+                sb.AppendLine("ongoing_items (user-side & task highlights only):");
+                foreach (var item in selection.OngoingThreadItems)
+                    sb.AppendLine($"- {item}");
+                break;
+
+            case Services.ProactiveTopicKind.RemindersAndSchedules:
+                sb.AppendLine("reminders_and_schedules:");
+                foreach (var item in selection.ReminderItems)
+                    sb.AppendLine($"- {item}");
+                break;
+
+            case Services.ProactiveTopicKind.CurrentActivity:
+                if (!string.IsNullOrWhiteSpace(selection.ActivityPayload))
+                    sb.AppendLine($"current_activity: {selection.ActivityPayload}");
+                break;
+
+            case Services.ProactiveTopicKind.CustomUserTopic:
+                if (selection.SelectedCustomTopic is { } fact)
+                {
+                    sb.AppendLine($"custom_topic_preference: {fact.Summary}" +
+                        (!string.IsNullOrWhiteSpace(fact.Detail) && !string.Equals(fact.Detail, fact.Summary, StringComparison.Ordinal)
+                            ? $" ({fact.Detail})"
+                            : ""));
+                }
+                if (selection.RecentSharedSummaries.Count > 0)
+                {
+                    sb.AppendLine("recent_shared_items (DO NOT repeat any of these):");
+                    foreach (var s in selection.RecentSharedSummaries)
+                        sb.AppendLine($"- {s}");
+                }
+                break;
+
+            case Services.ProactiveTopicKind.PersonaSmallTalk:
+                sb.AppendLine("guidance: Share a brief, in-character casual remark or personal little thought on your own (no screen/task commentary).");
+                break;
+
+            case Services.ProactiveTopicKind.TimeAndLife:
+            default:
+                sb.AppendLine("guidance: Make a natural, light remark fitting the current time of day / day of week.");
+                break;
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    public static string BuildStyleAwarenessClassifySystemPrompt()
+        => """
+            Classify how closely and frequently the desktop assistant persona below should comment on what the user is currently doing on screen during idle check-ins.
+            - "normal" (DEFAULT): friendly, playful, caring, energetic, teasing, or typical companion/secretary personas.
+            - "high": ONLY when the persona explicitly depicts obsessive, possessive, jealous, clingy-monitoring, yandere, menhera, or stalker-like interest in tracking every detail of what the user is doing.
+            - "low": when the persona explicitly depicts aloof, distant, stoic, minimalist, or strictly formal/hands-off behavior that avoids prying into the user's screen.
+            Understand the persona regardless of language (Chinese, Japanese, English, Spanish, etc.).
+            Output ONLY raw JSON: {"level": "low"|"normal"|"high"}
             """;
+
+    public static string BuildStyleAwarenessClassifyUserPrompt(string stylePrompt)
+        => stylePrompt.Length > 4000 ? stylePrompt[..4000] : stylePrompt;
 
     public static string BuildWelcomeBackSystemPrompt(
         string activeStylePrompt,
