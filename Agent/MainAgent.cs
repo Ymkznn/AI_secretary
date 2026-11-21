@@ -1183,15 +1183,38 @@ public sealed class MainAgent
                 startIdx--;
                 sum += contents[startIdx].Content.Length;
             }
+            // Never anchor solely on assistant messages (e.g. after consecutive proactive check-ins):
+            // walk back to include the nearest preceding user message if within budget.
+            if (contents[startIdx].Role == "assistant")
+            {
+                int back = startIdx - 1;
+                int extraSum = sum;
+                while (back >= 0
+                       && eligible.Count - back <= maxMessages
+                       && extraSum + contents[back].Content.Length <= totalMaxChars)
+                {
+                    extraSum += contents[back].Content.Length;
+                    if (contents[back].Role == "user")
+                    {
+                        startIdx = back;
+                        break;
+                    }
+                    back--;
+                }
+            }
             s_historyAnchors[anchorKey] = eligible[startIdx].Id;
         }
 
-        var normalized = new List<ModelMessage>(contents.Count - startIdx);
+        var normalized = new List<ModelMessage>(contents.Count - startIdx + 1);
         for (int i = startIdx; i < contents.Count; i++)
         {
             var (role, content) = contents[i];
             if (normalized.Count == 0 && role == "assistant")
-                continue;
+            {
+                // Preserve leading assistant/proactive turns instead of silently dropping all history:
+                // LLM chat APIs require the first non-system message to have role="user".
+                normalized.Add(new ModelMessage("user", "[Session resumed / proactive check-in]"));
+            }
             if (normalized.Count > 0 && normalized[^1].Role == role)
                 normalized[^1] = new ModelMessage(role, $"{normalized[^1].Content}\n\n{content}");
             else
