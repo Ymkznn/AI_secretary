@@ -46,7 +46,7 @@ public sealed class HolidaySyncAgent
         for (int turn = 0; turn < maxTurns; turn++)
         {
             ct.ThrowIfCancellationRequested();
-            var resp = await _model.CompleteAsync(messages, ModelTier.Simple, ct);
+            var resp = await _model.CompleteAsync(messages, new LlmCallOptions("HolidaySync", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), ct);
             var raw = (resp.Content ?? "").Trim();
             messages.Add(new ModelMessage("assistant", raw));
 

@@ -98,7 +98,7 @@ public sealed class PlannerAgent
         var customSkillsPrompt = PlannerPrompts.FormatCustomSkillsPrompt(customList);
 
         var recent = await _store.GetChatMessagesAsync(conversationId, 80, ct);
-        var historyMessages = MainAgent.BuildHistoryModelMessages(recent, userPrompt, maxMessages: 32, perMessageMaxChars: 3000, totalMaxChars: 36000);
+        var historyMessages = MainAgent.BuildHistoryModelMessages(recent, userPrompt, maxMessages: 20, perMessageMaxChars: 2500, totalMaxChars: 18000);
 
         var recalledFacts = await _store.RecallRelevantFactsAsync(conversationId, userPrompt, 5, ct);
         var factsContext = MainAgentPrompts.FormatFactsContext(recalledFacts);
@@ -143,22 +143,28 @@ public sealed class PlannerAgent
             var workerSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Worker", forceNewSession: true, ct: ct);
             var stepLimit = Math.Min(predSteps.Count, _guard.MaxWorkerStepsPerTask);
 
+            bool allPredOk = true;
             for (int i = 0; i < stepLimit; i++)
             {
                 ct.ThrowIfCancellationRequested();
                 var step = predSteps[i];
                 var skillName = step.Skill.Trim();
                 onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerStep", "Worker running {0} ({1}/{2})...", skillName, i + 1, stepLimit));
-                await _worker.RunStepAsync(
+                var outcome = await _worker.RunStepAsync(
                     conversationId, userPrompt, skillName, step.Args, targetMailId,
                     confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
+                if (outcome != StepOutcome.Ok)
+                {
+                    allPredOk = false;
+                    break;
+                }
             }
 
-            bool predSucceeded = completedSteps.Count == stepLimit &&
-                !observations.Any(o => o.Contains("failed", StringComparison.OrdinalIgnoreCase) || o.Contains("denied", StringComparison.OrdinalIgnoreCase));
+            bool predSucceeded = allPredOk && stepLimit > 0;
 
-            long estSaved = Math.Max(400, (plannerSysPrompt.Length + plannerPrompt.Length) / 3);
+            long estSaved = predSucceeded ? Math.Max(400, (plannerSysPrompt.Length + plannerPrompt.Length) / 3) : 0;
             await _workflowCache.RecordPredictionOutcomeAsync(predictedRec, predSucceeded, estSaved, ct);
+            await _store.InsertPredictionLogAsync("multi_step", predictedRec.WorkflowId, userPrompt, string.Join("->", predSteps.Select(s => s.Skill)), predSucceeded, estSaved, ct);
 
             if (predSucceeded)
             {
@@ -189,14 +195,17 @@ public sealed class PlannerAgent
             var maxRounds = _guard.MaxPlannerRounds;
             var workerSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Worker", forceNewSession: true, ct: ct);
             List<PlannedStep>? firstRoundSteps = null;
-            int firstRoundExecutedCount = 0;
+            bool firstRoundAllOk = true;
 
             for (int round = 1; round <= maxRounds; round++)
             {
                 ct.ThrowIfCancellationRequested();
                 roundsExecuted = round;
 
-                var planResp = await _model.CompleteAsync(planMessages, tier, ct);
+                var planResp = await _model.CompleteAsync(
+                    planMessages,
+                    new LlmCallOptions("PlannerAgent.Plan", tier, CachePolicy.Conversation, LlmPriority.Interactive),
+                    ct);
                 await _sessions.RecordTokensAsync(plannerSession, planResp.EstimatedTokens, ct: ct);
 
                 var (plannedSteps, statusNote, done) = ParsePlanWithStatus(planResp.Content);
@@ -209,7 +218,8 @@ public sealed class PlannerAgent
                 onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerPreparing", "Worker preparing {0} step(s)...", plannedSteps.Count));
                 var stepLimit = Math.Min(plannedSteps.Count, _guard.MaxWorkerStepsPerTask);
                 int obsBefore = observations.Count;
-                int stepsBefore = completedSteps.Count;
+                bool roundHadDenied = false;
+                bool roundHadFailure = false;
 
                 for (int i = 0; i < stepLimit; i++)
                 {
@@ -218,15 +228,17 @@ public sealed class PlannerAgent
                     var skillName = step.Skill.Trim();
                     onStageChanged?.Invoke("worker", _localizer.TextCached("StageWorkerStep", "Worker running {0} ({1}/{2})...", skillName, i + 1, stepLimit));
 
-                    await _worker.RunStepAsync(
+                    var outcome = await _worker.RunStepAsync(
                         conversationId, userPrompt, skillName, step.Args, targetMailId,
                         confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
+                    if (outcome == StepOutcome.Denied) roundHadDenied = true;
+                    else if (outcome == StepOutcome.Failed) roundHadFailure = true;
                 }
 
                 if (round == 1)
                 {
                     firstRoundSteps = plannedSteps;
-                    firstRoundExecutedCount = completedSteps.Count - stepsBefore;
+                    firstRoundAllOk = !roundHadDenied && !roundHadFailure;
                 }
 
                 var roundObs = observations.Skip(obsBefore).ToList();
@@ -245,9 +257,7 @@ public sealed class PlannerAgent
                 }
                 lastNotifCheckUtc = DateTimeOffset.UtcNow;
 
-                wasDeclinedOrDenied = roundObs.Any(o =>
-                    o.Contains("declined", StringComparison.OrdinalIgnoreCase) ||
-                    o.Contains("denied", StringComparison.OrdinalIgnoreCase));
+                wasDeclinedOrDenied = roundHadDenied;
                 if (wasDeclinedOrDenied)
                     break;
 
@@ -267,11 +277,8 @@ public sealed class PlannerAgent
                 new SessionHandoff(goal, completedSteps, new List<string>(), new List<string>(), sources.Select(s => s.MailId).ToList()),
                 ct);
 
-            // Cache clean single-round multi-step workflows for 2-bit branch prediction
-            if (roundsExecuted <= 2 && firstRoundSteps is { Count: >= 2 } &&
-                firstRoundExecutedCount == Math.Min(firstRoundSteps.Count, _guard.MaxWorkerStepsPerTask) &&
-                !wasDeclinedOrDenied &&
-                !observations.Any(o => o.Contains("Execution failed", StringComparison.OrdinalIgnoreCase) || o.Contains(" failed:", StringComparison.OrdinalIgnoreCase)))
+            // Cache clean single-round multi-step workflows for 2-bit branch prediction (only when structured outcome == Ok)
+            if (roundsExecuted <= 2 && firstRoundSteps is { Count: >= 2 } && firstRoundAllOk && !wasDeclinedOrDenied)
             {
                 await _workflowCache.RecordObservedPlanAsync(
                     conversationId,
@@ -318,7 +325,7 @@ public sealed class PlannerAgent
                 mail.SenderName,
                 mail.SenderEmail,
                 mail.Body))
-        }, ct);
+        }, new LlmCallOptions("MailTriage", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), ct);
 
         await _sessions.RecordTokensAsync(triageSession, resp.EstimatedTokens, ct: ct);
 

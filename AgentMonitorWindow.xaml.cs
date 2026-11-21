@@ -254,12 +254,10 @@ public partial class AgentMonitorWindow : Wpf.Ui.Controls.FluentWindow
             {
                 Text = "目前沒有執行中或近期的 Agent 任務。",
                 Opacity = 0.65,
-                Margin = new Thickness(4, 2, 4, 0)
+                Margin = new Thickness(4, 2, 4, 8)
             });
-            return;
         }
-
-        foreach (var run in runs)
+        else foreach (var run in runs)
         {
             var isRunning = run.MainState == "Running" || run.PlannerState == "Running" || run.WorkerState == "Running";
 
@@ -321,6 +319,109 @@ public partial class AgentMonitorWindow : Wpf.Ui.Controls.FluentWindow
 
             card.Child = stack;
             RunsPanel.Children.Add(card);
+        }
+
+        // Learned Rules ("我學到的事") + Recent Learning Ledger
+        var learnedRules = await _controller.GetLearnedStateRulesAsync();
+        var learningEvents = await _controller.GetRecentLearningEventsAsync(12);
+
+        RunsPanel.Children.Add(new TextBlock
+        {
+            Text = $"我學到的事（視窗／網頁自動化規則：{learnedRules.Count}）",
+            FontWeight = FontWeights.SemiBold,
+            FontSize = 13.5,
+            Margin = new Thickness(2, 10, 0, 8)
+        });
+
+        if (learnedRules.Count == 0)
+        {
+            RunsPanel.Children.Add(new TextBlock
+            {
+                Text = "尚未學到任何視窗／網頁自動化規則。",
+                Opacity = 0.65,
+                Margin = new Thickness(4, 0, 4, 10)
+            });
+        }
+        else
+        {
+            foreach (var r in learnedRules.Take(15))
+            {
+                var rcard = new Border
+                {
+                    Background = cardBg,
+                    BorderBrush = cardBorder,
+                    BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(8),
+                    Padding = new Thickness(12, 8, 12, 8),
+                    Margin = new Thickness(0, 0, 0, 6)
+                };
+                var dock = new DockPanel { LastChildFill = true };
+                var forgetBtn = new UiButton
+                {
+                    Content = "忘掉它",
+                    Appearance = UiAppearance.Danger,
+                    Padding = new Thickness(10, 3, 10, 3),
+                    FontSize = 11.5,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                var keyCopy = r.TriggerKey;
+                forgetBtn.Click += async (_, _) => await _controller.ForgetStateRuleAsync(keyCopy);
+                DockPanel.SetDock(forgetBtn, Dock.Right);
+                dock.Children.Add(forgetBtn);
+
+                var statusLabel = r.Status switch
+                {
+                    "Hot" => "自動執行 (Hot)",
+                    "Cold" => "待確認 (Cold)",
+                    "Muted" => "已靜音 (Muted)",
+                    "Ignored" => "暫時略過 (Ignored)",
+                    _ => r.Status
+                };
+                var info = new StackPanel { Margin = new Thickness(0, 0, 10, 0) };
+                info.Children.Add(new TextBlock
+                {
+                    Text = $"{r.TriggerKey}  →  {statusLabel}",
+                    FontWeight = FontWeights.SemiBold,
+                    TextWrapping = TextWrapping.Wrap
+                });
+                info.Children.Add(new TextBlock
+                {
+                    Text = $"動作：{r.StateName}｜命中 {r.HitCount} / 失敗 {r.MissCount}｜上次：{r.LastSeenAt.ToLocalTime():MM-dd HH:mm}",
+                    FontSize = 11.5,
+                    Opacity = 0.72,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 2, 0, 0)
+                });
+                dock.Children.Add(info);
+                rcard.Child = dock;
+                RunsPanel.Children.Add(rcard);
+            }
+        }
+
+        if (learningEvents.Count > 0)
+        {
+            RunsPanel.Children.Add(new TextBlock
+            {
+                Text = $"近期自主學習紀錄（最新 {learningEvents.Count} 筆）",
+                FontWeight = FontWeights.SemiBold,
+                FontSize = 13.5,
+                Margin = new Thickness(2, 8, 0, 6)
+            });
+            foreach (var ev in learningEvents)
+            {
+                var trans = string.IsNullOrWhiteSpace(ev.BeforeState) && string.IsNullOrWhiteSpace(ev.AfterState)
+                    ? ""
+                    : $" ({ev.BeforeState} → {ev.AfterState})";
+                RunsPanel.Children.Add(new TextBlock
+                {
+                    Text = $"• {ev.TimestampUtc.ToLocalTime():HH:mm:ss} [{ev.Learner}] {ev.EventType}{trans} — {ev.SubjectKey}" +
+                           (string.IsNullOrWhiteSpace(ev.Evidence) ? "" : $"｜{ev.Evidence}"),
+                    FontSize = 11.5,
+                    Opacity = 0.78,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(4, 0, 4, 3)
+                });
+            }
         }
     }
 

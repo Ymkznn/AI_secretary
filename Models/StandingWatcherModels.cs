@@ -110,3 +110,53 @@ public sealed record MemoryAnnotationRecord(
     string? SourceFactId,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt);
+
+public sealed record LlmCallLogRecord(
+    long Id,
+    DateTimeOffset TimestampUtc,
+    string Agent,
+    string Tier,
+    string Model,
+    string CachePolicy,
+    string Priority,
+    int UncachedInput,
+    int CacheWrite,
+    int CacheRead,
+    int Output,
+    int LatencyMs,
+    bool Succeeded,
+    string? Error = null);
+
+public sealed record AgentUsageSummary(
+    string Agent,
+    int Calls,
+    long UncachedInput,
+    long CacheWrite,
+    long CacheRead,
+    long Output,
+    double AvgLatencyMs)
+{
+    public long TotalInput => UncachedInput + CacheWrite + CacheRead;
+    public double CacheHitRatePercent => TotalInput == 0 ? 0.0 : Math.Round(CacheRead * 100.0 / TotalInput, 1);
+}
+
+public sealed record LearningEventRecord(
+    long Id,
+    DateTimeOffset TimestampUtc,
+    string Learner,
+    string SubjectKey,
+    string EventType, // observed | promoted | demoted | replayed | replay_ok | replay_fail | snoozed | muted | revived | pruned | skipped
+    string? BeforeState,
+    string? AfterState,
+    string? Evidence);
+
+public sealed record PredictionLogRecord(
+    long Id,
+    DateTimeOffset TimestampUtc,
+    string Source, // single_step | multi_step | state_machine
+    string SubjectKey,
+    string QueryText,
+    string PredictedAction,
+    bool ExecSucceeded,
+    string? ImplicitFeedback, // null | confirmed | corrected_miss
+    long TokensSaved);

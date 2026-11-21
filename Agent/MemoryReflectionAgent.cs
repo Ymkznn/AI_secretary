@@ -83,12 +83,16 @@ public sealed class MemoryReflectionAgent : IDisposable
         CancellationToken ct)
     {
         if (!await _gate.WaitAsync(0, ct))
+        {
+            await _store.InsertLearningEventAsync("MemoryReflection", conversationId, "skipped", null, null, "busy_gate", CancellationToken.None);
             return;
+        }
 
         try
         {
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
+            // Allow enough budget for low-priority pacing queue wait + LLM completion
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(30));
 
             var recalled = await _store.RecallRelevantFactsAsync(conversationId, userPrompt, 6, timeoutCts.Token);
             var existingBlock = recalled.Count == 0
@@ -103,12 +107,15 @@ public sealed class MemoryReflectionAgent : IDisposable
             {
                 new ModelMessage("system", sys),
                 new ModelMessage("user", user)
-            }, ModelTier.Simple, timeoutCts.Token);
+            }, new LlmCallOptions("MemoryReflection", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), timeoutCts.Token);
 
-            await ApplyReflectionOpsAsync(conversationId, resp.Content, defaultState, timeoutCts.Token);
+            var applied = await ApplyReflectionOpsAsync(conversationId, resp.Content, defaultState, timeoutCts.Token);
+            if (applied > 0)
+                await _store.InsertLearningEventAsync("MemoryReflection", conversationId, "observed", null, $"applied:{applied}", userPrompt.Length > 80 ? userPrompt[..80] : userPrompt, CancellationToken.None);
         }
         catch (OperationCanceledException)
         {
+            await _store.InsertLearningEventAsync("MemoryReflection", conversationId, "skipped", null, null, "timeout_or_cancelled", CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -120,9 +127,9 @@ public sealed class MemoryReflectionAgent : IDisposable
         }
     }
 
-    private async Task ApplyReflectionOpsAsync(string conversationId, string? raw, string defaultState, CancellationToken ct)
+    private async Task<int> ApplyReflectionOpsAsync(string conversationId, string? raw, string defaultState, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(raw)) return;
+        if (string.IsNullOrWhiteSpace(raw)) return 0;
 
         var cleaned = raw.Trim();
         if (cleaned.StartsWith("```", StringComparison.Ordinal))
@@ -140,7 +147,7 @@ public sealed class MemoryReflectionAgent : IDisposable
 
         using var doc = JsonDocument.Parse(cleaned);
         if (!doc.RootElement.TryGetProperty("ops", out var opsEl) || opsEl.ValueKind != JsonValueKind.Array)
-            return;
+            return 0;
 
         int applied = 0;
         foreach (var item in opsEl.EnumerateArray())
@@ -198,6 +205,7 @@ public sealed class MemoryReflectionAgent : IDisposable
 
         if (applied > 0)
             _logger.LogInformation("[MemoryReflectionAgent] Applied {Count} memory update(s).", applied);
+        return applied;
     }
 
     public void Dispose() => _gate.Dispose();

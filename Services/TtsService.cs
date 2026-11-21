@@ -429,7 +429,7 @@ public sealed class TtsService : IDisposable
                     new ModelMessage("system", sysPrompt),
                     new ModelMessage("user", userPrompt)
                 },
-                ModelTier.Simple,
+                new LlmCallOptions("Tts.Rewrite", ModelTier.Simple, CachePolicy.None, LlmPriority.Background),
                 ct);
 
             var speechLang = TargetLang;

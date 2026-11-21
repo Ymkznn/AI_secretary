@@ -1867,6 +1867,8 @@ public partial class MainWindow : Window
         }
 
         var (model, endpoint, inTok, outTok, cacheTok) = await _controller.GetModelAndUsageInfoAsync();
+        var cacheWriteTok = await _controller.GetCacheWriteTokensAsync();
+        var agentBreakdown = await _controller.GetLlmUsageByAgentAsync();
         var branchStats = await _controller.GetBranchTelemetryAsync();
         var baseline = await _controller.GetBaselineUsageInfoAsync();
         var dark = ThemeHelper.IsDarkEffective(await _controller.GetThemeModeAsync());
@@ -1910,10 +1912,23 @@ public partial class MainWindow : Window
         AddRow("AI 模型：", model, bold: true);
         AddRow("端點：", endpoint);
         panel.Children.Add(new Separator { Margin = new Thickness(0, 4, 0, 10) });
-        AddRow("累計輸入 Token：", $"{inTok:N0}");
+        long totalIn = inTok + cacheWriteTok + cacheTok;
+        double realCacheHitPct = totalIn == 0 ? 0.0 : Math.Round(cacheTok * 100.0 / totalIn, 1);
+        AddRow("未快取輸入 Token：", $"{inTok:N0}");
+        AddRow("快取寫入 (1.25×)：", $"{cacheWriteTok:N0}");
+        AddRow("快取讀取 (0.1×)：", $"{cacheTok:N0}（命中率 {realCacheHitPct:0.0}%）");
         AddRow("累計輸出 Token：", $"{outTok:N0}");
-        AddRow("累計快取 Token：", $"{cacheTok:N0}");
-        AddRow("總計 Token：", $"{(inTok + outTok + cacheTok):N0}", bold: true);
+        AddRow("總計 Token：", $"{(totalIn + outTok):N0}", bold: true);
+
+        if (agentBreakdown.Count > 0)
+        {
+            panel.Children.Add(new Separator { Margin = new Thickness(0, 4, 0, 10) });
+            AddRow("各 Agent 用量明細：", "(呼叫次數 / 快取命中率 / 總 Token)", bold: true);
+            foreach (var a in agentBreakdown.Take(6))
+            {
+                AddRow($"  {a.Agent}：", $"{a.Calls} 次｜命中 {a.CacheHitRatePercent:0.0}%｜{(a.TotalInput + a.Output):N0}");
+            }
+        }
         panel.Children.Add(new Separator { Margin = new Thickness(0, 4, 0, 10) });
         AddRow("Workflow 快取：", $"Hot {branchStats.HotWorkflows} / Cold {branchStats.ColdWorkflows} (共 {branchStats.TotalWorkflows})");
         AddRow("分支預測命中：", $"{branchStats.Hits} / {branchStats.Predictions} ({branchStats.HitRatePercent:0.0}%)");

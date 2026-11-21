@@ -106,7 +106,7 @@ public sealed class WorkflowOptimizerAgent
             {
                 new ModelMessage("system", sys),
                 new ModelMessage("user", compactPayload)
-            }, ModelTier.Simple, ct);
+            }, new LlmCallOptions("WorkflowOptimizer", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), ct);
 
             var cleanJson = ExtractJsonObject(resp.Content);
             using var doc = JsonDocument.Parse(cleanJson);

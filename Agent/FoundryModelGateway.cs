@@ -1,17 +1,29 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Text.Json;
 using AiSecretary.Desktop.Agent.Providers;
 using AiSecretary.Desktop.Data;
+using AiSecretary.Desktop.Models;
 using AiSecretary.Desktop.Services;
 
 namespace AiSecretary.Desktop.Agent;
 
 public sealed class FoundryModelGateway : IModelGateway
 {
-    private static readonly SemaphoreSlim RateGate = new(1, 1);
-    private static readonly SemaphoreSlim UsageLock = new(1, 1);
+    private static readonly object QueueLock = new();
+    private static readonly Queue<PacingWaiter> InteractiveQueue = new();
+    private static readonly Queue<PacingWaiter> BackgroundQueue = new();
+    private static bool _pacingActive;
     private static DateTimeOffset _lastRequestUtc = DateTimeOffset.MinValue;
+    private static readonly SemaphoreSlim UsageLock = new(1, 1);
+
+    private sealed class PacingWaiter
+    {
+        public TaskCompletionSource<bool> Tcs { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public DateTimeOffset EnqueuedUtc { get; } = DateTimeOffset.UtcNow;
+        public bool Cancelled;
+    }
 
     private readonly HttpClient _http;
     private readonly IConfiguration _config;
@@ -34,11 +46,14 @@ public sealed class FoundryModelGateway : IModelGateway
     }
 
     public Task<ModelResponse> CompleteAsync(IReadOnlyList<ModelMessage> messages, CancellationToken ct = default)
-        => CompleteAsync(messages, ModelTier.Simple, ct);
+        => CompleteAsync(messages, new LlmCallOptions("Unknown", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), ct);
 
-    public async Task<ModelResponse> CompleteAsync(IReadOnlyList<ModelMessage> messages, ModelTier tier, CancellationToken ct = default)
+    public Task<ModelResponse> CompleteAsync(IReadOnlyList<ModelMessage> messages, ModelTier tier, CancellationToken ct = default)
+        => CompleteAsync(messages, new LlmCallOptions("Unknown", tier, CachePolicy.None, LlmPriority.Background), ct);
+
+    public async Task<ModelResponse> CompleteAsync(IReadOnlyList<ModelMessage> messages, LlmCallOptions options, CancellationToken ct = default)
     {
-        var (endpoint, apiKey, model) = await ResolveProfileAsync(tier, ct);
+        var (endpoint, apiKey, model) = await ResolveProfileAsync(options.Tier, ct);
 
         if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(apiKey))
         {
@@ -53,12 +68,13 @@ public sealed class FoundryModelGateway : IModelGateway
         var activeMessages = messages;
         var hasImageAttachments = activeMessages.Any(m => m.Role == "user" && AttachmentExtractor.HasImageAttachment(m.Content));
         var imageFallbackUsed = false;
-        var bodyJson = adapter.BuildRequestJson(activeMessages, model);
+        var bodyJson = adapter.BuildRequestJson(activeMessages, model, options.CachePolicy);
 
+        var sw = Stopwatch.StartNew();
         const int maxRetries = 4;
         for (int attempt = 0; ; attempt++)
         {
-            await WaitForPacingAsync(ct);
+            await WaitForPacingAsync(options.Priority, ct);
 
             using var req = new HttpRequestMessage(HttpMethod.Post, endpoint);
             adapter.ApplyAuthHeaders(req, apiKey);
@@ -83,6 +99,7 @@ public sealed class FoundryModelGateway : IModelGateway
             catch (HttpRequestException ex) when (ex.InnerException is not null)
             {
                 resp?.Dispose();
+                await LogCallFailureAsync(options, model, (int)sw.ElapsedMilliseconds, ex.Message);
                 throw new HttpRequestException($"{ex.Message} ({ex.InnerException.Message})", ex);
             }
             using var _ = resp;
@@ -92,7 +109,7 @@ public sealed class FoundryModelGateway : IModelGateway
                 imageFallbackUsed = true;
                 _logger.LogWarning("LLM API returned 403 on image request (possibly corporate DLP/Forcepoint); stripping image payloads to text placeholders.");
                 activeMessages = AttachmentExtractor.StripImagesToPlaceholder(activeMessages);
-                bodyJson = adapter.BuildRequestJson(activeMessages, model);
+                bodyJson = adapter.BuildRequestJson(activeMessages, model, options.CachePolicy);
                 continue;
             }
 
@@ -108,6 +125,7 @@ public sealed class FoundryModelGateway : IModelGateway
             if (!resp.IsSuccessStatusCode)
             {
                 _logger.LogError("LLM API error {Status}: {Body}", (int)resp.StatusCode, respBody);
+                await LogCallFailureAsync(options, model, (int)sw.ElapsedMilliseconds, $"HTTP {(int)resp.StatusCode}");
                 throw new HttpRequestException($"LLM API error ({(int)resp.StatusCode}): {respBody}");
             }
 
@@ -115,14 +133,20 @@ public sealed class FoundryModelGateway : IModelGateway
             var root = doc.RootElement;
 
             string text = adapter.ExtractResponseText(root);
-            var (inTok, outTok, cacheTok) = adapter.ExtractUsage(root);
-            if (inTok == 0) inTok = Math.Max(16, messages.Sum(m => m.Content.Length) / 3);
-            if (outTok == 0) outTok = Math.Max(8, text.Length / 3);
+            var usage = adapter.ExtractUsage(root);
+            int uncachedIn = usage.UncachedInput;
+            int cacheWrite = usage.CacheWrite;
+            int cacheRead = usage.CacheRead;
+            int outTok = usage.Output;
+            if (uncachedIn == 0 && cacheWrite == 0 && cacheRead == 0)
+                uncachedIn = Math.Max(16, messages.Sum(m => m.Content.Length) / 3);
+            if (outTok == 0)
+                outTok = Math.Max(8, text.Length / 3);
 
-            await AccumulateUsageAsync(inTok, outTok, cacheTok, ct);
+            await AccumulateAndLogUsageAsync(options, model, uncachedIn, cacheWrite, cacheRead, outTok, (int)sw.ElapsedMilliseconds, ct);
 
-            var tokens = Math.Max(64, inTok + outTok);
-            return new ModelResponse(text, tokens, inTok, outTok, cacheTok);
+            var tokens = Math.Max(64, uncachedIn + cacheWrite + cacheRead + outTok);
+            return new ModelResponse(text, tokens, uncachedIn, outTok, cacheRead, cacheWrite);
         }
     }
 
@@ -157,9 +181,41 @@ public sealed class FoundryModelGateway : IModelGateway
     private static string? FirstNonEmpty(params string?[] values)
         => values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v))?.Trim();
 
-    private async Task WaitForPacingAsync(CancellationToken ct)
+    /// <summary>
+    /// Priority pacing queue: Interactive calls jump ahead of Background calls, with 12s anti-starvation aging
+    /// so background tasks (MemoryReflection, Triage, Optimizer) never starve indefinitely.
+    /// </summary>
+    private async Task WaitForPacingAsync(LlmPriority priority, CancellationToken ct)
     {
-        await RateGate.WaitAsync(ct);
+        PacingWaiter? waiter = null;
+        bool acquiredImmediately = false;
+        lock (QueueLock)
+        {
+            if (!_pacingActive)
+            {
+                _pacingActive = true;
+                acquiredImmediately = true;
+            }
+            else
+            {
+                waiter = new PacingWaiter();
+                if (priority == LlmPriority.Interactive)
+                    InteractiveQueue.Enqueue(waiter);
+                else
+                    BackgroundQueue.Enqueue(waiter);
+            }
+        }
+
+        if (!acquiredImmediately && waiter is not null)
+        {
+            using var reg = ct.Register(() =>
+            {
+                lock (QueueLock) { waiter.Cancelled = true; }
+                waiter.Tcs.TrySetCanceled(ct);
+            });
+            await waiter.Tcs.Task;
+        }
+
         try
         {
             var minIntervalMs = _config.GetValue<int>("Foundry:MinRequestIntervalMs", 1500);
@@ -171,8 +227,47 @@ public sealed class FoundryModelGateway : IModelGateway
         }
         finally
         {
-            RateGate.Release();
+            ReleaseNextWaiter();
         }
+    }
+
+    private static void ReleaseNextWaiter()
+    {
+        PacingWaiter? next = null;
+        lock (QueueLock)
+        {
+            var now = DateTimeOffset.UtcNow;
+            // Anti-starvation: if oldest background waiter has waited >= 12s, let it go next.
+            bool bgStarved = BackgroundQueue.Count > 0 &&
+                             !BackgroundQueue.Peek().Cancelled &&
+                             (now - BackgroundQueue.Peek().EnqueuedUtc) >= TimeSpan.FromSeconds(12);
+
+            while (next is null)
+            {
+                if (!bgStarved && InteractiveQueue.Count > 0)
+                {
+                    var cand = InteractiveQueue.Dequeue();
+                    if (!cand.Cancelled) next = cand;
+                }
+                else if (BackgroundQueue.Count > 0)
+                {
+                    var cand = BackgroundQueue.Dequeue();
+                    if (!cand.Cancelled) next = cand;
+                    bgStarved = false;
+                }
+                else if (InteractiveQueue.Count > 0)
+                {
+                    var cand = InteractiveQueue.Dequeue();
+                    if (!cand.Cancelled) next = cand;
+                }
+                else
+                {
+                    _pacingActive = false;
+                    return;
+                }
+            }
+        }
+        next.Tcs.TrySetResult(true);
     }
 
     private static bool IsTransientNetworkError(Exception ex, CancellationToken ct)
@@ -200,23 +295,69 @@ public sealed class FoundryModelGateway : IModelGateway
         return TimeSpan.FromSeconds(baseSec) + TimeSpan.FromMilliseconds(jitterMs);
     }
 
-    private async Task AccumulateUsageAsync(int inTok, int outTok, int cacheTok, CancellationToken ct)
+    private async Task AccumulateAndLogUsageAsync(
+        LlmCallOptions options,
+        string model,
+        int uncachedIn,
+        int cacheWrite,
+        int cacheRead,
+        int outTok,
+        int latencyMs,
+        CancellationToken ct)
     {
         await UsageLock.WaitAsync(ct);
         try
         {
-            await AddCounterAsync("tokens_input", inTok, ct);
+            await AddCounterAsync("tokens_input", uncachedIn, ct);
+            await AddCounterAsync("tokens_cache_write", cacheWrite, ct);
+            await AddCounterAsync("tokens_cache", cacheRead, ct);
             await AddCounterAsync("tokens_output", outTok, ct);
-            await AddCounterAsync("tokens_cache", cacheTok, ct);
+            await _store.InsertLlmCallLogAsync(new LlmCallLogRecord(
+                Id: 0,
+                TimestampUtc: DateTimeOffset.UtcNow,
+                Agent: options.Agent,
+                Tier: options.Tier.ToString(),
+                Model: model,
+                CachePolicy: options.CachePolicy.ToString(),
+                Priority: options.Priority.ToString(),
+                UncachedInput: uncachedIn,
+                CacheWrite: cacheWrite,
+                CacheRead: cacheRead,
+                Output: outTok,
+                LatencyMs: latencyMs,
+                Succeeded: true), ct);
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Failed to persist token usage");
+            _logger.LogDebug(ex, "Failed to persist token usage / LlmCallLog");
         }
         finally
         {
             UsageLock.Release();
         }
+    }
+
+    private async Task LogCallFailureAsync(LlmCallOptions options, string model, int latencyMs, string error)
+    {
+        try
+        {
+            await _store.InsertLlmCallLogAsync(new LlmCallLogRecord(
+                Id: 0,
+                TimestampUtc: DateTimeOffset.UtcNow,
+                Agent: options.Agent,
+                Tier: options.Tier.ToString(),
+                Model: model,
+                CachePolicy: options.CachePolicy.ToString(),
+                Priority: options.Priority.ToString(),
+                UncachedInput: 0,
+                CacheWrite: 0,
+                CacheRead: 0,
+                Output: 0,
+                LatencyMs: latencyMs,
+                Succeeded: false,
+                Error: error), CancellationToken.None);
+        }
+        catch { }
     }
 
     private async Task AddCounterAsync(string key, int delta, CancellationToken ct)

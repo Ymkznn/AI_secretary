@@ -628,6 +628,28 @@ public sealed class SecretaryController : IDisposable
         return (model, endpoint, inTok, outTok, cacheTok);
     }
 
+    public async Task<long> GetCacheWriteTokensAsync()
+    {
+        var raw = await _store.GetSyncValueAsync("tokens_cache_write", _appCts.Token);
+        return long.TryParse(raw, out var v) ? v : 0L;
+    }
+
+    public Task<List<AgentUsageSummary>> GetLlmUsageByAgentAsync(CancellationToken ct = default)
+        => _store.GetLlmUsageByAgentAsync(ct);
+
+    public Task<List<AutoStateRuleRecord>> GetLearnedStateRulesAsync(CancellationToken ct = default)
+        => _stateMachine.GetAllRulesAsync(ct);
+
+    public async Task ForgetStateRuleAsync(string triggerKey, CancellationToken ct = default)
+    {
+        await _stateMachine.DeleteRuleAsync(triggerKey, ct);
+        await _store.InsertLearningEventAsync("StateMachine", triggerKey, "pruned", "UserForgot", "Deleted", "user clicked forget", ct);
+        AgentsChanged?.Invoke();
+    }
+
+    public Task<List<LearningEventRecord>> GetRecentLearningEventsAsync(int limit = 20, CancellationToken ct = default)
+        => _store.GetRecentLearningEventsAsync(limit, ct);
+
     public async Task<BaselineUsageSnapshot?> GetBaselineUsageInfoAsync()
     {
         var ct = _appCts.Token;

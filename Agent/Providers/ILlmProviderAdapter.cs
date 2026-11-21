@@ -12,7 +12,7 @@ public interface ILlmProviderAdapter
     bool CanHandle(string endpoint);
     string PrepareEndpoint(string endpoint, string model) => endpoint;
     void ApplyAuthHeaders(HttpRequestMessage request, string apiKey);
-    string BuildRequestJson(IReadOnlyList<ModelMessage> messages, string model);
+    string BuildRequestJson(IReadOnlyList<ModelMessage> messages, string model, CachePolicy cachePolicy = CachePolicy.Conversation);
     string ExtractResponseText(JsonElement root);
-    (int Input, int Output, int Cache) ExtractUsage(JsonElement root);
+    TokenUsage ExtractUsage(JsonElement root);
 }

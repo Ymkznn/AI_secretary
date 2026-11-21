@@ -5,16 +5,22 @@ using AiSecretary.Desktop.Skills;
 
 namespace AiSecretary.Desktop.Agent;
 
-/// <summary>Worker 執行工具後回報給 MainAgent 或 Planner 的純資料結果（不含對使用者的自然語言回覆）。</summary>
+/// <summary>
+/// Worker 執行工具後回報給 MainAgent 或 Planner 的純資料結果（不含對使用者的自然語言回覆）。
+/// - <see cref="Handled"/>：流程控制旗標（只要技能有產生回應即為 true，例如「收件匣無未讀」不該誤退回 Planner 重跑）。
+/// - <see cref="Succeeded"/>：學習與預測統計旗標（僅在 <see cref="StepOutcome.Ok"/> 時為 true，避免失敗或被拒執行汙染訓練資料或算成命中）。
+/// </summary>
 public sealed record WorkerReport(
     bool Handled,
+    bool Succeeded,
+    StepOutcome Outcome,
     List<string> Observations,
     List<MailSourceRef> Sources,
     List<string> CompletedSteps);
 
 /// <summary>
 /// 純工具執行代理（Worker）：只負責呼叫內建技能（<see cref="SkillRegistry"/>）或自訂技能（<see cref="CustomSkillService"/>），
-/// 絕不呼叫 LLM，也絕不直接與使用者對話；執行完畢後僅將原始結果回報給呼叫端（<see cref="PlannerAgent"/> 或 <see cref="MainAgent"/>）。
+/// 絕不呼叫 LLM，也絕不直接與使用者對話；執行完畢後僅將結構化結果回報給呼叫端（<see cref="PlannerAgent"/> 或 <see cref="MainAgent"/>）。
 /// </summary>
 public sealed class WorkerAgent
 {
@@ -56,17 +62,20 @@ public sealed class WorkerAgent
         var observations = new List<string>();
         var completedSteps = new List<string>();
 
-        await RunStepAsync(
+        var outcome = await RunStepAsync(
             conversationId, userPrompt, skillName.Trim(), args, targetMailId,
             confirmAsync, onStatusAsync, sources, observations, completedSteps, ct, taskId);
 
-        return new WorkerReport(observations.Count > 0, observations, sources, completedSteps);
+        bool handled = observations.Count > 0;
+        bool succeeded = handled && outcome == StepOutcome.Ok;
+        return new WorkerReport(handled, succeeded, outcome, observations, sources, completedSteps);
     }
 
     /// <summary>
-    /// 執行單一規劃步驟（由 <see cref="SkillRegistry"/> 派發內建技能，或轉交 <see cref="CustomSkillService"/> 執行自訂技能）。
+    /// 執行單一規劃步驟（由 <see cref="SkillRegistry"/> 派發內建技能，或轉交 <see cref="CustomSkillService"/> 執行自訂技能），
+    /// 回傳結構化 <see cref="StepOutcome"/>（避免用脆弱的字串比對誤判郵件主旨中的 "failed"）。
     /// </summary>
-    public async Task RunStepAsync(
+    public async Task<StepOutcome> RunStepAsync(
         string conversationId,
         string userPrompt,
         string skillName,
@@ -82,45 +91,61 @@ public sealed class WorkerAgent
     {
         var basic = _skillRegistry.FindBasic(skillName);
         if (basic is null)
-        {
-            await ExecuteCustomStepAsync(skillName, args, observations, completedSteps, taskId, onStatusAsync, ct);
-            return;
-        }
+            return await ExecuteCustomStepAsync(skillName, args, observations, completedSteps, taskId, onStatusAsync, ct);
 
         var (record, handler) = basic.Value;
         var check = _guard.CheckSkillExecution(record.Name);
         if (!check.Allowed)
         {
             observations.Add($"Skill {record.Name} denied by Guard: {check.Reason}");
-            return;
+            return StepOutcome.Denied;
         }
+
+        int obsBefore = observations.Count;
+        var ctx = new SkillExecutionContext
+        {
+            SkillName = record.Name,
+            ConversationId = conversationId,
+            UserPrompt = userPrompt,
+            Args = args,
+            TargetMailId = targetMailId,
+            ConfirmAsync = confirmAsync,
+            OnStatusAsync = onStatusAsync,
+            LocalizeAsync = (k, en, a) => _localizer.TextAsync(k, en, a, ct),
+            Sources = sources,
+            Observations = observations,
+            CompletedSteps = completedSteps,
+            Ct = ct
+        };
 
         try
         {
-            await handler.ExecuteAsync(new SkillExecutionContext
+            await handler.ExecuteAsync(ctx);
+            if (ctx.Outcome != StepOutcome.Ok)
+                return ctx.Outcome;
+
+            // Secondary guard only for explicit skill-prefix denial/decline messages produced by skills themselves
+            for (int i = obsBefore; i < observations.Count; i++)
             {
-                SkillName = record.Name,
-                ConversationId = conversationId,
-                UserPrompt = userPrompt,
-                Args = args,
-                TargetMailId = targetMailId,
-                ConfirmAsync = confirmAsync,
-                OnStatusAsync = onStatusAsync,
-                LocalizeAsync = (k, en, a) => _localizer.TextAsync(k, en, a, ct),
-                Sources = sources,
-                Observations = observations,
-                CompletedSteps = completedSteps,
-                Ct = ct
-            });
+                var obs = observations[i];
+                if (obs.StartsWith($"{record.Name}:", StringComparison.OrdinalIgnoreCase) &&
+                    (obs.Contains("user declined", StringComparison.OrdinalIgnoreCase) ||
+                     obs.Contains("denied by Guard", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return StepOutcome.Denied;
+                }
+            }
+            return StepOutcome.Ok;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogDebug(ex, "Worker step {Skill} failed", record.Name);
             observations.Add($"{record.Name} failed: {ex.Message}");
+            return StepOutcome.Failed;
         }
     }
 
-    private async Task ExecuteCustomStepAsync(
+    private async Task<StepOutcome> ExecuteCustomStepAsync(
         string skillName,
         JsonElement args,
         List<string> observations,
@@ -133,13 +158,13 @@ public sealed class WorkerAgent
         if (skill is null)
         {
             observations.Add($"Custom skill not found: {skillName}");
-            return;
+            return StepOutcome.Failed;
         }
         var check = _guard.CheckSkillExecution(skill.Name);
         if (!check.Allowed)
         {
             observations.Add($"Custom skill disabled: {skill.Name}");
-            return;
+            return StepOutcome.Denied;
         }
 
         var statusMsg = await _localizer.TextAsync("CustomSkillRunning", "Running {0}...", new object?[] { skill.Name }, ct);
@@ -152,10 +177,17 @@ public sealed class WorkerAgent
             var output = await _customSkills.ExecuteAsync(skill, extraArgs, taskId, ct);
             observations.Add($"custom:{skill.Name} output:\n{output}");
             completedSteps.Add($"custom:{skill.Name}");
+            if (output.StartsWith("Execution failed", StringComparison.OrdinalIgnoreCase))
+                return StepOutcome.Failed;
+            if (output.Contains("declined", StringComparison.OrdinalIgnoreCase) ||
+                output.Contains("denied", StringComparison.OrdinalIgnoreCase))
+                return StepOutcome.Denied;
+            return StepOutcome.Ok;
         }
         catch (Exception ex)
         {
             observations.Add($"custom:{skill.Name} failed: {ex.Message}");
+            return StepOutcome.Failed;
         }
     }
 

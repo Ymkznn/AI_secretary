@@ -33,7 +33,7 @@ public sealed class GeminiProviderAdapter : ILlmProviderAdapter
         request.Headers.Add("x-goog-api-key", apiKey);
     }
 
-    public string BuildRequestJson(IReadOnlyList<ModelMessage> messages, string model)
+    public string BuildRequestJson(IReadOnlyList<ModelMessage> messages, string model, CachePolicy cachePolicy = CachePolicy.Conversation)
     {
         var systemPrompt = string.Join("\n\n", messages.Where(m => m.Role == "system").Select(m => m.Content));
         var contents = messages
@@ -80,7 +80,7 @@ public sealed class GeminiProviderAdapter : ILlmProviderAdapter
         return "";
     }
 
-    public (int Input, int Output, int Cache) ExtractUsage(JsonElement root)
+    public TokenUsage ExtractUsage(JsonElement root)
     {
         int input = 0, output = 0, cache = 0;
         if (root.TryGetProperty("usageMetadata", out var gmUsage) && gmUsage.ValueKind == JsonValueKind.Object)
@@ -90,7 +90,7 @@ public sealed class GeminiProviderAdapter : ILlmProviderAdapter
             if (gmUsage.TryGetProperty("cachedContentTokenCount", out var cc) && cc.TryGetInt32(out var ccv)) cache = ccv;
         }
         var nonCachedInput = Math.Max(0, input - cache);
-        return (nonCachedInput, output, cache);
+        return new TokenUsage(nonCachedInput, 0, cache, output);
     }
 
     private static object[] BuildParts(string text)

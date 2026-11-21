@@ -168,9 +168,9 @@ public static class MainAgentPrompts
             {{{factsContext}}}
             </persistent_memory>{{{activeWindowBlock}}}
 
-            <untrusted_context>
-            user_input: {{{userPrompt}}}
-            </untrusted_context>
+            <user_input>
+            {{{userPrompt}}}
+            </user_input>
             """;
     }
 

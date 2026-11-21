@@ -209,7 +209,7 @@ public sealed class UiLocalizer
             {
                 new ModelMessage("system", SystemAutomationPrompts.BuildUiTranslateSystemPrompt(lang)),
                 new ModelMessage("user", englishTemplate)
-            }, ModelTier.Simple, timeoutCts.Token);
+            }, new LlmCallOptions("UiLocalizer", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), timeoutCts.Token);
 
             var translated = (resp.Content ?? "").Trim();
             if (!string.IsNullOrWhiteSpace(translated) && HasSamePlaceholders(englishTemplate, translated))
@@ -245,7 +245,7 @@ public sealed class UiLocalizer
             {
                 new ModelMessage("system", SystemAutomationPrompts.BuildUiBatchTranslateSystemPrompt(lang)),
                 new ModelMessage("user", jsonIn)
-            }, ModelTier.Simple, ct);
+            }, new LlmCallOptions("UiLocalizer.Batch", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), ct);
 
             var raw = StripJsonFences((resp.Content ?? "").Trim());
             if (string.IsNullOrWhiteSpace(raw)) continue;

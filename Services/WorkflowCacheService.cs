@@ -247,28 +247,35 @@ public sealed class WorkflowCacheService
             var prevSteps = ParseSteps(match.StepsJson);
             bool sameSkill = prevSteps.Count == 1 && string.Equals(prevSteps[0].Skill, skill, StringComparison.OrdinalIgnoreCase);
             int nextCounter = sameSkill ? Math.Min(3, match.PredictorCounter + 1) : 1;
+            var nextStatus = nextCounter >= 2 ? "Hot" : "Cold";
+            // Keep HitCount strictly for actual predicted replays (never conflate training observations with hits).
             await _store.UpsertWorkflowCacheAsync(match with
             {
                 StepsJson = stepsJson,
                 PredictorCounter = nextCounter,
-                HitCount = sameSkill ? match.HitCount + 1 : match.HitCount,
-                Status = nextCounter >= 2 ? "Hot" : "Cold",
+                Status = nextStatus,
                 LastUsedAt = DateTimeOffset.UtcNow
             }, ct);
+            await _store.InsertLearningEventAsync(
+                "WorkflowCache", match.WorkflowId,
+                match.Status != "Hot" && nextStatus == "Hot" ? "promoted" : "observed",
+                match.Status, nextStatus, $"{skill} ({sigCore})", ct);
         }
         else
         {
+            var wfId = Guid.NewGuid().ToString("N")[..12];
             await _store.UpsertWorkflowCacheAsync(new WorkflowCacheRecord(
-                WorkflowId: Guid.NewGuid().ToString("N")[..12],
+                WorkflowId: wfId,
                 ConversationId: conversationId,
                 GoalSignature: sig,
                 StepsJson: stepsJson,
                 PredictorCounter: 1,
-                HitCount: 1,
+                HitCount: 0,
                 MissCount: 0,
                 Status: "Cold",
                 LastUsedAt: DateTimeOffset.UtcNow,
                 CreatedAt: DateTimeOffset.UtcNow), ct);
+            await _store.InsertLearningEventAsync("WorkflowCache", wfId, "observed", "None", "Cold", $"{skill} ({sigCore})", ct);
         }
     }
 
@@ -336,16 +343,20 @@ public sealed class WorkflowCacheService
         if (match is not null)
         {
             int nextCounter = Math.Min(3, match.PredictorCounter + 1);
+            var nextStatus = nextCounter >= 2 ? "Hot" : "Cold";
             var updated = match with
             {
                 StepsJson = stepsJson,
                 PredictorCounter = nextCounter,
-                HitCount = match.HitCount + 1,
-                Status = nextCounter >= 2 ? "Hot" : "Cold",
+                Status = nextStatus,
                 LastUsedAt = DateTimeOffset.UtcNow
             };
             await _store.UpsertWorkflowCacheAsync(updated, ct);
             workflowId = match.WorkflowId;
+            await _store.InsertLearningEventAsync(
+                "WorkflowCache", workflowId,
+                match.Status != "Hot" && nextStatus == "Hot" ? "promoted" : "observed",
+                match.Status, nextStatus, string.Join(" -> ", steps.Select(s => s.Skill)), ct);
         }
         else
         {
@@ -355,13 +366,14 @@ public sealed class WorkflowCacheService
                 GoalSignature: sig,
                 StepsJson: stepsJson,
                 PredictorCounter: 1, // Weakly Not Taken initially
-                HitCount: 1,
+                HitCount: 0,
                 MissCount: 0,
                 Status: "Cold",
                 LastUsedAt: DateTimeOffset.UtcNow,
                 CreatedAt: DateTimeOffset.UtcNow);
             await _store.UpsertWorkflowCacheAsync(created, ct);
             workflowId = created.WorkflowId;
+            await _store.InsertLearningEventAsync("WorkflowCache", workflowId, "observed", "None", "Cold", string.Join(" -> ", steps.Select(s => s.Skill)), ct);
         }
 
         if (sourcePrefs is { Count: > 0 })

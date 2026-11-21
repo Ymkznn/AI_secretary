@@ -99,7 +99,7 @@ public sealed class MainAgent
         var mainSession = await _sessions.GetOrRotateSessionAsync(conversationId, "Main", ct: ct);
 
         var recent = await _store.GetChatMessagesAsync(conversationId, 80, ct);
-        var historyMessages = BuildHistoryModelMessages(recent, userPrompt, maxMessages: 32, perMessageMaxChars: 3000, totalMaxChars: 36000);
+        var historyMessages = BuildHistoryModelMessages(recent, userPrompt, maxMessages: 20, perMessageMaxChars: 2500, totalMaxChars: 18000);
 
         var recalledFacts = await _store.RecallRelevantFactsAsync(conversationId, userPrompt, 5, ct);
         var factsContext = MainAgentPrompts.FormatFactsContext(recalledFacts);
@@ -177,7 +177,8 @@ public sealed class MainAgent
                             bgCt, taskId);
                         if (report.Handled)
                         {
-                            await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: true, estimatedTokensSaved: 350, bgCt);
+                            await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: report.Succeeded, estimatedTokensSaved: report.Succeeded ? 350 : 0, bgCt);
+                            await _store.InsertPredictionLogAsync("single_step", predWf.WorkflowId, userPrompt, predSkill, report.Succeeded, report.Succeeded ? 350 : 0, bgCt);
                             onSingleSkillFinished?.Invoke(taskId);
                             onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", predSkill));
                             await SynthesizeFinalReplyAsync(
@@ -189,6 +190,7 @@ public sealed class MainAgent
                         }
 
                         await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: false, estimatedTokensSaved: 0, bgCt);
+                        await _store.InsertPredictionLogAsync("single_step", predWf.WorkflowId, userPrompt, predSkill, false, 0, bgCt);
                         onStageChanged?.Invoke("planner", _localizer.TextCached("StagePlannerPlanning", "MainAgent -> Planner ({0})...", "Simple"));
                         var plannerTaskId = resolveLogicalTaskId is not null
                             ? resolveLogicalTaskId("call_planner", null, userPrompt)
@@ -217,7 +219,8 @@ public sealed class MainAgent
                     s => onStatusAsync(s), ct, taskId);
                 if (syncReport.Handled)
                 {
-                    await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: true, estimatedTokensSaved: 350, ct);
+                    await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: syncReport.Succeeded, estimatedTokensSaved: syncReport.Succeeded ? 350 : 0, ct);
+                    await _store.InsertPredictionLogAsync("single_step", predWf.WorkflowId, userPrompt, predSkill, syncReport.Succeeded, syncReport.Succeeded ? 350 : 0, ct);
                     onSingleSkillFinished?.Invoke(taskId);
                     onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", predSkill));
                     await SynthesizeFinalReplyAsync(
@@ -229,11 +232,15 @@ public sealed class MainAgent
                 }
 
                 await _workflowCache.RecordPredictionOutcomeAsync(predWf, hit: false, estimatedTokensSaved: 0, ct);
+                await _store.InsertPredictionLogAsync("single_step", predWf.WorkflowId, userPrompt, predSkill, false, 0, ct);
             }
         }
 
         var routeMessages = basePromptMessages;
-        var routeResp = await _model.CompleteAsync(routeMessages, ModelTier.Simple, ct);
+        var routeResp = await _model.CompleteAsync(
+            routeMessages,
+            new LlmCallOptions("MainAgent.Route", ModelTier.Simple, CachePolicy.Conversation, LlmPriority.Interactive),
+            ct);
 
         await _sessions.RecordTokensAsync(mainSession, routeResp.EstimatedTokens, ct: ct);
 
@@ -288,8 +295,11 @@ public sealed class MainAgent
                         bgCt, taskId);
                     if (report.Handled)
                     {
-                        await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, bgCt);
-                        await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, bgCt);
+                        if (report.Succeeded)
+                        {
+                            await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, bgCt);
+                            await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, bgCt);
+                        }
                         onSingleSkillFinished?.Invoke(taskId);
                         onStageChanged?.Invoke("worker_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
                         await SynthesizeFinalReplyAsync(
@@ -332,8 +342,11 @@ public sealed class MainAgent
                 conversationId, userPrompt, skill, args, targetMailId, confirmAsync, workerStatusAsync, ct, taskId);
             if (syncReport.Handled)
             {
-                await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, ct);
-                await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, ct);
+                if (syncReport.Succeeded)
+                {
+                    await _workflowCache.RecordObservedSingleSkillAsync(conversationId, userPrompt, skill, args, ct);
+                    await _stateMachine.ObserveUserSkillExecutionAsync(_activity.GetLastExternalTarget(), skill, args, ct);
+                }
                 onSingleSkillFinished?.Invoke(taskId);
                 onStageChanged?.Invoke("main_done", _localizer.TextCached("StageWorkerDone", "Worker finished {0}", skill));
                 await SynthesizeFinalReplyAsync(
@@ -450,7 +463,10 @@ public sealed class MainAgent
         finalMessages.Add(new("assistant", routingAssistantJson));
         finalMessages.Add(new("user", synthesisPrompt));
 
-        var finalResp = await _model.CompleteAsync(finalMessages, tier, ct);
+        var finalResp = await _model.CompleteAsync(
+            finalMessages,
+            new LlmCallOptions("MainAgent.FinalReply", tier, CachePolicy.Conversation, LlmPriority.Interactive),
+            ct);
         WorkerAgent.CleanupTempScreenshots(observations);
         await _sessions.RecordTokensAsync(mainSession, finalResp.EstimatedTokens, ct: ct);
 
@@ -495,7 +511,7 @@ public sealed class MainAgent
         {
             new ModelMessage("system", sys),
             new ModelMessage("user", PlannerPrompts.BuildSingleSkillUserPrompt(prefContext, prompt, report.Observations))
-        }, ModelTier.Simple, ct);
+        }, new LlmCallOptions("MainAgent.ScheduledSummary", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), ct);
 
         WorkerAgent.CleanupTempScreenshots(report.Observations);
         await _sessions.RecordTokensAsync(mainSession, resp.EstimatedTokens, ct: ct);
@@ -549,7 +565,7 @@ public sealed class MainAgent
             {
                 new ModelMessage("system", sys),
                 new ModelMessage("user", user)
-            }, ModelTier.Simple, ct);
+            }, new LlmCallOptions("MainAgent.Proactive", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), ct);
 
             var s = resp.Content.Trim();
             var first = s.IndexOf('{');
@@ -697,7 +713,9 @@ public sealed class MainAgent
         for (int i = 0; i < eligible.Count; i++)
         {
             var m = eligible[i];
-            var role = m.Role == "user" ? "user" : "assistant";
+            // Map notification to "user" role with [System Notification] prefix so arriving background
+            // notifications never mutate and invalidate the previously cached assistant message block.
+            var role = m.Role == "assistant" ? "assistant" : "user";
             var rawContent = m.Role == "notification"
                 ? $"[System Notification] {m.Content}"
                 : m.Content;

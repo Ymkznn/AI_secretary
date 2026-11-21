@@ -36,7 +36,7 @@ public sealed class AnthropicProviderAdapter : ILlmProviderAdapter
         request.Headers.Add("anthropic-beta", "prompt-caching-2024-07-31");
     }
 
-    public string BuildRequestJson(IReadOnlyList<ModelMessage> messages, string model)
+    public string BuildRequestJson(IReadOnlyList<ModelMessage> messages, string model, CachePolicy cachePolicy = CachePolicy.Conversation)
     {
         var systemPrompt = string.Join("\n\n", messages.Where(m => m.Role == "system").Select(m => m.Content));
         var normalized = new List<(string Role, string Content)>();
@@ -51,10 +51,9 @@ public sealed class AnthropicProviderAdapter : ILlmProviderAdapter
                 normalized.Add((role, m.Content));
         }
 
-        // Place cache breakpoints like ARTIFEX: on the last message (writes current prefix for next turn/step)
-        // AND on the second-to-last message when available (anchors the previous turn's history prefix).
-        int lastIdx = normalized.Count - 1;
-        int prevIdx = normalized.Count >= 2 ? normalized.Count - 2 : -1;
+        // Only attach conversation breakpoints when CachePolicy == Conversation (avoids 1.25x cache write waste on one-off calls).
+        int lastIdx = cachePolicy == CachePolicy.Conversation ? normalized.Count - 1 : -1;
+        int prevIdx = cachePolicy == CachePolicy.Conversation && normalized.Count >= 2 ? normalized.Count - 2 : -1;
         var chatMsgs = normalized
             .Select((m, idx) => new
             {
@@ -63,17 +62,27 @@ public sealed class AnthropicProviderAdapter : ILlmProviderAdapter
             })
             .ToArray();
 
-        var systemBlocks = string.IsNullOrWhiteSpace(systemPrompt)
+        bool cacheSystem = cachePolicy is CachePolicy.SystemOnly or CachePolicy.Conversation;
+        object[] systemBlocks = string.IsNullOrWhiteSpace(systemPrompt)
             ? Array.Empty<object>()
-            : new object[]
-            {
-                new
+            : (cacheSystem
+                ? new object[]
                 {
-                    type = "text",
-                    text = systemPrompt,
-                    cache_control = new { type = "ephemeral" }
+                    new
+                    {
+                        type = "text",
+                        text = systemPrompt,
+                        cache_control = new { type = "ephemeral" }
+                    }
                 }
-            };
+                : new object[]
+                {
+                    new
+                    {
+                        type = "text",
+                        text = systemPrompt
+                    }
+                });
 
         var payload = new
         {
@@ -104,17 +113,17 @@ public sealed class AnthropicProviderAdapter : ILlmProviderAdapter
         return "";
     }
 
-    public (int Input, int Output, int Cache) ExtractUsage(JsonElement root)
+    public TokenUsage ExtractUsage(JsonElement root)
     {
-        int input = 0, output = 0, cache = 0;
+        int uncachedInput = 0, cacheWrite = 0, cacheRead = 0, output = 0;
         if (root.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
         {
-            if (usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv)) input += itv;
-            if (usage.TryGetProperty("cache_creation_input_tokens", out var cw) && cw.TryGetInt32(out var cwv)) input += cwv;
+            if (usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv)) uncachedInput = itv;
+            if (usage.TryGetProperty("cache_creation_input_tokens", out var cw) && cw.TryGetInt32(out var cwv)) cacheWrite = cwv;
+            if (usage.TryGetProperty("cache_read_input_tokens", out var cr) && cr.TryGetInt32(out var crv)) cacheRead = crv;
             if (usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv)) output = otv;
-            if (usage.TryGetProperty("cache_read_input_tokens", out var cr) && cr.TryGetInt32(out var crv)) cache = crv;
         }
-        return (input, output, cache);
+        return new TokenUsage(uncachedInput, cacheWrite, cacheRead, output);
     }
 
     private static object BuildContent(string text, bool withCacheControl)

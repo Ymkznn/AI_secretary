@@ -3,6 +3,13 @@ using AiSecretary.Desktop.Models;
 
 namespace AiSecretary.Desktop.Skills;
 
+public enum StepOutcome
+{
+    Ok,
+    Failed,
+    Denied
+}
+
 /// <summary>
 /// 單步技能執行所需的上下文與參數輔助工具。
 /// </summary>
@@ -20,6 +27,11 @@ public sealed class SkillExecutionContext
     public required List<string> Observations { get; init; }
     public required List<string> CompletedSteps { get; init; }
     public CancellationToken Ct { get; init; }
+
+    public StepOutcome Outcome { get; private set; } = StepOutcome.Ok;
+
+    public void MarkFailed() => Outcome = StepOutcome.Failed;
+    public void MarkDenied() => Outcome = StepOutcome.Denied;
 
     /// <summary>依目前 ReplyLanguage 非同步取得本地化介面／提示文字。</summary>
     public Task<string> TextAsync(string key, string englishTemplate, params object?[] args)

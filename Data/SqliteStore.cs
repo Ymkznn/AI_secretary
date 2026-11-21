@@ -260,6 +260,46 @@ public sealed class SqliteStore
             );
             CREATE INDEX IF NOT EXISTS IX_MemoryAnnotations_Target ON MemoryAnnotations(TargetType, TargetId);
             CREATE INDEX IF NOT EXISTS IX_MemoryAnnotations_SourceFact ON MemoryAnnotations(SourceFactId);
+            CREATE TABLE IF NOT EXISTS LlmCallLogs (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                TimestampUtc TEXT NOT NULL,
+                Agent TEXT NOT NULL,
+                Tier TEXT NOT NULL,
+                Model TEXT NOT NULL,
+                CachePolicy TEXT NOT NULL,
+                Priority TEXT NOT NULL,
+                UncachedInput INTEGER NOT NULL DEFAULT 0,
+                CacheWrite INTEGER NOT NULL DEFAULT 0,
+                CacheRead INTEGER NOT NULL DEFAULT 0,
+                Output INTEGER NOT NULL DEFAULT 0,
+                LatencyMs INTEGER NOT NULL DEFAULT 0,
+                Succeeded INTEGER NOT NULL DEFAULT 1,
+                Error TEXT NULL
+            );
+            CREATE INDEX IF NOT EXISTS IX_LlmCallLogs_Ts ON LlmCallLogs(TimestampUtc DESC);
+            CREATE TABLE IF NOT EXISTS LearningEvents (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                TimestampUtc TEXT NOT NULL,
+                Learner TEXT NOT NULL,
+                SubjectKey TEXT NOT NULL,
+                EventType TEXT NOT NULL,
+                BeforeState TEXT NULL,
+                AfterState TEXT NULL,
+                Evidence TEXT NULL
+            );
+            CREATE INDEX IF NOT EXISTS IX_LearningEvents_Ts ON LearningEvents(TimestampUtc DESC);
+            CREATE TABLE IF NOT EXISTS PredictionLogs (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                TimestampUtc TEXT NOT NULL,
+                Source TEXT NOT NULL,
+                SubjectKey TEXT NOT NULL,
+                QueryText TEXT NOT NULL,
+                PredictedAction TEXT NOT NULL,
+                ExecSucceeded INTEGER NOT NULL DEFAULT 0,
+                ImplicitFeedback TEXT NULL,
+                TokensSaved INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS IX_PredictionLogs_Ts ON PredictionLogs(TimestampUtc DESC);
             """;
 
         await using var cmd = conn.CreateCommand();
@@ -2348,6 +2388,192 @@ public sealed class SqliteStore
         cmd.CommandText = "DELETE FROM AutoStateRules WHERE TriggerKey = @k;";
         cmd.Parameters.AddWithValue("@k", triggerKey);
         return await cmd.ExecuteNonQueryAsync(ct) > 0;
+    }
+
+    // ─── Observability: LlmCallLogs, LearningEvents, PredictionLogs ───
+
+    public async Task InsertLlmCallLogAsync(LlmCallLogRecord rec, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO LlmCallLogs (TimestampUtc, Agent, Tier, Model, CachePolicy, Priority, UncachedInput, CacheWrite, CacheRead, Output, LatencyMs, Succeeded, Error)
+            VALUES (@ts, @agent, @tier, @model, @cp, @prio, @inTok, @cw, @cr, @outTok, @lat, @ok, @err);
+            """;
+        cmd.Parameters.AddWithValue("@ts", rec.TimestampUtc.ToString("O"));
+        cmd.Parameters.AddWithValue("@agent", rec.Agent);
+        cmd.Parameters.AddWithValue("@tier", rec.Tier);
+        cmd.Parameters.AddWithValue("@model", rec.Model);
+        cmd.Parameters.AddWithValue("@cp", rec.CachePolicy);
+        cmd.Parameters.AddWithValue("@prio", rec.Priority);
+        cmd.Parameters.AddWithValue("@inTok", rec.UncachedInput);
+        cmd.Parameters.AddWithValue("@cw", rec.CacheWrite);
+        cmd.Parameters.AddWithValue("@cr", rec.CacheRead);
+        cmd.Parameters.AddWithValue("@outTok", rec.Output);
+        cmd.Parameters.AddWithValue("@lat", rec.LatencyMs);
+        cmd.Parameters.AddWithValue("@ok", rec.Succeeded ? 1 : 0);
+        cmd.Parameters.AddWithValue("@err", string.IsNullOrWhiteSpace(rec.Error) ? DBNull.Value : rec.Error);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task<List<LlmCallLogRecord>> GetRecentLlmCallLogsAsync(int limit = 40, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT Id, TimestampUtc, Agent, Tier, Model, CachePolicy, Priority, UncachedInput, CacheWrite, CacheRead, Output, LatencyMs, Succeeded, Error FROM LlmCallLogs ORDER BY Id DESC LIMIT @lim;";
+        cmd.Parameters.AddWithValue("@lim", Math.Clamp(limit, 1, 200));
+        var list = new List<LlmCallLogRecord>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            list.Add(new LlmCallLogRecord(
+                Id: r.GetInt64(0),
+                TimestampUtc: DateTimeOffset.Parse(r.GetString(1)),
+                Agent: r.GetString(2),
+                Tier: r.GetString(3),
+                Model: r.GetString(4),
+                CachePolicy: r.GetString(5),
+                Priority: r.GetString(6),
+                UncachedInput: r.GetInt32(7),
+                CacheWrite: r.GetInt32(8),
+                CacheRead: r.GetInt32(9),
+                Output: r.GetInt32(10),
+                LatencyMs: r.GetInt32(11),
+                Succeeded: r.GetInt32(12) != 0,
+                Error: r.IsDBNull(13) ? null : r.GetString(13)));
+        }
+        return list;
+    }
+
+    public async Task<List<AgentUsageSummary>> GetLlmUsageByAgentAsync(CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT Agent, COUNT(*), SUM(UncachedInput), SUM(CacheWrite), SUM(CacheRead), SUM(Output), AVG(LatencyMs)
+            FROM LlmCallLogs
+            GROUP BY Agent
+            ORDER BY (SUM(UncachedInput) + SUM(CacheWrite) + SUM(CacheRead) + SUM(Output)) DESC;
+            """;
+        var list = new List<AgentUsageSummary>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            list.Add(new AgentUsageSummary(
+                Agent: r.GetString(0),
+                Calls: r.GetInt32(1),
+                UncachedInput: r.IsDBNull(2) ? 0 : r.GetInt64(2),
+                CacheWrite: r.IsDBNull(3) ? 0 : r.GetInt64(3),
+                CacheRead: r.IsDBNull(4) ? 0 : r.GetInt64(4),
+                Output: r.IsDBNull(5) ? 0 : r.GetInt64(5),
+                AvgLatencyMs: r.IsDBNull(6) ? 0 : r.GetDouble(6)));
+        }
+        return list;
+    }
+
+    public async Task InsertLearningEventAsync(
+        string learner,
+        string subjectKey,
+        string eventType,
+        string? beforeState = null,
+        string? afterState = null,
+        string? evidence = null,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO LearningEvents (TimestampUtc, Learner, SubjectKey, EventType, BeforeState, AfterState, Evidence)
+                VALUES (@ts, @learner, @subj, @evt, @bef, @aft, @ev);
+                """;
+            cmd.Parameters.AddWithValue("@ts", DateTimeOffset.UtcNow.ToString("O"));
+            cmd.Parameters.AddWithValue("@learner", learner);
+            cmd.Parameters.AddWithValue("@subj", subjectKey);
+            cmd.Parameters.AddWithValue("@evt", eventType);
+            cmd.Parameters.AddWithValue("@bef", string.IsNullOrWhiteSpace(beforeState) ? DBNull.Value : beforeState);
+            cmd.Parameters.AddWithValue("@aft", string.IsNullOrWhiteSpace(afterState) ? DBNull.Value : afterState);
+            cmd.Parameters.AddWithValue("@ev", string.IsNullOrWhiteSpace(evidence) ? DBNull.Value : evidence);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch { }
+    }
+
+    public async Task<List<LearningEventRecord>> GetRecentLearningEventsAsync(int limit = 50, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT Id, TimestampUtc, Learner, SubjectKey, EventType, BeforeState, AfterState, Evidence FROM LearningEvents ORDER BY Id DESC LIMIT @lim;";
+        cmd.Parameters.AddWithValue("@lim", Math.Clamp(limit, 1, 200));
+        var list = new List<LearningEventRecord>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            list.Add(new LearningEventRecord(
+                Id: r.GetInt64(0),
+                TimestampUtc: DateTimeOffset.Parse(r.GetString(1)),
+                Learner: r.GetString(2),
+                SubjectKey: r.GetString(3),
+                EventType: r.GetString(4),
+                BeforeState: r.IsDBNull(5) ? null : r.GetString(5),
+                AfterState: r.IsDBNull(6) ? null : r.GetString(6),
+                Evidence: r.IsDBNull(7) ? null : r.GetString(7)));
+        }
+        return list;
+    }
+
+    public async Task InsertPredictionLogAsync(
+        string source,
+        string subjectKey,
+        string queryText,
+        string predictedAction,
+        bool execSucceeded,
+        long tokensSaved,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO PredictionLogs (TimestampUtc, Source, SubjectKey, QueryText, PredictedAction, ExecSucceeded, ImplicitFeedback, TokensSaved)
+                VALUES (@ts, @src, @subj, @q, @act, @ok, NULL, @saved);
+                """;
+            cmd.Parameters.AddWithValue("@ts", DateTimeOffset.UtcNow.ToString("O"));
+            cmd.Parameters.AddWithValue("@src", source);
+            cmd.Parameters.AddWithValue("@subj", subjectKey);
+            cmd.Parameters.AddWithValue("@q", queryText.Length > 200 ? queryText[..200] : queryText);
+            cmd.Parameters.AddWithValue("@act", predictedAction);
+            cmd.Parameters.AddWithValue("@ok", execSucceeded ? 1 : 0);
+            cmd.Parameters.AddWithValue("@saved", tokensSaved);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch { }
+    }
+
+    public async Task<List<PredictionLogRecord>> GetRecentPredictionLogsAsync(int limit = 40, CancellationToken ct = default)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT Id, TimestampUtc, Source, SubjectKey, QueryText, PredictedAction, ExecSucceeded, ImplicitFeedback, TokensSaved FROM PredictionLogs ORDER BY Id DESC LIMIT @lim;";
+        cmd.Parameters.AddWithValue("@lim", Math.Clamp(limit, 1, 200));
+        var list = new List<PredictionLogRecord>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            list.Add(new PredictionLogRecord(
+                Id: r.GetInt64(0),
+                TimestampUtc: DateTimeOffset.Parse(r.GetString(1)),
+                Source: r.GetString(2),
+                SubjectKey: r.GetString(3),
+                QueryText: r.GetString(4),
+                PredictedAction: r.GetString(5),
+                ExecSucceeded: r.GetInt32(6) != 0,
+                ImplicitFeedback: r.IsDBNull(7) ? null : r.GetString(7),
+                TokensSaved: r.GetInt64(8)));
+        }
+        return list;
     }
 
     public async Task<bool> DeleteWorkflowCacheAsync(string workflowId, CancellationToken ct = default)

@@ -163,15 +163,17 @@ public sealed class StateMachineAgent : IDisposable
                 if (steps.Count == 0)
                     return;
 
-                // Hot rule (Counter >= 2): run silently with 30s hit cooldown (0 LLM tokens)
+                // Hot rule (Counter >= 2): run silently with 30s hit cooldown (0 LLM tokens); record outcome AFTER execution.
                 if (existing.PredictorCounter >= 2)
                 {
                     if (_hitCooldowns.TryGetValue(triggerKey, out var lastHit) && (now - lastHit) < TimeSpan.FromSeconds(30))
                         return;
                     _hitCooldowns[triggerKey] = now;
 
-                    await RecordOutcomeAsync(triggerKey, hit: true, estimatedTokensSaved: 350, ct);
-                    await ExecuteSafeStepsAsync(conversationId, triggerKey, existing.StateName, steps, ct);
+                    var ok = await ExecuteSafeStepsAsync(conversationId, triggerKey, existing.StateName, steps, ct);
+                    await RecordOutcomeAsync(triggerKey, hit: ok, estimatedTokensSaved: ok ? 350 : 0, ct);
+                    await _store.InsertPredictionLogAsync("state_machine", triggerKey, target.Title ?? triggerKey, steps[0].Skill, ok, ok ? 350 : 0, ct);
+                    await _store.InsertLearningEventAsync("StateMachine", triggerKey, ok ? "replay_ok" : "replay_fail", existing.Status, ok ? "Hot" : "Cold", steps[0].Skill, ct);
                     return;
                 }
 
@@ -332,7 +334,7 @@ public sealed class StateMachineAgent : IDisposable
         {
             new ModelMessage("system", sys),
             new ModelMessage("user", user)
-        }, ModelTier.Simple, probeCts.Token);
+        }, new LlmCallOptions("StateMachine.FirstProbe", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), probeCts.Token);
 
         var (shouldPropose, proposal, step) = ParseFirstVisitDecision(resp.Content);
         if (!shouldPropose || step is null || FilterSafeSteps(new List<CachedWorkflowStep> { step }).Count == 0)
@@ -519,6 +521,7 @@ public sealed class StateMachineAgent : IDisposable
         }
 
         var stateName = $"learned_{skillName.Trim().ToLowerInvariant()}";
+        var nextStatus = nextCounter >= 2 ? "Hot" : "Cold";
         var updated = new AutoStateRuleRecord(
             TriggerKey: triggerKey,
             StateName: stateName,
@@ -526,12 +529,16 @@ public sealed class StateMachineAgent : IDisposable
             PredictorCounter: nextCounter,
             HitCount: hits,
             MissCount: misses,
-            Status: nextCounter >= 2 ? "Hot" : "Cold",
+            Status: nextStatus,
             LastSeenAt: DateTimeOffset.UtcNow,
             CooldownUntil: null,
             ProposalText: existing?.ProposalText);
 
         await _store.UpsertAutoStateRuleAsync(updated, ct);
+        var evtType = existing is not null && existing.Status is "Muted" or "Disabled" or "Ignored"
+            ? "revived"
+            : (existing?.Status != "Hot" && nextStatus == "Hot" ? "promoted" : "observed");
+        await _store.InsertLearningEventAsync("StateMachine", triggerKey, evtType, existing?.Status ?? "None", nextStatus, skillName, ct);
     }
 
     public async Task RecordOutcomeAsync(string triggerKey, bool hit, long estimatedTokensSaved = 350, CancellationToken ct = default)
@@ -565,19 +572,20 @@ public sealed class StateMachineAgent : IDisposable
     public Task<bool> DeleteRuleAsync(string triggerKey, CancellationToken ct = default)
         => _store.DeleteAutoStateRuleAsync(triggerKey, ct);
 
-    private async Task ExecuteSafeStepsAsync(
+    private async Task<bool> ExecuteSafeStepsAsync(
         string conversationId,
         string triggerKey,
         string stateName,
         List<CachedWorkflowStep> steps,
         CancellationToken ct)
     {
+        bool anyExecuted = false;
         foreach (var step in steps.Take(2))
         {
             if (!_guard.IsSkillEnabled(step.Skill)) continue;
             try
             {
-                await _worker.RunStepAsync(
+                var outcome = await _worker.RunStepAsync(
                     conversationId: conversationId,
                     userPrompt: $"[auto_state:{stateName}] {triggerKey}",
                     skillName: step.Skill,
@@ -589,13 +597,17 @@ public sealed class StateMachineAgent : IDisposable
                     observations: new List<string>(),
                     completedSteps: new List<string>(),
                     ct: ct);
+                anyExecuted = true;
+                if (outcome != Skills.StepOutcome.Ok)
+                    return false;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogDebug(ex, "[StateMachineAgent] step {Skill} failed for {Key}", step.Skill, triggerKey);
-                await RecordOutcomeAsync(triggerKey, hit: false, estimatedTokensSaved: 0, CancellationToken.None);
+                return false;
             }
         }
+        return anyExecuted;
     }
 
     private List<CachedWorkflowStep> FilterSafeSteps(List<CachedWorkflowStep> steps)
