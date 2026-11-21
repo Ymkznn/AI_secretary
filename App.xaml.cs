@@ -162,6 +162,13 @@ public partial class App : System.Windows.Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        // Stop managed TTS server immediately so a slow HTTP drain can never leave a 3 GB api_v2.py running.
+        try
+        {
+            _services?.GetService<TtsService>()?.Dispose();
+        }
+        catch { }
+
         try
         {
             var apiHost = _services?.GetService<ApiServerHost>();

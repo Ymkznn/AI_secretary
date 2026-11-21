@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Media;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -26,6 +27,8 @@ public sealed class TtsService : IDisposable
     private readonly ILogger<TtsService> _logger;
     private readonly Channel<(string Title, string Content, bool IsDirectJapanese, SpeechKind Kind, Action? OnBeforePlay)> _queue;
     private readonly CancellationTokenSource _cts = new();
+    private readonly object _lifecycleLock = new();
+    private CancellationTokenSource _playbackCts;
     private readonly Task _workerTask;
     private bool _weightsInitialized;
     private bool _pendingWeightReload;
@@ -37,6 +40,12 @@ public sealed class TtsService : IDisposable
     private readonly Dictionary<string, string?> _cachedStylePrompts = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string?> _cachedStyleLangs = new(StringComparer.OrdinalIgnoreCase);
     private Process? _serverProcess;
+    private IntPtr _serverJobHandle = IntPtr.Zero;
+    private int _serverGeneration;
+    private int _startingServer;
+
+    internal Action? StopServerHookForTest { get; set; }
+    internal Action? StartServerHookForTest { get; set; }
 
     public TtsService(
         IHttpClientFactory httpFactory,
@@ -53,6 +62,7 @@ public sealed class TtsService : IDisposable
         _styles = styles;
         _localizer = localizer;
         _logger = logger;
+        _playbackCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
         var defProf = settings.Current.Tts.DefaultProfile;
         _voiceProfile = string.IsNullOrWhiteSpace(defProf) ? "default" : defProf.Trim().ToLowerInvariant();
         _loadedWeightGroup = GetWeightGroup(_voiceProfile);
@@ -186,13 +196,27 @@ public sealed class TtsService : IDisposable
     public void EnsureServerStartedInBackground()
     {
         var tts = _settings.Current.Tts;
-        if (!IsEnabled || !tts.AutoStartServer)
+        if (_disposed || !IsEnabled || !tts.AutoStartServer)
             return;
+
+        if (StartServerHookForTest is { } testStart)
+        {
+            testStart();
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _startingServer, 1, 0) != 0)
+            return;
+
+        var startGen = Volatile.Read(ref _serverGeneration);
 
         _ = Task.Run(async () =>
         {
             try
             {
+                if (_disposed || !IsEnabled || Volatile.Read(ref _serverGeneration) != startGen)
+                    return;
+
                 var baseUrl = (tts.ApiBaseUrl ?? "http://127.0.0.1:9880").TrimEnd('/');
                 if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri))
                     return;
@@ -202,6 +226,9 @@ public sealed class TtsService : IDisposable
                     _logger.LogInformation("GPT-SoVITS already listening on {Host}:{Port}", uri.Host, uri.Port);
                     return;
                 }
+
+                if (_disposed || !IsEnabled || Volatile.Read(ref _serverGeneration) != startGen)
+                    return;
 
                 var (root, python, apiScript) = ResolveSoVitsServer();
                 if (root is null || python is null || apiScript is null)
@@ -242,23 +269,82 @@ public sealed class TtsService : IDisposable
                 psi.Environment.TryAdd("OMP_NUM_THREADS", "2");
                 psi.Environment.TryAdd("MKL_NUM_THREADS", "2");
 
-                _serverProcess = Process.Start(psi);
-                if (_serverProcess is not null)
+                var proc = Process.Start(psi);
+                if (proc is not null)
                 {
-                    try { _serverProcess.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
+                    bool stale;
+                    lock (_lifecycleLock)
+                    {
+                        stale = _disposed || !IsEnabled || Volatile.Read(ref _serverGeneration) != startGen;
+                        if (!stale)
+                        {
+                            CloseJobHandleLocked();
+                            _serverProcess?.Dispose();
+                            _serverProcess = proc;
+                            _serverJobHandle = TryAssignKillOnCloseJob(proc);
+                        }
+                    }
+
+                    if (stale)
+                    {
+                        try { proc.Kill(entireProcessTree: true); } catch { }
+                        proc.Dispose();
+                        return;
+                    }
+
+                    try { proc.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
                     _loadedWeightGroup = group;
                     _pendingWeightReload = false;
                     _weightsInitialized = true;
-                    _serverProcess.BeginOutputReadLine();
-                    _serverProcess.BeginErrorReadLine();
-                    _logger.LogInformation("Auto-started GPT-SoVITS server (PID {Pid}, voice={Group})", _serverProcess.Id, group);
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+                    _logger.LogInformation("Auto-started GPT-SoVITS server (PID {Pid}, voice={Group})", proc.Id, group);
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to auto-start GPT-SoVITS server.");
             }
+            finally
+            {
+                Interlocked.Exchange(ref _startingServer, 0);
+            }
         });
+    }
+
+    public void StopServer()
+    {
+        Interlocked.Increment(ref _serverGeneration);
+        CancelActivePlaybackAndDrainQueue();
+        _weightsInitialized = false;
+        _pendingWeightReload = false;
+
+        if (StopServerHookForTest is { } testStop)
+        {
+            testStop();
+            return;
+        }
+
+        KillManagedOrLocalSoVitsServers();
+    }
+
+    private void CancelActivePlaybackAndDrainQueue()
+    {
+        CancellationTokenSource? oldCts;
+        lock (_lifecycleLock)
+        {
+            oldCts = _playbackCts;
+            _playbackCts = _disposed
+                ? new CancellationTokenSource()
+                : CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            if (_disposed)
+                _playbackCts.Cancel();
+        }
+        try { oldCts.Cancel(); } catch { }
+        try { oldCts.Dispose(); } catch { }
+
+        while (_queue.Reader.TryRead(out var pending))
+            SafeInvoke(pending.OnBeforePlay);
     }
 
     private static async Task<bool> IsPortOpenAsync(string host, int port)
@@ -276,8 +362,9 @@ public sealed class TtsService : IDisposable
         }
     }
 
-    public void Configure(bool enabled, string voiceProfile, string chatMode)
+    public void Configure(bool enabled, string voiceProfile, string chatMode, bool manageServerLifecycle = false)
     {
+        bool wasEnabled = IsEnabled;
         _enabledOverride = enabled;
         _chatModeOverride = string.IsNullOrWhiteSpace(chatMode) ? "smart" : chatMode.Trim().ToLowerInvariant();
 
@@ -291,6 +378,30 @@ public sealed class TtsService : IDisposable
             _weightsInitialized = false;
         }
         _voiceProfile = nextProfile;
+
+        if (!enabled)
+        {
+            CancelActivePlaybackAndDrainQueue();
+            if (manageServerLifecycle)
+            {
+                bool hasManagedServer;
+                lock (_lifecycleLock)
+                    hasManagedServer = _serverProcess is not null || _serverJobHandle != IntPtr.Zero;
+
+                if (wasEnabled || hasManagedServer)
+                {
+                    Interlocked.Increment(ref _serverGeneration);
+                    if (StopServerHookForTest is not null)
+                        StopServer();
+                    else
+                        _ = Task.Run(StopServer);
+                }
+            }
+        }
+        else if (manageServerLifecycle && !wasEnabled)
+        {
+            EnsureServerStartedInBackground();
+        }
     }
 
     private static string GetWeightGroup(string profile)
@@ -346,22 +457,32 @@ public sealed class TtsService : IDisposable
                     SafeInvoke(onBeforePlay);
                 }
 
+                if (!IsEnabled)
+                {
+                    RevealOnce();
+                    continue;
+                }
+
+                CancellationToken itemCt;
+                lock (_lifecycleLock)
+                    itemCt = _playbackCts.Token;
+
                 try
                 {
                     var sw = Stopwatch.StartNew();
                     var speechLang = TargetLang;
                     var jaText = isDirect
                         ? CleanSpokenText(content, ChatMode == "full" ? 800 : 240, speechLang == "ja", GetPronunciationMap())
-                        : await ToSpeechTextAsync(title, content, kind, ct);
+                        : await ToSpeechTextAsync(title, content, kind, itemCt);
                     var llmMs = sw.ElapsedMilliseconds;
 
-                    if (string.IsNullOrWhiteSpace(jaText))
+                    if (!IsEnabled || string.IsNullOrWhiteSpace(jaText))
                     {
                         RevealOnce();
                         continue;
                     }
 
-                    await SynthesizeAndPlayPipelinedAsync(jaText, ct, RevealOnce);
+                    await SynthesizeAndPlayPipelinedAsync(jaText, itemCt, RevealOnce);
                     _logger.LogInformation("TTS done (isDirect={IsDirect}, llm={LlmMs}ms, total={TotalMs}ms): {Text}",
                         isDirect, llmMs, sw.ElapsedMilliseconds, jaText);
                 }
@@ -369,6 +490,11 @@ public sealed class TtsService : IDisposable
                 {
                     RevealOnce();
                     break;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Playback cancelled because user toggled TTS off; keep worker loop alive for future re-enable.
+                    RevealOnce();
                 }
                 catch (Exception ex)
                 {
@@ -575,6 +701,12 @@ public sealed class TtsService : IDisposable
 
     public async Task SynthesizeAndPlayPipelinedAsync(string japaneseText, CancellationToken ct, Action? onBeforeFirstPlay = null)
     {
+        if (!IsEnabled)
+        {
+            SafeInvoke(onBeforeFirstPlay);
+            return;
+        }
+
         var baseUrl = (_settings.Current.Tts.ApiBaseUrl ?? "http://127.0.0.1:9880").TrimEnd('/');
         if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var baseUri) ||
             baseUri.Scheme is not ("http" or "https"))
@@ -587,26 +719,34 @@ public sealed class TtsService : IDisposable
         await EnsureWeightsLoadedIfRequestedAsync(baseUrl, ct);
 
         var sentences = SplitSentences(japaneseText);
+        if (sentences.Count == 0)
+        {
+            SafeInvoke(onBeforeFirstPlay);
+            return;
+        }
+
         Task<byte[]?>? nextTask = SynthesizeWavAsync(baseUrl, sentences[0], ct);
 
         for (int i = 0; i < sentences.Count; i++)
         {
-            if (nextTask is null) break;
+            if (nextTask is null || !IsEnabled || ct.IsCancellationRequested) break;
             var wavBytes = await nextTask;
-            nextTask = (i + 1 < sentences.Count)
+            nextTask = (i + 1 < sentences.Count && IsEnabled && !ct.IsCancellationRequested)
                 ? SynthesizeWavAsync(baseUrl, sentences[i + 1], ct)
                 : null;
 
             if (i == 0)
                 SafeInvoke(onBeforeFirstPlay);
 
-            if (IsValidWav(wavBytes))
+            if (IsEnabled && !ct.IsCancellationRequested && IsValidWav(wavBytes))
             {
                 await Task.Run(() =>
                 {
                     using var ms = new MemoryStream(wavBytes!);
                     using var player = new SoundPlayer(ms);
-                    player.PlaySync();
+                    using var stopReg = ct.Register(() => { try { player.Stop(); } catch { } });
+                    if (!ct.IsCancellationRequested)
+                        player.PlaySync();
                 }, ct);
             }
         }
@@ -786,28 +926,293 @@ public sealed class TtsService : IDisposable
 
     private void KillManagedOrLocalSoVitsServers()
     {
+        Process? managedProc;
+        IntPtr jobHandle;
+        lock (_lifecycleLock)
+        {
+            managedProc = _serverProcess;
+            _serverProcess = null;
+            jobHandle = _serverJobHandle;
+            _serverJobHandle = IntPtr.Zero;
+        }
+
+        if (jobHandle != IntPtr.Zero)
+        {
+            try { TerminateJobObject(jobHandle, 0); } catch { }
+            try { CloseHandle(jobHandle); } catch { }
+        }
+
         try
         {
-            if (_serverProcess is { HasExited: false })
+            if (managedProc is { HasExited: false })
             {
-                try { _serverProcess.Kill(entireProcessTree: true); } catch { }
+                try { managedProc.Kill(entireProcessTree: true); } catch { }
             }
-            _serverProcess?.Dispose();
-            _serverProcess = null;
+            managedProc?.Dispose();
         }
         catch { }
 
-        foreach (var p in Process.GetProcessesByName("python"))
+        int? configuredPort = null;
+        var baseUrl = (_settings.Current.Tts.ApiBaseUrl ?? "http://127.0.0.1:9880").TrimEnd('/');
+        if (Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri))
+            configuredPort = uri.Port;
+        var configuredRoot = _settings.Current.Tts.SoVitsRoot;
+
+        foreach (var procName in new[] { "python", "pythonw" })
         {
-            try
+            foreach (var p in Process.GetProcessesByName(procName))
             {
-                if (p.MainModule?.FileName?.Contains("GPT-SoVITS", StringComparison.OrdinalIgnoreCase) == true)
-                    p.Kill(entireProcessTree: true);
+                try
+                {
+                    string? modulePath = null;
+                    try { modulePath = p.MainModule?.FileName; } catch { }
+                    var cmdLine = TryGetProcessCommandLine(p.Id);
+
+                    if (IsMatchingSoVitsServerProcess(modulePath, cmdLine, configuredPort, configuredRoot))
+                    {
+                        _logger.LogInformation("Stopping local GPT-SoVITS process (PID {Pid})", p.Id);
+                        p.Kill(entireProcessTree: true);
+                    }
+                }
+                catch { }
+                finally { p.Dispose(); }
             }
-            catch { }
-            finally { p.Dispose(); }
         }
     }
+
+    private static readonly Regex PortFlagRegex = new(
+        @"(?:\s|^)(?:-p|--port)(?:\s+|=)(\d+)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Identifies local GPT-SoVITS api_v2.py server processes — including .venv-spawned real Python child processes
+    /// (e.g. Python311\python.exe) whose MainModule path does NOT contain "GPT-SoVITS" — while leaving unrelated
+    /// Python processes (MCP servers, webui.py, different-port instances) untouched.
+    /// </summary>
+    internal static bool IsMatchingSoVitsServerProcess(
+        string? mainModulePath,
+        string? commandLine,
+        int? configuredPort,
+        string? configuredSoVitsRoot)
+    {
+        if (!string.IsNullOrWhiteSpace(commandLine))
+        {
+            if (!commandLine.Contains("api_v2.py", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            int? cmdPort = null;
+            var portMatch = PortFlagRegex.Match(commandLine);
+            if (portMatch.Success && int.TryParse(portMatch.Groups[1].Value, out var parsedPort))
+                cmdPort = parsedPort;
+
+            if (configuredPort is int targetPort && cmdPort is int actualPort && actualPort != targetPort)
+                return false;
+
+            if (commandLine.Contains("GPT-SoVITS", StringComparison.OrdinalIgnoreCase) ||
+                commandLine.Contains("tts_infer_", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var trimmedRoot = configuredSoVitsRoot?.Trim().TrimEnd('\\', '/');
+            if (!string.IsNullOrWhiteSpace(trimmedRoot) &&
+                commandLine.Contains(trimmedRoot, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!string.IsNullOrWhiteSpace(mainModulePath) &&
+                mainModulePath.Contains("GPT-SoVITS", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (configuredPort is int p && cmdPort == p &&
+                (commandLine.Contains("127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+                 commandLine.Contains("localhost", StringComparison.OrdinalIgnoreCase)))
+                return true;
+
+            return false;
+        }
+
+        return !string.IsNullOrWhiteSpace(mainModulePath) &&
+               mainModulePath.Contains("GPT-SoVITS", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void CloseJobHandleLocked()
+    {
+        if (_serverJobHandle != IntPtr.Zero)
+        {
+            try { CloseHandle(_serverJobHandle); } catch { }
+            _serverJobHandle = IntPtr.Zero;
+        }
+    }
+
+    internal static IntPtr CreateKillOnCloseJobObject()
+    {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero)
+            return IntPtr.Zero;
+
+        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                ref info,
+                (uint)Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()))
+        {
+            CloseHandle(job);
+            return IntPtr.Zero;
+        }
+
+        return job;
+    }
+
+    internal static void CloseNativeHandle(IntPtr handle)
+    {
+        if (handle != IntPtr.Zero)
+            CloseHandle(handle);
+    }
+
+    private static IntPtr TryAssignKillOnCloseJob(Process proc)
+    {
+        try
+        {
+            var job = CreateKillOnCloseJobObject();
+            if (job == IntPtr.Zero)
+                return IntPtr.Zero;
+
+            if (!AssignProcessToJobObject(job, proc.Handle))
+            {
+                CloseHandle(job);
+                return IntPtr.Zero;
+            }
+            return job;
+        }
+        catch
+        {
+            return IntPtr.Zero;
+        }
+    }
+
+    internal static string? TryGetProcessCommandLine(int pid)
+    {
+        IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (hProc == IntPtr.Zero)
+            return null;
+
+        IntPtr buf = IntPtr.Zero;
+        try
+        {
+            int bufSize = 1024;
+            buf = Marshal.AllocHGlobal(bufSize);
+            int status = NtQueryInformationProcess(hProc, ProcessCommandLineInformation, buf, bufSize, out int required);
+            if ((status == STATUS_INFO_LENGTH_MISMATCH || status == STATUS_BUFFER_TOO_SMALL || status == STATUS_BUFFER_OVERFLOW) && required > bufSize)
+            {
+                Marshal.FreeHGlobal(buf);
+                buf = IntPtr.Zero;
+                bufSize = required + 64;
+                buf = Marshal.AllocHGlobal(bufSize);
+                status = NtQueryInformationProcess(hProc, ProcessCommandLineInformation, buf, bufSize, out _);
+            }
+
+            if (status != 0)
+                return null;
+
+            var ustr = Marshal.PtrToStructure<UNICODE_STRING>(buf);
+            if (ustr.Buffer == IntPtr.Zero || ustr.Length == 0)
+                return null;
+
+            return Marshal.PtrToStringUni(ustr.Buffer, ustr.Length / 2);
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            if (buf != IntPtr.Zero)
+                Marshal.FreeHGlobal(buf);
+            CloseHandle(hProc);
+        }
+    }
+
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    private const int ProcessCommandLineInformation = 60;
+    private const int STATUS_INFO_LENGTH_MISMATCH = unchecked((int)0xC0000004);
+    private const int STATUS_BUFFER_TOO_SMALL = unchecked((int)0xC0000023);
+    private const int STATUS_BUFFER_OVERFLOW = unchecked((int)0x80000005);
+    private const int JobObjectExtendedLimitInformation = 9;
+    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UNICODE_STRING
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQueryInformationProcess(
+        IntPtr processHandle,
+        int processInformationClass,
+        IntPtr processInformation,
+        int processInformationLength,
+        out int returnLength);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(
+        IntPtr hJob,
+        int jobObjectInfoClass,
+        ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION lpJobObjectInfo,
+        uint cbJobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
 
     private async Task EnsureWeightsLoadedIfRequestedAsync(string baseUrl, CancellationToken ct)
     {
@@ -855,9 +1260,16 @@ public sealed class TtsService : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        Interlocked.Increment(ref _serverGeneration);
         _queue.Writer.TryComplete();
         _cts.Cancel();
+        CancelActivePlaybackAndDrainQueue();
+        lock (_lifecycleLock)
+        {
+            try { _playbackCts.Dispose(); } catch { }
+        }
         _cts.Dispose();
-        KillManagedOrLocalSoVitsServers();
+        if (StopServerHookForTest is null)
+            KillManagedOrLocalSoVitsServers();
     }
 }

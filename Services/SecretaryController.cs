@@ -583,7 +583,7 @@ public sealed class SecretaryController : IDisposable
 
     public async Task SaveTtsSettingsAsync(bool enabled, string voiceProfile, string chatMode)
     {
-        _tts.Configure(enabled, voiceProfile, chatMode);
+        _tts.Configure(enabled, voiceProfile, chatMode, manageServerLifecycle: true);
         await _store.SetSyncValueAsync("tts_enabled", enabled ? "true" : "false", _appCts.Token);
         await _store.SetSyncValueAsync("tts_voice_profile", _tts.VoiceProfile, _appCts.Token);
         await _store.SetSyncValueAsync("tts_chat_mode", _tts.ChatMode, _appCts.Token);

@@ -28,6 +28,8 @@ public sealed class ApiServerHost : IAsyncDisposable
     private readonly IConfiguration _config;
     private readonly ILogger<ApiServerHost> _logger;
     private readonly ConcurrentDictionary<Guid, Channel<string>> _sseClients = new();
+    private readonly CancellationTokenSource _shutdownCts = new();
+    private int _disposed;
     private WebApplication? _app;
 
     public string BaseUrl { get; private set; } = "";
@@ -276,7 +278,7 @@ public sealed class ApiServerHost : IAsyncDisposable
                 SingleReader = true
             });
             _sseClients[clientId] = ch;
-            using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+            using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, _shutdownCts.Token);
             _ = Task.Run(async () =>
             {
                 try
@@ -292,12 +294,12 @@ public sealed class ApiServerHost : IAsyncDisposable
 
             try
             {
-                await ctx.Response.WriteAsync("event: ping\ndata: {}\n\n", ctx.RequestAborted);
-                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
-                await foreach (var payload in ch.Reader.ReadAllAsync(ctx.RequestAborted))
+                await ctx.Response.WriteAsync("event: ping\ndata: {}\n\n", pingCts.Token);
+                await ctx.Response.Body.FlushAsync(pingCts.Token);
+                await foreach (var payload in ch.Reader.ReadAllAsync(pingCts.Token))
                 {
-                    await ctx.Response.WriteAsync(payload, ctx.RequestAborted);
-                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                    await ctx.Response.WriteAsync(payload, pingCts.Token);
+                    await ctx.Response.Body.FlushAsync(pingCts.Token);
                 }
             }
             catch (OperationCanceledException) { }
@@ -326,10 +328,21 @@ public sealed class ApiServerHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        try { _shutdownCts.Cancel(); } catch { }
+        foreach (var ch in _sseClients.Values)
+            ch.Writer.TryComplete();
+        _sseClients.Clear();
+
         if (_app is not null)
         {
-            await _app.StopAsync();
-            await _app.DisposeAsync();
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1500));
+            try { await _app.StopAsync(stopCts.Token); } catch { }
+            try { await _app.DisposeAsync(); } catch { }
         }
+
+        _shutdownCts.Dispose();
     }
 }
