@@ -1813,46 +1813,9 @@ public partial class MainWindow : Window
             return;
         }
 
-        var dlg = new Window
-        {
-            Title = mail.Subject,
-            Width = 540,
-            Height = 440,
-            WindowStartupLocation = WindowStartupLocation.CenterScreen,
-            Topmost = Topmost,
-            Background = Brushes.White
-        };
-
-        var grid = new Grid { Margin = new Thickness(18) };
-        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-
-        var meta = new TextBlock
-        {
-            Text = $"寄件者：{mail.SenderName} <{mail.SenderEmail}>\n時間：{mail.ReceivedAt.ToLocalTime():yyyy-MM-dd HH:mm}",
-            FontSize = 13,
-            Foreground = BrushFrom("#64748B"),
-            Margin = new Thickness(0, 0, 0, 12)
-        };
-        Grid.SetRow(meta, 0);
-        grid.Children.Add(meta);
-
-        var bodyBox = new TextBox
-        {
-            Text = mail.Body,
-            IsReadOnly = true,
-            TextWrapping = TextWrapping.Wrap,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-            Padding = new Thickness(10),
-            Background = BrushFrom("#F8FAFC"),
-            BorderBrush = BrushFrom("#E2E8F0"),
-            FontSize = 13.5
-        };
-        Grid.SetRow(bodyBox, 1);
-        grid.Children.Add(bodyBox);
-
-        dlg.Content = grid;
-        dlg.ShowDialog();
+        var themeMode = await _controller.GetThemeModeAsync();
+        var dlg = new MailDetailWindow(mail, themeMode);
+        dlg.Show();
     }
 
     private void DragArea_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)

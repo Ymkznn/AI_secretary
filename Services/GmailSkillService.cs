@@ -504,14 +504,13 @@ public sealed class GmailSkillService
     private static string ExtractBodyText(JsonElement payload)
     {
         var plain = FindPartData(payload, "text/plain");
-        if (!string.IsNullOrWhiteSpace(plain)) return plain.Trim();
+        if (!string.IsNullOrWhiteSpace(plain))
+            return MailBodyFormatter.NormalizeReadablePlainText(plain);
 
         var html = FindPartData(payload, "text/html");
         if (!string.IsNullOrWhiteSpace(html))
-        {
-            var stripped = Regex.Replace(html, "<[^>]+>", " ");
-            return WebUtility.HtmlDecode(stripped).Trim();
-        }
+            return MailBodyFormatter.HtmlToReadableText(html);
+
         return "";
     }
 

@@ -339,8 +339,5 @@ public sealed class EwsDirectMailBroker : IMailBroker
     }
 
     private static string CleanBody(string raw)
-    {
-        var noTags = Regex.Replace(raw, "<[^>]+>", " ");
-        return WebUtility.HtmlDecode(noTags).Trim();
-    }
+        => MailBodyFormatter.FormatForDisplay(raw);
 }
