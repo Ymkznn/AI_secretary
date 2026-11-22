@@ -119,7 +119,9 @@ public sealed class TtsService : IDisposable
             foreach (var dir in Directory.GetDirectories(root))
             {
                 var key = Path.GetFileName(dir).ToLowerInvariant();
-                if (result.ContainsKey(key)) continue;
+                if (result.ContainsKey(key) ||
+                    result.Keys.Any(k => string.Equals(GetWeightGroup(k), key, StringComparison.OrdinalIgnoreCase)))
+                    continue;
 
                 var displayName = key;
                 var mdFile = Directory.GetFiles(dir, "*.md").FirstOrDefault();
