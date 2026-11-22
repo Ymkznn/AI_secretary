@@ -159,10 +159,14 @@ public sealed class ManageMailSkill : IBasicSkill
             var otpHandles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var m in collected.Take(15))
             {
-                var h = VaultOtpIfPresent(m);
+                var h = _vault.TryGetActiveHandleForMail(m.Id);
                 if (!string.IsNullOrWhiteSpace(h))
+                {
                     otpHandles.Add(h);
-                ctx.Sources.Add(new MailSourceRef(m.Id, m.Subject, m.SenderName, m.Subject, m.ReceivedAt));
+                    _skills.LastObservedOtpHandle = h;
+                    _skills.LastObservedOtpHint = m.Subject;
+                }
+                ctx.Sources.Add(new MailSourceRef(m.Id, _vault.RedactKnownSecrets(m.Subject), m.SenderName, _vault.RedactKnownSecrets(m.Subject), m.ReceivedAt));
             }
 
             var lines = collected.Take(15).Select(m =>
@@ -216,8 +220,13 @@ public sealed class ManageMailSkill : IBasicSkill
             return;
         }
 
-        var otpHandle = VaultOtpIfPresent(mail);
-        ctx.Sources.Add(new MailSourceRef(mail.Id, mail.Subject, mail.SenderName, mail.Subject, mail.ReceivedAt));
+        var otpHandle = _vault.TryGetActiveHandleForMail(mail.Id);
+        if (!string.IsNullOrWhiteSpace(otpHandle))
+        {
+            _skills.LastObservedOtpHandle = otpHandle;
+            _skills.LastObservedOtpHint = mail.Subject;
+        }
+        ctx.Sources.Add(new MailSourceRef(mail.Id, _vault.RedactKnownSecrets(mail.Subject), mail.SenderName, _vault.RedactKnownSecrets(mail.Subject), mail.ReceivedAt));
         var body = string.IsNullOrWhiteSpace(mail.Body) ? mail.Snippet : mail.Body;
         body = _vault.RedactKnownSecrets(body);
         if (body.Length > 4000) body = body[..4000] + "\n...(truncated)";
@@ -226,17 +235,6 @@ public sealed class ManageMailSkill : IBasicSkill
             : "";
         ctx.Observations.Add($"manage_mail: id={mail.Id} from={mail.SenderName} subject=\"{_vault.RedactKnownSecrets(mail.Subject)}\" at={mail.ReceivedAt.ToLocalTime():yyyy-MM-dd HH:mm}\n{body}{otpNote}");
         ctx.CompletedSteps.Add($"manage_mail:detail:{mail.Id}");
-    }
-
-    private string? VaultOtpIfPresent(MailItem mail)
-    {
-        if (!OtpExtractor.TryExtractFromMail(mail, out var rawCode))
-            return null;
-        var regDomain = OtpExtractor.ExtractRegistrableDomain(OtpExtractor.ExtractSenderDomain(mail.SenderEmail));
-        var handle = _vault.StoreOtp(rawCode, regDomain, mail.SenderName, mail.Id);
-        _skills.LastObservedOtpHandle = handle;
-        _skills.LastObservedOtpHint = mail.Subject;
-        return handle;
     }
 
     private async Task SyncAsync(SkillExecutionContext ctx, string source)

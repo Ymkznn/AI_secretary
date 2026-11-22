@@ -36,7 +36,6 @@ public partial class App : System.Windows.Application
         sc.AddSingleton<InteractionGateway>();
         sc.AddSingleton<AgentBlackboard>();
         sc.AddSingleton<SecretVaultService>();
-        sc.AddSingleton<OtpSituationDetector>();
         sc.AddSingleton<AutonomyPolicyService>();
         sc.AddLogging(b => b.AddConsole());
 

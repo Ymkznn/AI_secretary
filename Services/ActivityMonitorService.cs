@@ -25,8 +25,8 @@ public sealed record CachedBrowserPageSignal(
     IReadOnlyList<string> Headings,
     string Excerpt,
     DateTimeOffset CapturedAt,
-    bool OtpFieldPresent = false,
-    bool OtpFieldFocused = false);
+    bool HasOneTimeCodeInput = false,
+    bool HasFocusedInput = false);
 
 public sealed record DesktopSelectionSnapshot(
     string? SelectionText,
@@ -268,7 +268,7 @@ public sealed class ActivityMonitorService : IDisposable
         var domain = string.IsNullOrWhiteSpace(expectedDomain) || string.Equals(expectedDomain.Trim(), "unknown", StringComparison.OrdinalIgnoreCase)
             ? null
             : expectedDomain.Trim().ToLowerInvariant();
-        var domainStem = domain is not null ? OtpExtractor.ExtractDomainStem(domain) : "";
+        var domainStem = domain is not null ? DomainParser.ExtractDomainStem(domain) : "";
 
         bool MatchesDomainOrSender(ExternalWindowTarget t)
         {
@@ -394,8 +394,8 @@ public sealed class ActivityMonitorService : IDisposable
             Headings: headings,
             Excerpt: excerpt,
             CapturedAt: now,
-            OtpFieldPresent: signal.OtpFieldPresent,
-            OtpFieldFocused: signal.OtpFieldFocused);
+            HasOneTimeCodeInput: signal.HasOneTimeCodeInput,
+            HasFocusedInput: signal.HasFocusedInput);
 
         // Always cache L1 browser page metadata (even when InputCount == 0, e.g., Wiki/doc pages) for zero-round-trip deictic prefetch.
         lock (_lock)
@@ -403,34 +403,15 @@ public sealed class ActivityMonitorService : IDisposable
             _lastBrowserPageSignal = cached;
         }
 
-        // Notify OTP dual-signal detector regardless of InputCount (OTP pages often have only 1 input).
-        BrowserPageSignalReceived?.Invoke(cached);
-
-        if (!ProactiveMonitoringEnabled || signal.InputCount <= 0)
-            return Task.CompletedTask;
-
-        var current = GetLastExternalTarget();
-        var target = new ExternalWindowTarget(
-            Hwnd: current?.Hwnd ?? IntPtr.Zero,
-            ProcessId: current?.ProcessId ?? 0,
-            ProcessName: current?.ProcessName ?? "browser",
-            Title: title,
-            CapturedAt: now,
-            IsFormLike: signal.InputCount >= 4,
-            FormFieldLabels: labels,
-            VisibleInputCount: signal.InputCount);
-
-        // On OTP pages, the dedicated zero-LLM OTP correlator + fast mail sync handles everything automatically.
-        // Do NOT also fire WindowFocused -> StateMachine.FirstProbe, or the user gets a redundant "要不要幫你同步信箱" card!
-        if (!signal.OtpFieldPresent)
-            WindowFocused?.Invoke(target, signal.Url);
+        // Single unified browser-page signal channel consumed by StateMachineAgent (eliminates dual WindowFocused + PageSignal triggers).
+        if (ProactiveMonitoringEnabled)
+            BrowserPageSignalReceived?.Invoke(cached);
         return Task.CompletedTask;
     }
 
     /// <summary>
     /// Suppresses redundant UIA <c>WindowFocused(enriched, null)</c> events for browsers whenever the browser extension
-    /// already reported a fresh page signal (preventing duplicate <c>win:msedge|...</c> + <c>url:...</c> cards,
-    /// and ensuring OTP pages never spawn redundant StateMachine proposals).
+    /// already reported a fresh page signal (preventing duplicate <c>win:msedge|...</c> + <c>url:...</c> rules).
     /// </summary>
     internal static bool ShouldSuppressBrowserUiaWindowFocus(
         CachedBrowserPageSignal? lastSignal,
@@ -443,9 +424,6 @@ public sealed class ActivityMonitorService : IDisposable
         var age = nowUtc - lastSignal.CapturedAt;
         if (age > TimeSpan.FromSeconds(15))
             return false;
-
-        if (lastSignal.OtpFieldPresent)
-            return true;
 
         if (age <= TimeSpan.FromSeconds(5))
             return true;

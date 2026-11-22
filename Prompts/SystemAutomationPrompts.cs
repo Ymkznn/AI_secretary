@@ -107,18 +107,20 @@ public static class SystemAutomationPrompts
 
     public static string BuildFirstVisitProbeSystemPrompt(string replyLang = "繁體中文")
         => $$$"""
-            You are a discreet personal desktop secretary observing a work window or web form the user has dwelled on for several seconds.
-            Decide whether there is ONE genuinely helpful, low-risk, read/assist action worth gently offering to the user.
-            Be conservative: if the page is just reading/browsing/search or no clear assistance fits, set should_propose=false.
+            You are a discreet personal desktop secretary observing a work window or web page the user has dwelled on.
+            Decide the single best mode:
+            - "silent_prepare": ONLY when the page is clearly waiting for an incoming asynchronous email (such as a verification code, 2FA/OTP input, or email confirmation). Pick skill "manage_mail" with args {"action":"sync","source":"all","boost_seconds":90}. This runs silently in the background with ZERO popup card so the user is never nagged before the email arrives.
+            - "propose": ONLY when there is a genuinely helpful, low-risk interactive read/assist action worth gently offering (e.g., a multi-field web form to help fill, or an active Excel/PowerPoint document).
+            - "ignore": for general reading, browsing, search, video/social media, chat, password-only sign-in pages (not awaiting an email code), or whenever no clear assistance fits. Be conservative.
 
             Allowed safe skills only:
-            - "browser_form": args {"action":"read"} (for web forms with fillable fields)
-            - "manage_mail": args {"action":"sync"} (ONLY for login/2FA/OTP/verification pages where an email code might arrive)
-            - "office_excel": args {"action":"read_active"} (for Excel workbooks)
-            - "office_ppt": args {"action":"read_active"} (for PowerPoint decks)
+            - "manage_mail": args {"action":"sync","source":"all","boost_seconds":90} (for mode="silent_prepare" ONLY)
+            - "browser_form": args {"action":"read"} (for mode="propose" on fillable web forms)
+            - "office_excel": args {"action":"read_active"} (for mode="propose" on Excel workbooks)
+            - "office_ppt": args {"action":"read_active"} (for mode="propose" on PowerPoint decks)
 
             Output ONLY raw JSON (no markdown fences):
-            {"should_propose": true|false, "proposal": "1 short natural sentence in '{{{replyLang}}}' asking if they want help (no user name)", "skill": "skill_name", "args": {}}
+            {"mode": "silent_prepare|propose|ignore", "proposal": "1 short natural sentence in '{{{replyLang}}}' (required only when mode=propose; empty otherwise; no user name)", "skill": "skill_name", "args": {}}
             """;
 
     public static string BuildFirstVisitProbeUserPrompt(string processName, string title, string? url, string? formHints)
@@ -127,5 +129,39 @@ public static class SystemAutomationPrompts
             Title: {title}
             URL: {url ?? "(desktop app)"}
             Form/Page hints: {formHints ?? "(none)"}
+            """;
+
+    public static string BuildContextEventMatchSystemPrompt()
+        => """
+            You are the cross-context event matcher for a personal desktop assistant.
+            Given the user's currently open web page (metadata & visible field labels only) and one or more recent incoming actionable events (metadata only — never secrets), determine which event(s), if any, genuinely correspond to what the user is currently doing on this page (for example, the same service across different TLDs, a localized brand name matching its domain, or a verification email sent via a third-party mail provider).
+
+            Rules:
+            - Be strict and conservative: only include an event ID if the page is clearly expecting that event's action (e.g. a verification/input page for the same service/brand).
+            - Never match unrelated sites, general browsing/video/search pages, or different services.
+            - `confidence` must be between 0.0 and 1.0 (>= 0.85 only when the service match is unambiguous).
+            - Output ONLY raw JSON (no markdown fences):
+            {"matched_event_ids": ["..."], "confidence": 0.0, "reason": "brief reason"}
+            """;
+
+    public static string BuildContextEventMatchUserPrompt(
+        string pageUrl,
+        string pageTitle,
+        IReadOnlyList<string> pageHeadings,
+        IReadOnlyList<string> pageLabels,
+        bool hasOneTimeCodeInput,
+        string eventsBlock)
+        => $"""
+            <active_page>
+            url: {pageUrl}
+            title: {pageTitle}
+            headings: {(pageHeadings.Count == 0 ? "(none)" : string.Join(" | ", pageHeadings.Take(5)))}
+            input_labels: {(pageLabels.Count == 0 ? "(none)" : string.Join(", ", pageLabels.Take(10)))}
+            w3c_one_time_code_input: {hasOneTimeCodeInput.ToString().ToLowerInvariant()}
+            </active_page>
+
+            <recent_events>
+            {eventsBlock}
+            </recent_events>
             """;
 }

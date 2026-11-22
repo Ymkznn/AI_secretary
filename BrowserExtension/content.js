@@ -317,122 +317,140 @@
     return rect.width > 0 && rect.height > 0;
   }
 
-  const STRICT_OTP_HINT_RE = /otp|code|verify|verification|one[-_ ]?time|passcode|auth[-_ ]?code|confirm[-_ ]?code|2fa|mfa|驗證碼|認證碼|確認碼|動態密碼|認証|確認コード|ワンタイム/i;
-  const LOOSE_OTP_HINT_RE = /otp|one[-_ ]?time|code|verify|verification|token|auth|pin|passcode|2fa|mfa|驗證|認證|確認碼|動態密碼|認証|確認コード/i;
+  const NON_CODE_INPUT_TYPES = new Set([
+    'hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'image', 'reset',
+    'search', 'password', 'email', 'url', 'date', 'datetime-local', 'month', 'week', 'time', 'color', 'range'
+  ]);
 
-  function isStrictOtpInput(el) {
-    if (!el || (el.tagName || '').toLowerCase() !== 'input') return false;
+  function isEligibleCodeInput(el) {
+    if (!isVisibleInput(el) || (el.tagName || '').toLowerCase() !== 'input') return false;
     const ac = (el.getAttribute('autocomplete') || '').toLowerCase().trim();
     if (ac === 'one-time-code') return true;
     const type = (el.type || 'text').toLowerCase();
+    if (NON_CODE_INPUT_TYPES.has(type)) return false;
+    const role = (el.getAttribute('role') || '').toLowerCase().trim();
+    if (role === 'searchbox' || role === 'combobox') return false;
+    return true;
+  }
+
+  function isNumericOrShortCodeInput(el) {
+    const type = (el.type || 'text').toLowerCase();
     const maxLen = Number(el.maxLength || 0);
     const inputMode = (el.getAttribute('inputmode') || el.inputMode || '').toLowerCase().trim();
-    const lbl = findLabel(el, el.ownerDocument);
-    const meta = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${lbl}`;
-    if (!STRICT_OTP_HINT_RE.test(meta)) return false;
-    return (maxLen >= 4 && maxLen <= 8) || inputMode === 'numeric' || type === 'tel' || type === 'number';
+    return (maxLen >= 4 && maxLen <= 12) || inputMode === 'numeric' || type === 'tel' || type === 'number';
   }
 
-  function isStrictMultiBoxOtp(singleCharBoxes) {
-    if (singleCharBoxes.length < 4 || singleCharBoxes.length > 8) return false;
-    return singleCharBoxes.some(el => {
-      const ac = (el.getAttribute('autocomplete') || '').toLowerCase().trim();
-      const im = (el.getAttribute('inputmode') || el.inputMode || '').toLowerCase().trim();
-      const meta = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''}`;
-      return ac === 'one-time-code' || im === 'numeric' || STRICT_OTP_HINT_RE.test(meta);
-    }) || STRICT_OTP_HINT_RE.test(document.title || '');
-  }
-
-  function fillOtp(rawCode, requireStrictOtpField = false) {
+  // Pure DOM/W3C structural targeting (ZERO hardcoded language keywords):
+  // 1) Multi-box (4..8 visible maxLength===1 inputs)
+  // 2) W3C autocomplete="one-time-code"
+  // 3) Currently / recently focused eligible input
+  // 4) Sole eligible input on the verified page, or unique numeric/short-maxLength input
+  function fillOtp(rawCode, requireStrictField = false) {
     const code = String(rawCode ?? '').trim();
     if (!code) return { filled: false, title: document.title, url: location.href, error: 'empty code' };
 
     const inputs = queryAllDeep(document, 'input').filter(isVisibleInput);
     if (inputs.length === 0) {
-      return { filled: false, title: document.title, url: location.href, error: requireStrictOtpField ? 'no_otp_field' : 'no visible inputs' };
+      return { filled: false, title: document.title, url: location.href, error: requireStrictField ? 'no_otp_field' : 'no visible inputs' };
     }
 
-    // Case A: Multi-box OTP (e.g. 4-8 single-character boxes)
-    const singleCharBoxes = inputs.filter(el => el.maxLength === 1);
-    const multiAllowed = requireStrictOtpField
-      ? isStrictMultiBoxOtp(singleCharBoxes)
-      : (singleCharBoxes.length >= 4 && singleCharBoxes.length <= 8);
-    if (multiAllowed) {
+    // 1) Multi-box (4..8 single-character visible inputs)
+    const singleCharBoxes = inputs.filter(el => Number(el.maxLength) === 1);
+    if (singleCharBoxes.length >= 4 && singleCharBoxes.length <= 8 && singleCharBoxes.length >= code.length) {
       const targetBoxes = singleCharBoxes.slice(0, code.length);
-      if (targetBoxes.length === code.length) {
-        for (let i = 0; i < targetBoxes.length; i++) {
-          setNativeValue(targetBoxes[i], code[i]);
-        }
-        return { filled: true, mode: `multi(${targetBoxes.length})`, title: document.title, url: location.href };
+      for (let i = 0; i < targetBoxes.length; i++) {
+        setNativeValue(targetBoxes[i], code[i]);
       }
+      window.__aiSecLastFilledOtpEls = targetBoxes;
+      return { filled: true, mode: `multi(${targetBoxes.length})`, title: document.title, url: location.href };
     }
 
-    // Case B: Single OTP input (strict verification required on L2 auto-fill so generic search/text boxes are never filled)
-    let best = null;
-    let bestScore = -1;
-
-    for (const el of inputs) {
-      if (requireStrictOtpField && !isStrictOtpInput(el)) continue;
-
-      const type = (el.type || 'text').toLowerCase();
-      const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
-      const hintText = `${el.id} ${el.name} ${el.placeholder} ${el.getAttribute('aria-label') || ''} ${findLabel(el, el.ownerDocument)}`;
-      const isOtpHint = LOOSE_OTP_HINT_RE.test(hintText);
-      if (type === 'password' && !isOtpHint && ac !== 'one-time-code') continue;
-
-      let score = 1;
-      if (ac === 'one-time-code') score += 10;
-      if (isOtpHint) score += 5;
-      if (el.inputMode === 'numeric' || type === 'tel' || type === 'number') score += 2;
-      if (type !== 'password') score += 2;
-
-      if (score > bestScore) {
-        bestScore = score;
-        best = el;
-      }
+    // 2) W3C standard autocomplete="one-time-code"
+    const w3cOtp = inputs.find(el => (el.getAttribute('autocomplete') || '').toLowerCase().trim() === 'one-time-code');
+    if (w3cOtp) {
+      setNativeValue(w3cOtp, code);
+      window.__aiSecLastFilledOtpEls = [w3cOtp];
+      return { filled: true, mode: 'w3c_one_time_code', title: document.title, url: location.href };
     }
 
-    if (!best) {
-      return { filled: false, title: document.title, url: location.href, error: requireStrictOtpField ? 'no_otp_field' : 'no matching otp input' };
+    // 3) Eligible non-search, non-password, non-email inputs
+    const eligible = inputs.filter(isEligibleCodeInput);
+    if (eligible.length === 0) {
+      return { filled: false, title: document.title, url: location.href, error: requireStrictField ? 'no_otp_field' : 'no matching input' };
     }
 
-    setNativeValue(best, code);
+    const focusInfo = getFocusedEditableInfo();
+    if (focusInfo.el && eligible.includes(focusInfo.el)) {
+      setNativeValue(focusInfo.el, code);
+      window.__aiSecLastFilledOtpEls = [focusInfo.el];
+      return { filled: true, mode: 'focused', title: document.title, url: location.href };
+    }
+
+    if (eligible.length === 1) {
+      setNativeValue(eligible[0], code);
+      window.__aiSecLastFilledOtpEls = [eligible[0]];
+      return { filled: true, mode: 'sole_input', title: document.title, url: location.href };
+    }
+
+    const structured = eligible.filter(isNumericOrShortCodeInput);
+    if (structured.length === 1) {
+      setNativeValue(structured[0], code);
+      window.__aiSecLastFilledOtpEls = [structured[0]];
+      return { filled: true, mode: 'structured_unique', title: document.title, url: location.href };
+    }
+
+    if (requireStrictField) {
+      // Multiple ambiguous inputs and none is focused or structurally unique: fail safely so L2 downgrades to L1.
+      return { filled: false, title: document.title, url: location.href, error: 'ambiguous_fields' };
+    }
+
+    // Explicit user click fallback (L1 / manual): pick first structured candidate or first eligible input.
+    const chosen = structured[0] || eligible[0];
+    setNativeValue(chosen, code);
+    window.__aiSecLastFilledOtpEls = [chosen];
     return { filled: true, mode: 'single', title: document.title, url: location.href };
   }
 
   function clearOtp() {
+    // 1) Exact Undo: clear the exact DOM element(s) we filled in fillOtp (zero guessing).
+    const tracked = Array.isArray(window.__aiSecLastFilledOtpEls)
+      ? window.__aiSecLastFilledOtpEls.filter(el => el && el.isConnected && !el.disabled && !el.readOnly)
+      : [];
+    if (tracked.length > 0) {
+      for (const el of tracked) {
+        setNativeValue(el, '');
+      }
+      window.__aiSecLastFilledOtpEls = [];
+      return { filled: true, mode: `clear_tracked(${tracked.length})`, title: document.title, url: location.href };
+    }
+
+    // 2) Structural fallback if element references were cleared
     const inputs = queryAllDeep(document, 'input').filter(isVisibleInput);
     if (inputs.length === 0) {
       return { filled: false, title: document.title, url: location.href, error: 'no visible inputs' };
     }
 
-    const singleCharBoxes = inputs.filter(el => el.maxLength === 1);
-    if (isStrictMultiBoxOtp(singleCharBoxes)) {
+    const singleCharBoxes = inputs.filter(el => Number(el.maxLength) === 1);
+    if (singleCharBoxes.length >= 4 && singleCharBoxes.length <= 8) {
       for (const box of singleCharBoxes) {
         setNativeValue(box, '');
       }
       return { filled: true, mode: `clear_multi(${singleCharBoxes.length})`, title: document.title, url: location.href };
     }
 
-    let best = null;
-    let bestScore = -1;
-    for (const el of inputs) {
-      const type = (el.type || 'text').toLowerCase();
-      const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
-      const hintText = `${el.id} ${el.name} ${el.placeholder} ${el.getAttribute('aria-label') || ''} ${findLabel(el, el.ownerDocument)}`;
-      const isOtpHint = LOOSE_OTP_HINT_RE.test(hintText);
-      if (ac !== 'one-time-code' && !isOtpHint) continue;
-      let score = 1;
-      if (ac === 'one-time-code') score += 10;
-      if (isOtpHint) score += 5;
-      if (el.inputMode === 'numeric' || type === 'tel' || type === 'number') score += 2;
-      if (score > bestScore) { bestScore = score; best = el; }
+    const w3cOtp = inputs.find(el => (el.getAttribute('autocomplete') || '').toLowerCase().trim() === 'one-time-code');
+    if (w3cOtp) {
+      setNativeValue(w3cOtp, '');
+      return { filled: true, mode: 'clear_w3c', title: document.title, url: location.href };
     }
-    if (!best) {
-      return { filled: false, title: document.title, url: location.href, error: 'no_otp_field' };
+
+    const nonEmptyEligible = inputs.filter(el => isEligibleCodeInput(el) && String(el.value || '').trim().length > 0);
+    if (nonEmptyEligible.length === 1) {
+      setNativeValue(nonEmptyEligible[0], '');
+      return { filled: true, mode: 'clear_sole', title: document.title, url: location.href };
     }
-    setNativeValue(best, '');
-    return { filled: true, mode: 'clear_single', title: document.title, url: location.href };
+
+    return { filled: false, title: document.title, url: location.href, error: 'no_otp_field' };
   }
 
   function sanitizeCloneDom(rootDocOrEl) {

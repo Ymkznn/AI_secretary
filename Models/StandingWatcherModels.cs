@@ -64,8 +64,8 @@ public sealed record BrowserPageSignal(
     IReadOnlyList<string>? Labels = null,
     IReadOnlyList<string>? Headings = null,
     string? Excerpt = null,
-    bool OtpFieldPresent = false,
-    bool OtpFieldFocused = false);
+    bool HasOneTimeCodeInput = false,
+    bool HasFocusedInput = false);
 
 public sealed record AutonomyPolicyRecord(
     string ActionClass,

@@ -19,6 +19,7 @@ public sealed class AutonomyPolicyService
 {
     public const string ActionFillOtp = "fill_otp";
     public const int L1PromotionThreshold = 3;
+    public const double DefaultAutoExecuteL2Threshold = 0.85;
 
     private readonly SqliteStore _store;
 
@@ -39,7 +40,7 @@ public sealed class AutonomyPolicyService
         if (existing is null)
         {
             if (string.Equals(actionClass, ActionFillOtp, StringComparison.OrdinalIgnoreCase))
-                return confidence >= OtpSituationDetector.AutoFillL2Threshold ? 2 : 1;
+                return confidence >= DefaultAutoExecuteL2Threshold ? 2 : 1;
             return 1;
         }
 

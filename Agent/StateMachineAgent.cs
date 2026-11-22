@@ -15,15 +15,55 @@ public sealed record StateMachineProposal(
     string ProposalMessage,
     IReadOnlyList<string> Choices);
 
+public sealed record ActivePageContext(
+    string Url,
+    string Host,
+    string RegistrableDomain,
+    string Title,
+    IReadOnlyList<string> Headings,
+    IReadOnlyList<string> Labels,
+    int InputCount,
+    bool HasOneTimeCodeInput,
+    bool HasFocusedInput,
+    DateTimeOffset ObservedAtUtc);
+
+public sealed record StateMachineContextEvent(
+    string EventId,
+    string ActionClass,
+    string SourceId,
+    string SourceDomain,
+    string SourceName,
+    string Title,
+    string Summary,
+    string ResourceHandle,
+    DateTimeOffset OccurredAtUtc);
+
+public enum ContextEventMatchKind
+{
+    None,
+    SingleMatch,
+    MultipleMatches
+}
+
+public sealed record MatchedContextEvent(
+    StateMachineContextEvent Event,
+    double Confidence,
+    string Reason);
+
+public sealed record ContextEventMatchDecision(
+    ContextEventMatchKind Kind,
+    ActivePageContext Page,
+    IReadOnlyList<MatchedContextEvent> Matches);
+
 /// <summary>
-/// Human-friendly adaptive autonomous state machine agent.
+/// Unified adaptive autonomous state machine agent (Window/Page Context x Incoming Events -> Learned Action).
+/// Contains ZERO hardcoded language keywords, OTP regexes, or domain blacklists:
 /// - Hot rules (Counter >= 2): replay silently via WorkerAgent.RunStepAsync (0 LLM tokens).
-/// - Cold rules (Counter == 1) & same-domain experience transfer: after a short dwell, gently raise hand
-///   with ["好，幫我做", "這次不用", "以後別問"] (0 LLM tokens).
-/// - First-visit unknown work windows/forms: zero-token noise filter + 5s dwell + work-signal check,
-///   then at most ONE Simple-tier probe cached as Cold or Ignored(7d) so it never re-spends tokens.
-/// - "這次不用" snoozes for 3h without killing the rule; "以後別問" mutes it; manually using the skill
-///   again on that window/page auto-revives Muted/Disabled/Ignored rules back to Cold.
+/// - Cold rules (Counter == 1) &amp; same-domain experience transfer: gently raise hand after dwell (0 LLM tokens).
+/// - First-visit unknown input pages/Office docs: structural input check + brief dwell -> 1 Simple-tier LLM probe
+///   choosing <c>silent_prepare</c> (read-only background sync, zero popup), <c>propose</c>, or <c>ignore</c> (cached 7d).
+/// - Incoming actionable context events (e.g., triaged mail actions): correlated bidirectionally (page-first or event-first)
+///   within a ±3 minute window via exact RFC registrable-domain match (0 LLM) or 1 Simple-tier semantic match for cross-domain services.
 /// </summary>
 public sealed class StateMachineAgent : IDisposable
 {
@@ -32,17 +72,18 @@ public sealed class StateMachineAgent : IDisposable
     public const string ChoiceSnooze = "這次不用";
     public const string ChoiceMute = "以後別問";
 
+    public static readonly TimeSpan EventCorrelationWindow = TimeSpan.FromMinutes(3);
+    public const double MinSemanticMatchConfidence = 0.50;
+
     private static readonly TimeSpan ColdDwellDelay = TimeSpan.FromSeconds(4);
-    private static readonly TimeSpan FirstVisitDwellDelay = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan FirstVisitDwellDelay = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan GlobalFirstProbeCooldown = TimeSpan.FromSeconds(20);
 
-    private static readonly HashSet<string> NoiseProcesses = new(StringComparer.OrdinalIgnoreCase)
+    // Pure Windows OS shell & self-exclusion (non-business infrastructure only).
+    private static readonly HashSet<string> SystemShellProcesses = new(StringComparer.OrdinalIgnoreCase)
     {
         "aisecretary.desktop", "explorer", "searchhost", "shellexperiencehost", "startmenuexperiencehost",
-        "applicationframehost", "taskmgr", "lockapp", "textinputhost",
-        "discord", "line", "telegram", "slack", "spotify", "steam", "steamwebhelper",
-        "epicgameslauncher", "riotclientux", "battle.net", "vlc", "potplayermini64", "mpv",
-        "code", "devenv", "rider64", "windowsterminal", "powershell", "pwsh", "cmd", "conhost", "wt"
+        "applicationframehost", "taskmgr", "lockapp", "textinputhost"
     };
 
     private static readonly HashSet<string> BrowserProcesses = new(StringComparer.OrdinalIgnoreCase)
@@ -55,18 +96,6 @@ public sealed class StateMachineAgent : IDisposable
         "excel", "powerpnt", "winword", "outlook"
     };
 
-    private static readonly string[] EntertainmentHosts =
-    {
-        "youtube.com", "youtu.be", "twitch.tv", "netflix.com", "bilibili.com", "bahamut.com.tw",
-        "gamer.com.tw", "discord.com", "twitter.com", "x.com", "instagram.com", "facebook.com",
-        "threads.net", "reddit.com", "tiktok.com", "spotify.com", "nicovideo.jp", "pixiv.net",
-        "google.com", "bing.com", "duckduckgo.com", "github.com", "chatgpt.com", "claude.ai"
-    };
-
-    private static readonly Regex WorkTitleHintRegex = new(
-        @"(登入|登錄|驗證碼|驗證|兩步驟|表單|申請|報銷|請假|問卷|預約|報名|login|sign[\s-]?in|verify|verification|otp|2fa|mfa|auth|form|apply|submit|checkout|register)",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled);
-
     private readonly SqliteStore _store;
     private readonly WorkerAgent _worker;
     private readonly GuardService _guard;
@@ -74,7 +103,9 @@ public sealed class StateMachineAgent : IDisposable
     private readonly BrowserFormBridgeService _browserBridge;
     private readonly AgentBlackboard _blackboard;
     private readonly UserPresenceService _presence;
+    private readonly SecretVaultService _vault;
     private readonly ILogger<StateMachineAgent> _logger;
+    private readonly Func<DateTimeOffset> _utcNow;
 
     private readonly object _latestLock = new();
     private CancellationTokenSource? _latestCts;
@@ -83,7 +114,19 @@ public sealed class StateMachineAgent : IDisposable
     private DateTimeOffset _lastFirstProbeAtUtc = DateTimeOffset.MinValue;
     private readonly ConcurrentDictionary<string, DateTimeOffset> _hitCooldowns = new(StringComparer.OrdinalIgnoreCase);
 
+    // Unified Context x Event correlation state (replaces dedicated OTP detector).
+    private readonly object _eventLock = new();
+    private ActivePageContext? _activePage;
+    private readonly List<StateMachineContextEvent> _recentEvents = new();
+    private readonly HashSet<string> _dispatchedEventKeys = new(StringComparer.OrdinalIgnoreCase);
+
     public event Action<StateMachineProposal>? ProposalRequested;
+
+    /// <summary>
+    /// Async handler invoked whenever an active page/window matches 1+ recent actionable context events.
+    /// Returns <c>true</c> if the handler executed or surfaced a UI card so upstream producers skip duplicate alerts.
+    /// </summary>
+    public Func<ContextEventMatchDecision, CancellationToken, Task<bool>>? ContextEventMatchHandler { get; set; }
 
     public StateMachineAgent(
         SqliteStore store,
@@ -93,7 +136,23 @@ public sealed class StateMachineAgent : IDisposable
         BrowserFormBridgeService browserBridge,
         AgentBlackboard blackboard,
         UserPresenceService presence,
+        SecretVaultService vault,
         ILogger<StateMachineAgent> logger)
+        : this(store, worker, guard, model, browserBridge, blackboard, presence, vault, logger, () => DateTimeOffset.UtcNow)
+    {
+    }
+
+    internal StateMachineAgent(
+        SqliteStore store,
+        WorkerAgent worker,
+        GuardService guard,
+        IModelGateway model,
+        BrowserFormBridgeService browserBridge,
+        AgentBlackboard blackboard,
+        UserPresenceService presence,
+        SecretVaultService vault,
+        ILogger<StateMachineAgent> logger,
+        Func<DateTimeOffset> utcNow)
     {
         _store = store;
         _worker = worker;
@@ -102,7 +161,33 @@ public sealed class StateMachineAgent : IDisposable
         _browserBridge = browserBridge;
         _blackboard = blackboard;
         _presence = presence;
+        _vault = vault;
         _logger = logger;
+        _utcNow = utcNow;
+    }
+
+    /// <summary>
+    /// One-time cleanup of legacy browser-UIA (<c>win:msedge|...</c>) rules and pre-v2 Cold <c>first_visit_manage_mail</c> rules
+    /// so pages with the browser extension use clean URL-scoped rules and silent background preparation.
+    /// </summary>
+    public async Task MigrateLegacyRulesAsync(CancellationToken ct = default)
+    {
+        var done = await _store.GetSyncValueAsync("state_machine_v2_migrated", ct);
+        if (done == "1") return;
+
+        var rules = await _store.GetAllAutoStateRulesAsync(ct);
+        foreach (var r in rules)
+        {
+            bool isLegacyBrowserWinRule = BrowserProcesses.Any(b =>
+                r.TriggerKey.StartsWith($"win:{b}|", StringComparison.OrdinalIgnoreCase));
+            bool isLegacyColdMailSync = string.Equals(r.Status, "Cold", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(r.StateName, "first_visit_manage_mail", StringComparison.OrdinalIgnoreCase);
+
+            if (isLegacyBrowserWinRule || isLegacyColdMailSync)
+                await _store.DeleteAutoStateRuleAsync(r.TriggerKey, ct);
+        }
+
+        await _store.SetSyncValueAsync("state_machine_v2_migrated", "1", ct);
     }
 
     public static string BuildTriggerKey(string? url, string processName, string title)
@@ -129,11 +214,264 @@ public sealed class StateMachineAgent : IDisposable
         return null;
     }
 
-    public async Task HandleWindowFocusAsync(
+    /// <summary>
+    /// Unified entry point for browser extension page signals:
+    /// 1) Updates active page context and immediately evaluates any pending incoming context events (event-first -> page-second).
+    /// 2) When the page has editable non-search inputs, drives standard StateMachine rule replay / first-visit probe.
+    /// </summary>
+    public async Task HandleBrowserPageSignalAsync(
+        string conversationId,
+        CachedBrowserPageSignal signal,
+        ExternalWindowTarget? currentExternalTarget = null,
+        CancellationToken appCt = default)
+    {
+        if (signal is null || string.IsNullOrWhiteSpace(signal.Url))
+            return;
+
+        var host = DomainParser.ExtractHostFromUrl(signal.Url);
+        var regDomain = DomainParser.ExtractRegistrableDomain(host);
+        var page = new ActivePageContext(
+            Url: signal.Url.Trim(),
+            Host: host,
+            RegistrableDomain: regDomain,
+            Title: (signal.Title ?? "").Trim(),
+            Headings: signal.Headings ?? Array.Empty<string>(),
+            Labels: signal.Labels ?? Array.Empty<string>(),
+            InputCount: Math.Max(0, signal.InputCount),
+            HasOneTimeCodeInput: signal.HasOneTimeCodeInput,
+            HasFocusedInput: signal.HasFocusedInput,
+            ObservedAtUtc: signal.CapturedAt == default ? _utcNow() : signal.CapturedAt);
+
+        lock (_eventLock)
+        {
+            _activePage = page;
+        }
+
+        // Step 1: Event-first -> Page-second correlation (zero dwell so already-arrived events act immediately).
+        if (page.InputCount > 0 || page.HasOneTimeCodeInput)
+        {
+            try
+            {
+                var decision = await TryCorrelateActivePageAsync(appCt);
+                if (decision is not null && ContextEventMatchHandler is not null)
+                    await ContextEventMatchHandler(decision, appCt);
+            }
+            catch (OperationCanceledException) { return; }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "[StateMachineAgent] Page-arrival event correlation failed");
+            }
+        }
+
+        // Step 2: Only engage page automation rules when the page structurally has editable form/input controls.
+        if (page.InputCount <= 0 && !page.HasOneTimeCodeInput)
+            return;
+
+        var target = new ExternalWindowTarget(
+            Hwnd: currentExternalTarget?.Hwnd ?? IntPtr.Zero,
+            ProcessId: currentExternalTarget?.ProcessId ?? 0,
+            ProcessName: currentExternalTarget is not null && BrowserProcesses.Contains(currentExternalTarget.ProcessName)
+                ? currentExternalTarget.ProcessName
+                : "chrome",
+            Title: page.Title,
+            CapturedAt: page.ObservedAtUtc,
+            IsFormLike: page.InputCount >= 4,
+            FormFieldLabels: page.Labels,
+            VisibleInputCount: page.InputCount);
+
+        await HandleWindowFocusInternalAsync(conversationId, target, page.Url, signal, appCt);
+    }
+
+    /// <summary>
+    /// Records an incoming actionable context event (e.g., an OTP/action extracted by MailTriage at exit)
+    /// and attempts immediate correlation against the currently active page (page-first -> event-second).
+    /// Returns <c>true</c> if correlated and handled so the caller skips emitting a duplicate notification card.
+    /// </summary>
+    public async Task<bool> HandleContextEventAsync(StateMachineContextEvent contextEvent, CancellationToken ct = default)
+    {
+        if (contextEvent is null || string.IsNullOrWhiteSpace(contextEvent.EventId))
+            return false;
+
+        var now = _utcNow();
+        lock (_eventLock)
+        {
+            PruneEventsLocked(now);
+            _recentEvents.RemoveAll(e =>
+                string.Equals(e.EventId, contextEvent.EventId, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrWhiteSpace(contextEvent.ResourceHandle) &&
+                 string.Equals(e.ResourceHandle, contextEvent.ResourceHandle, StringComparison.OrdinalIgnoreCase)));
+            _recentEvents.Add(contextEvent);
+        }
+
+        var decision = await TryCorrelateActivePageAsync(ct);
+        if (decision is null)
+            return false;
+
+        if (ContextEventMatchHandler is not null)
+            return await ContextEventMatchHandler(decision, ct);
+
+        return true;
+    }
+
+    internal async Task<ContextEventMatchDecision?> TryCorrelateActivePageAsync(CancellationToken ct = default)
+    {
+        var now = _utcNow();
+        ActivePageContext? page;
+        List<StateMachineContextEvent> eligible;
+
+        lock (_eventLock)
+        {
+            PruneEventsLocked(now);
+            page = _activePage;
+            if (page is null || (page.InputCount <= 0 && !page.HasOneTimeCodeInput) || _recentEvents.Count == 0)
+                return null;
+
+            if ((now - page.ObservedAtUtc) > EventCorrelationWindow)
+                return null;
+
+            eligible = _recentEvents
+                .Where(ev =>
+                    Math.Abs((page.ObservedAtUtc - ev.OccurredAtUtc).TotalSeconds) <= EventCorrelationWindow.TotalSeconds &&
+                    (now - ev.OccurredAtUtc) <= EventCorrelationWindow &&
+                    IsEventResourceActive(ev) &&
+                    !_dispatchedEventKeys.Contains(BuildDispatchKey(page.Url, ev.EventId)))
+                .ToList();
+        }
+
+        if (eligible.Count == 0)
+            return null;
+
+        var decision = await EvaluatePageEventMatchAsync(page, eligible, ct);
+        if (decision is null || decision.Kind == ContextEventMatchKind.None || decision.Matches.Count == 0)
+            return null;
+
+        lock (_eventLock)
+        {
+            // Guard against concurrent double-dispatch while async semantic match was in flight.
+            var freshMatches = decision.Matches
+                .Where(m => !_dispatchedEventKeys.Contains(BuildDispatchKey(page.Url, m.Event.EventId)))
+                .ToList();
+            if (freshMatches.Count == 0)
+                return null;
+
+            foreach (var m in freshMatches)
+                _dispatchedEventKeys.Add(BuildDispatchKey(page.Url, m.Event.EventId));
+
+            var kind = freshMatches.Count == 1 ? ContextEventMatchKind.SingleMatch : ContextEventMatchKind.MultipleMatches;
+            return new ContextEventMatchDecision(kind, page, freshMatches);
+        }
+    }
+
+    internal async Task<ContextEventMatchDecision?> EvaluatePageEventMatchAsync(
+        ActivePageContext page,
+        IReadOnlyList<StateMachineContextEvent> candidates,
+        CancellationToken ct = default)
+    {
+        if (candidates.Count == 0)
+            return null;
+
+        // Path A: Exact RFC registrable-domain match (e.g., tenso.com == tenso.com, pchome.com.tw == pchome.com.tw).
+        // Pure DNS identity boundary (same trust basis as browser Same-Origin) -> zero LLM calls, confidence 1.0.
+        if (!string.IsNullOrWhiteSpace(page.RegistrableDomain))
+        {
+            var exact = candidates
+                .Where(ev => !string.IsNullOrWhiteSpace(ev.SourceDomain) &&
+                             string.Equals(page.RegistrableDomain, ev.SourceDomain, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(ev => ev.OccurredAtUtc)
+                .Select(ev => new MatchedContextEvent(ev, 1.0, $"exact_domain:{page.RegistrableDomain}"))
+                .ToList();
+
+            if (exact.Count > 0)
+            {
+                var kind = exact.Count == 1 ? ContextEventMatchKind.SingleMatch : ContextEventMatchKind.MultipleMatches;
+                return new ContextEventMatchDecision(kind, page, exact);
+            }
+        }
+
+        // Path B: Cross-domain / localized-brand / third-party-ESP semantic match via 1 Simple-tier LLM call.
+        // Never sends any plaintext secret (only redacted metadata + page labels/title).
+        if (_presence.IsSilentForTokens)
+            return null;
+
+        try
+        {
+            using var matchCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            matchCts.CancelAfter(TimeSpan.FromSeconds(8));
+
+            var eventsBlock = string.Join("\n", candidates.Take(5).Select(ev =>
+                $"- event_id={ev.EventId} | action={ev.ActionClass} | source_domain={ev.SourceDomain} | source_name=\"{ev.SourceName}\" | title=\"{ev.Title}\" | summary=\"{ev.Summary}\""));
+
+            var sys = SystemAutomationPrompts.BuildContextEventMatchSystemPrompt();
+            var user = SystemAutomationPrompts.BuildContextEventMatchUserPrompt(
+                page.Url, page.Title, page.Headings, page.Labels, page.HasOneTimeCodeInput, eventsBlock);
+
+            var resp = await _model.CompleteAsync(new[]
+            {
+                new ModelMessage("system", sys),
+                new ModelMessage("user", user)
+            }, new LlmCallOptions("StateMachine.EventMatch", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), matchCts.Token);
+
+            var (matchedIds, confidence, reason) = ParseEventMatchDecision(resp.Content);
+            if (matchedIds.Count == 0 || confidence < MinSemanticMatchConfidence)
+                return null;
+
+            var idSet = new HashSet<string>(matchedIds, StringComparer.OrdinalIgnoreCase);
+            var matched = candidates
+                .Where(ev => idSet.Contains(ev.EventId))
+                .OrderByDescending(ev => ev.OccurredAtUtc)
+                .Select(ev => new MatchedContextEvent(ev, confidence, string.IsNullOrWhiteSpace(reason) ? "semantic_match" : reason))
+                .ToList();
+
+            if (matched.Count == 0)
+                return null;
+
+            var kind = matched.Count == 1 ? ContextEventMatchKind.SingleMatch : ContextEventMatchKind.MultipleMatches;
+            return new ContextEventMatchDecision(kind, page, matched);
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "[StateMachineAgent] Cross-domain EventMatch failed");
+            return null;
+        }
+    }
+
+    private bool IsEventResourceActive(StateMachineContextEvent ev)
+    {
+        if (string.IsNullOrWhiteSpace(ev.ResourceHandle))
+            return true;
+        if (SecretVaultService.IsOtpHandle(ev.ResourceHandle))
+            return _vault.TryPeekMetadata(ev.ResourceHandle, out _);
+        return true;
+    }
+
+    private void PruneEventsLocked(DateTimeOffset now)
+    {
+        _recentEvents.RemoveAll(ev =>
+            (now - ev.OccurredAtUtc) > EventCorrelationWindow || !IsEventResourceActive(ev));
+
+        if (_dispatchedEventKeys.Count > 200)
+            _dispatchedEventKeys.Clear();
+    }
+
+    private static string BuildDispatchKey(string pageUrl, string eventId) => $"{pageUrl}|{eventId}";
+
+    public Task HandleWindowFocusAsync(
         string conversationId,
         ExternalWindowTarget target,
         string? url,
         CancellationToken appCt = default)
+        => HandleWindowFocusInternalAsync(conversationId, target, url, browserSignal: null, appCt);
+
+    private async Task HandleWindowFocusInternalAsync(
+        string conversationId,
+        ExternalWindowTarget target,
+        string? url,
+        CachedBrowserPageSignal? browserSignal,
+        CancellationToken appCt)
     {
         var triggerKey = BuildTriggerKey(url, target.ProcessName, target.Title);
 
@@ -142,7 +480,7 @@ public sealed class StateMachineAgent : IDisposable
         lock (_latestLock)
         {
             _lastFocusedTriggerKey = triggerKey;
-            _lastFocusedAtUtc = DateTimeOffset.UtcNow;
+            _lastFocusedAtUtc = _utcNow();
             try { _latestCts?.Cancel(); } catch { }
             try { _latestCts?.Dispose(); } catch { }
             _latestCts = CancellationTokenSource.CreateLinkedTokenSource(appCt);
@@ -152,7 +490,7 @@ public sealed class StateMachineAgent : IDisposable
 
         try
         {
-            var now = DateTimeOffset.UtcNow;
+            var now = _utcNow();
             var existing = await _store.GetAutoStateRuleAsync(triggerKey, ct);
             if (existing is not null)
             {
@@ -189,11 +527,10 @@ public sealed class StateMachineAgent : IDisposable
                     await Task.Delay(ColdDwellDelay, ct);
                     if (ct.IsCancellationRequested) return;
 
-                    // Prevent re-popping if user ignores the pill and Alt+Tabs right back.
                     await _store.UpsertAutoStateRuleAsync(existing with
                     {
-                        CooldownUntil = DateTimeOffset.UtcNow.AddMinutes(30),
-                        LastSeenAt = DateTimeOffset.UtcNow
+                        CooldownUntil = _utcNow().AddMinutes(30),
+                        LastSeenAt = _utcNow()
                     }, ct);
 
                     var msg = !string.IsNullOrWhiteSpace(existing.ProposalText)
@@ -215,6 +552,7 @@ public sealed class StateMachineAgent : IDisposable
                     r.TriggerKey.StartsWith(coarsePrefix, StringComparison.OrdinalIgnoreCase) &&
                     r.Status is "Hot" or "Cold" &&
                     r.PredictorCounter >= 1 &&
+                    !r.StateName.StartsWith("silent_prepare_", StringComparison.OrdinalIgnoreCase) &&
                     ParseSteps(r.StepsJson).Count > 0);
 
                 if (donor is not null)
@@ -231,8 +569,8 @@ public sealed class StateMachineAgent : IDisposable
                         HitCount: 0,
                         MissCount: 0,
                         Status: "Cold",
-                        LastSeenAt: DateTimeOffset.UtcNow,
-                        CooldownUntil: DateTimeOffset.UtcNow.AddMinutes(30),
+                        LastSeenAt: _utcNow(),
+                        CooldownUntil: _utcNow().AddMinutes(30),
                         ProposalText: $"這頁跟之前在同個網站用過的很像，要照上次那樣幫你處理（{DescribeSkill(donorSteps[0].Skill)}）嗎？");
 
                     await _store.UpsertAutoStateRuleAsync(transferred, ct);
@@ -241,8 +579,8 @@ public sealed class StateMachineAgent : IDisposable
                 }
             }
 
-            // Brand-new window/page: zero-token noise filter -> dwell -> work-signal check -> at most 1 Simple LLM probe
-            await TryFirstVisitProbeAsync(triggerKey, target, url, ct);
+            // Brand-new window/page: pure structural check -> dwell -> at most 1 Simple LLM probe
+            await TryFirstVisitProbeAsync(conversationId, triggerKey, target, url, browserSignal, ct);
         }
         catch (OperationCanceledException)
         {
@@ -254,20 +592,23 @@ public sealed class StateMachineAgent : IDisposable
         }
     }
 
-    private async Task TryFirstVisitProbeAsync(
+    internal async Task TryFirstVisitProbeAsync(
+        string conversationId,
         string triggerKey,
         ExternalWindowTarget target,
         string? url,
-        CancellationToken ct)
+        CachedBrowserPageSignal? browserSignal,
+        CancellationToken ct,
+        bool skipDwellForTest = false)
     {
         if (_presence.IsSilentForTokens)
             return;
 
         var proc = (target.ProcessName ?? "").Trim();
-        if (string.IsNullOrWhiteSpace(proc) || NoiseProcesses.Contains(proc))
+        if (string.IsNullOrWhiteSpace(proc) || SystemShellProcesses.Contains(proc))
             return;
 
-        bool isBrowser = BrowserProcesses.Contains(proc);
+        bool isBrowser = browserSignal is not null || BrowserProcesses.Contains(proc);
         bool isOffice = OfficeProcesses.Contains(proc);
         if (!isBrowser && !isOffice)
             return;
@@ -278,51 +619,67 @@ public sealed class StateMachineAgent : IDisposable
                 return;
             if (uri.Scheme is not ("http" or "https"))
                 return;
-            var host = uri.Host.ToLowerInvariant();
-            if (EntertainmentHosts.Any(h => host == h || host.EndsWith("." + h, StringComparison.Ordinal)))
-                return;
         }
 
-        // Wait dwell time so rapid tab switching costs 0 tokens and never nags.
-        await Task.Delay(FirstVisitDwellDelay, ct);
-        if (ct.IsCancellationRequested) return;
-
-        // Global first-visit probe rate limit.
-        lock (_latestLock)
+        if (!skipDwellForTest)
         {
-            if ((DateTimeOffset.UtcNow - _lastFirstProbeAtUtc) < GlobalFirstProbeCooldown)
-                return;
+            // Wait brief dwell time so rapid tab switching costs 0 tokens and never nags.
+            await Task.Delay(FirstVisitDwellDelay, ct);
+            if (ct.IsCancellationRequested) return;
+
+            // Global first-visit probe rate limit.
+            lock (_latestLock)
+            {
+                if ((_utcNow() - _lastFirstProbeAtUtc) < GlobalFirstProbeCooldown)
+                    return;
+            }
         }
 
         string? formHints = null;
         if (isBrowser)
         {
-            BrowserFormContext? formCtx = null;
-            try
+            int fieldCount = browserSignal?.InputCount ?? 0;
+            var labels = browserSignal?.Labels is { Count: > 0 } ? browserSignal.Labels.Take(8).ToList() : new List<string>();
+            var headings = browserSignal?.Headings is { Count: > 0 } ? browserSignal.Headings.Take(4).ToList() : new List<string>();
+            var excerpt = browserSignal?.Excerpt ?? "";
+
+            if (fieldCount == 0 && browserSignal is null)
             {
-                formCtx = await _browserBridge.RequestActiveTabFormAsync(TimeSpan.FromMilliseconds(1500), ct);
+                BrowserFormContext? formCtx = null;
+                try
+                {
+                    formCtx = await _browserBridge.RequestActiveTabFormAsync(TimeSpan.FromMilliseconds(1500), ct);
+                }
+                catch { }
+
+                var nonSearchFields = formCtx?.Fields?
+                    .Where(f => !string.Equals(f.ControlType, "search", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                fieldCount = nonSearchFields?.Count ?? 0;
+                if (fieldCount > 0)
+                {
+                    labels = nonSearchFields!
+                        .Select(f => string.IsNullOrWhiteSpace(f.Label) ? f.ControlType : f.Label)
+                        .Where(s => !string.IsNullOrWhiteSpace(s))
+                        .Take(8)
+                        .ToList();
+                }
             }
-            catch { }
 
-            int fieldCount = formCtx?.Fields?.Count ?? 0;
-            bool titleMatchesWork = WorkTitleHintRegex.IsMatch(target.Title ?? "");
-
-            // Only spend 1 Simple LLM call when there is a real work signal (form fields or auth/form title).
-            if (fieldCount == 0 && !titleMatchesWork)
+            // Pure structural gate (ZERO language keywords): only probe pages that actually contain editable non-search inputs.
+            if (fieldCount == 0 && browserSignal?.HasOneTimeCodeInput != true)
                 return;
 
-            if (fieldCount > 0)
-            {
-                var labels = formCtx!.Fields
-                    .Select(f => string.IsNullOrWhiteSpace(f.Label) ? f.ControlType : f.Label)
-                    .Where(s => !string.IsNullOrWhiteSpace(s))
-                    .Take(8);
-                formHints = $"Detected {fieldCount} form field(s): {string.Join(", ", labels)}";
-            }
-            else
-            {
-                formHints = "Title suggests login/verification/form page (no extension form snapshot).";
-            }
+            var parts = new List<string> { $"Detected {fieldCount} editable form field(s)" };
+            if (labels.Count > 0)
+                parts.Add($"labels=[{string.Join(", ", labels)}]");
+            if (headings.Count > 0)
+                parts.Add($"headings=[{string.Join(" | ", headings)}]");
+            if (browserSignal?.HasOneTimeCodeInput == true)
+                parts.Add("structural_hint=w3c_one_time_code_or_multibox");
+            if (!string.IsNullOrWhiteSpace(excerpt))
+                parts.Add($"excerpt=\"{(excerpt.Length <= 220 ? excerpt : excerpt[..220] + "…")}\"");
+            formHints = string.Join("; ", parts);
         }
         else if (isOffice)
         {
@@ -331,7 +688,7 @@ public sealed class StateMachineAgent : IDisposable
 
         lock (_latestLock)
         {
-            _lastFirstProbeAtUtc = DateTimeOffset.UtcNow;
+            _lastFirstProbeAtUtc = _utcNow();
         }
 
         using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -345,8 +702,8 @@ public sealed class StateMachineAgent : IDisposable
             new ModelMessage("user", user)
         }, new LlmCallOptions("StateMachine.FirstProbe", ModelTier.Simple, CachePolicy.None, LlmPriority.Background), probeCts.Token);
 
-        var (shouldPropose, proposal, step) = ParseFirstVisitDecision(resp.Content);
-        if (!shouldPropose || step is null || FilterSafeSteps(new List<CachedWorkflowStep> { step }).Count == 0)
+        var (mode, proposal, step) = ParseFirstVisitDecision(resp.Content);
+        if (mode == "ignore" || step is null || FilterSafeSteps(new List<CachedWorkflowStep> { step }).Count == 0)
         {
             // Remember "nothing to offer" for 7 days so revisiting costs 0 tokens.
             await _store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord(
@@ -357,8 +714,32 @@ public sealed class StateMachineAgent : IDisposable
                 HitCount: 0,
                 MissCount: 0,
                 Status: "Ignored",
-                LastSeenAt: DateTimeOffset.UtcNow,
-                CooldownUntil: DateTimeOffset.UtcNow.AddDays(7)), ct);
+                LastSeenAt: _utcNow(),
+                CooldownUntil: _utcNow().AddDays(7)), ct);
+            return;
+        }
+
+        // Strictly read-only background preparation (e.g., manage_mail sync boost while waiting on a verification email):
+        // Save directly as Hot and execute silently with ZERO popup card!
+        if (mode == "silent_prepare" && IsSafeSilentPrepareStep(step))
+        {
+            var silentSteps = new List<CachedWorkflowStep> { step };
+            var silentRule = new AutoStateRuleRecord(
+                TriggerKey: triggerKey,
+                StateName: $"silent_prepare_{step.Skill.ToLowerInvariant()}",
+                StepsJson: JsonSerializer.Serialize(silentSteps),
+                PredictorCounter: 2,
+                HitCount: 0,
+                MissCount: 0,
+                Status: "Hot",
+                LastSeenAt: _utcNow(),
+                CooldownUntil: null,
+                ProposalText: null);
+
+            await _store.UpsertAutoStateRuleAsync(silentRule, ct);
+            _hitCooldowns[triggerKey] = _utcNow();
+            var ok = await ExecuteSafeStepsAsync(conversationId, triggerKey, silentRule.StateName, silentSteps, ct);
+            await RecordOutcomeAsync(triggerKey, hit: ok, estimatedTokensSaved: 0, ct);
             return;
         }
 
@@ -374,12 +755,23 @@ public sealed class StateMachineAgent : IDisposable
             HitCount: 0,
             MissCount: 0,
             Status: "Cold",
-            LastSeenAt: DateTimeOffset.UtcNow,
-            CooldownUntil: DateTimeOffset.UtcNow.AddMinutes(30),
+            LastSeenAt: _utcNow(),
+            CooldownUntil: _utcNow().AddMinutes(30),
             ProposalText: proposalText);
 
         await _store.UpsertAutoStateRuleAsync(rule, ct);
         RaiseProposal(triggerKey, target.Title, proposalText, new[] { ChoiceAccept, ChoiceSnooze, ChoiceMute });
+    }
+
+    private static bool IsSafeSilentPrepareStep(CachedWorkflowStep step)
+    {
+        if (!string.Equals(step.Skill, "manage_mail", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (step.Args.ValueKind != JsonValueKind.Object)
+            return false;
+        if (!step.Args.TryGetProperty("action", out var act))
+            return false;
+        return string.Equals(act.GetString()?.Trim(), "sync", StringComparison.OrdinalIgnoreCase);
     }
 
     private void RaiseProposal(string triggerKey, string? title, string message, IReadOnlyList<string> choices)
@@ -407,7 +799,7 @@ public sealed class StateMachineAgent : IDisposable
             HitCount = existing.HitCount + 1,
             Status = "Hot",
             CooldownUntil = null,
-            LastSeenAt = DateTimeOffset.UtcNow
+            LastSeenAt = _utcNow()
         }, ct);
         await _store.RecordBranchOutcomeAsync(hit: true, estimatedTokensSaved: 350, ct);
 
@@ -454,9 +846,6 @@ public sealed class StateMachineAgent : IDisposable
         return $"好，幫你處理完了，以後到這頁我也會主動留意：\n{snippet}";
     }
 
-    /// <summary>
-    /// User answered "這次不用": snooze temporarily without killing the rule.
-    /// </summary>
     public async Task SnoozeProposalAsync(string triggerKey, TimeSpan? duration = null, CancellationToken ct = default)
     {
         var existing = await _store.GetAutoStateRuleAsync(triggerKey, ct);
@@ -468,14 +857,11 @@ public sealed class StateMachineAgent : IDisposable
         {
             PredictorCounter = nextCnt,
             Status = "Cold",
-            CooldownUntil = DateTimeOffset.UtcNow.Add(snooze),
-            LastSeenAt = DateTimeOffset.UtcNow
+            CooldownUntil = _utcNow().Add(snooze),
+            LastSeenAt = _utcNow()
         }, ct);
     }
 
-    /// <summary>
-    /// User answered "以後別問": mute proactive prompts, but allow auto-revive if user manually uses the skill later.
-    /// </summary>
     public async Task MuteProposalAsync(string triggerKey, CancellationToken ct = default)
     {
         var existing = await _store.GetAutoStateRuleAsync(triggerKey, ct);
@@ -487,16 +873,11 @@ public sealed class StateMachineAgent : IDisposable
             MissCount = existing.MissCount + 1,
             Status = "Muted",
             CooldownUntil = null,
-            LastSeenAt = DateTimeOffset.UtcNow
+            LastSeenAt = _utcNow()
         }, ct);
         await _store.RecordBranchOutcomeAsync(hit: false, estimatedTokensSaved: 0, ct);
     }
 
-    /// <summary>
-    /// Passively observes a user-initiated single-skill execution on the recently focused external window/page.
-    /// Zero LLM calls: revives Muted/Disabled/Ignored rules if the user changed their mind, and promotes repeated
-    /// observations to Hot.
-    /// </summary>
     public async Task ObserveUserSkillExecutionAsync(
         ExternalWindowTarget? fallbackTarget,
         string skillName,
@@ -514,7 +895,7 @@ public sealed class StateMachineAgent : IDisposable
         lock (_latestLock)
         {
             triggerKey = !string.IsNullOrWhiteSpace(_lastFocusedTriggerKey) &&
-                         (DateTimeOffset.UtcNow - _lastFocusedAtUtc) <= TimeSpan.FromMinutes(5)
+                         (_utcNow() - _lastFocusedAtUtc) <= TimeSpan.FromMinutes(5)
                 ? _lastFocusedTriggerKey
                 : null;
         }
@@ -536,7 +917,6 @@ public sealed class StateMachineAgent : IDisposable
         {
             if (existing.Status is "Muted" or "Disabled" or "Ignored")
             {
-                // Auto-revive: user explicitly invoked the skill again on this page/window!
                 nextCounter = 1;
                 misses = 0;
             }
@@ -556,7 +936,7 @@ public sealed class StateMachineAgent : IDisposable
             HitCount: hits,
             MissCount: misses,
             Status: nextStatus,
-            LastSeenAt: DateTimeOffset.UtcNow,
+            LastSeenAt: _utcNow(),
             CooldownUntil: null,
             ProposalText: existing?.ProposalText);
 
@@ -577,7 +957,7 @@ public sealed class StateMachineAgent : IDisposable
             : Math.Max(1, existing.PredictorCounter - 1);
 
         var nextStatus = nextCnt >= 2 ? "Hot" : "Cold";
-        DateTimeOffset? cooldown = hit ? null : DateTimeOffset.UtcNow.AddHours(1);
+        DateTimeOffset? cooldown = hit ? null : _utcNow().AddHours(1);
 
         await _store.UpsertAutoStateRuleAsync(existing with
         {
@@ -586,7 +966,7 @@ public sealed class StateMachineAgent : IDisposable
             MissCount = hit ? existing.MissCount : existing.MissCount + 1,
             Status = nextStatus,
             CooldownUntil = cooldown,
-            LastSeenAt = DateTimeOffset.UtcNow
+            LastSeenAt = _utcNow()
         }, ct);
 
         await _store.RecordBranchOutcomeAsync(hit, hit ? estimatedTokensSaved : 0, ct);
@@ -680,50 +1060,99 @@ public sealed class StateMachineAgent : IDisposable
         return safe;
     }
 
-    private static (bool ShouldPropose, string? Proposal, CachedWorkflowStep? Step) ParseFirstVisitDecision(string? raw)
+    internal static (string Mode, string? Proposal, CachedWorkflowStep? Step) ParseFirstVisitDecision(string? raw)
     {
-        if (string.IsNullOrWhiteSpace(raw)) return (false, null, null);
+        if (string.IsNullOrWhiteSpace(raw)) return ("ignore", null, null);
         try
         {
-            var cleaned = raw.Trim();
-            if (cleaned.StartsWith("```", StringComparison.Ordinal))
-            {
-                var nl = cleaned.IndexOf('\n');
-                if (nl >= 0) cleaned = cleaned[(nl + 1)..];
-                var end = cleaned.LastIndexOf("```", StringComparison.Ordinal);
-                if (end >= 0) cleaned = cleaned[..end];
-                cleaned = cleaned.Trim();
-            }
-            var sIdx = cleaned.IndexOf('{');
-            var eIdx = cleaned.LastIndexOf('}');
-            if (sIdx >= 0 && eIdx > sIdx)
-                cleaned = cleaned[sIdx..(eIdx + 1)];
-
+            var cleaned = ExtractJsonObject(raw);
             using var doc = JsonDocument.Parse(cleaned);
             var root = doc.RootElement;
-            bool should = root.TryGetProperty("should_propose", out var sp) && sp.ValueKind == JsonValueKind.True;
-            if (!should) return (false, null, null);
+
+            string mode = "ignore";
+            if (root.TryGetProperty("mode", out var md) && md.ValueKind == JsonValueKind.String)
+            {
+                mode = (md.GetString() ?? "ignore").Trim().ToLowerInvariant();
+            }
+            else if (root.TryGetProperty("should_propose", out var sp) && sp.ValueKind == JsonValueKind.True)
+            {
+                mode = "propose";
+            }
+
+            if (mode is not ("silent_prepare" or "propose"))
+                return ("ignore", null, null);
 
             var skill = root.TryGetProperty("skill", out var sk) ? sk.GetString()?.Trim() : null;
-            if (string.IsNullOrWhiteSpace(skill)) return (false, null, null);
+            if (string.IsNullOrWhiteSpace(skill)) return ("ignore", null, null);
 
             var proposal = root.TryGetProperty("proposal", out var pr) ? pr.GetString()?.Trim() : null;
             var args = root.TryGetProperty("args", out var ag) && ag.ValueKind == JsonValueKind.Object
                 ? ag.Clone()
                 : JsonDocument.Parse("{}").RootElement.Clone();
 
-            return (true, proposal, new CachedWorkflowStep(skill, args));
+            return (mode, proposal, new CachedWorkflowStep(skill, args));
         }
         catch
         {
-            return (false, null, null);
+            return ("ignore", null, null);
         }
+    }
+
+    internal static (List<string> MatchedEventIds, double Confidence, string Reason) ParseEventMatchDecision(string? raw)
+    {
+        var ids = new List<string>();
+        if (string.IsNullOrWhiteSpace(raw)) return (ids, 0.0, "");
+        try
+        {
+            var cleaned = ExtractJsonObject(raw);
+            using var doc = JsonDocument.Parse(cleaned);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("matched_event_ids", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var el in arr.EnumerateArray())
+                {
+                    var s = el.GetString()?.Trim();
+                    if (!string.IsNullOrWhiteSpace(s))
+                        ids.Add(s);
+                }
+            }
+
+            double conf = 0.0;
+            if (root.TryGetProperty("confidence", out var cf) && cf.TryGetDouble(out var d))
+                conf = Math.Clamp(d, 0.0, 1.0);
+
+            var reason = root.TryGetProperty("reason", out var rs) ? (rs.GetString() ?? "").Trim() : "";
+            return (ids, conf, reason);
+        }
+        catch
+        {
+            return (ids, 0.0, "");
+        }
+    }
+
+    private static string ExtractJsonObject(string raw)
+    {
+        var cleaned = raw.Trim();
+        if (cleaned.StartsWith("```", StringComparison.Ordinal))
+        {
+            var nl = cleaned.IndexOf('\n');
+            if (nl >= 0) cleaned = cleaned[(nl + 1)..];
+            var end = cleaned.LastIndexOf("```", StringComparison.Ordinal);
+            if (end >= 0) cleaned = cleaned[..end];
+            cleaned = cleaned.Trim();
+        }
+        var sIdx = cleaned.IndexOf('{');
+        var eIdx = cleaned.LastIndexOf('}');
+        if (sIdx >= 0 && eIdx > sIdx)
+            cleaned = cleaned[sIdx..(eIdx + 1)];
+        return cleaned;
     }
 
     private static string DescribeSkill(string skill) => skill.ToLowerInvariant() switch
     {
         "browser_form" => "讀取表單並協助預填",
-        "manage_mail" => "同步收信確認驗證碼或郵件",
+        "manage_mail" => "同步收信確認郵件",
         "office_excel" => "讀取這份 Excel 內容",
         "office_ppt" => "讀取這份簡報內容",
         _ => skill

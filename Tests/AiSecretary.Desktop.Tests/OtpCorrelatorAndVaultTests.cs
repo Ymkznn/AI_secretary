@@ -1,7 +1,11 @@
+using System.Text.Json;
+using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
 using AiSecretary.Desktop.Services;
+using AiSecretary.Desktop.Skills;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace AiSecretary.Desktop.Tests;
@@ -19,7 +23,7 @@ public sealed class OtpCorrelatorAndVaultTests
     [InlineData("github.com", "github.com")]
     public void ExtractRegistrableDomain_HandlesTwoLevelSuffixes(string input, string expected)
     {
-        Assert.Equal(expected, OtpExtractor.ExtractRegistrableDomain(input));
+        Assert.Equal(expected, DomainParser.ExtractRegistrableDomain(input));
     }
 
     [Fact]
@@ -32,6 +36,7 @@ public sealed class OtpCorrelatorAndVaultTests
         Assert.True(SecretVaultService.IsOtpHandle(handle));
         Assert.StartsWith("otp#", handle);
         Assert.Equal(10, handle.Length); // "otp#" + 6 hex chars
+        Assert.Equal(handle, vault.TryGetActiveHandleForMail("m1"));
 
         // Redaction replaces plaintext with handle
         var redacted = vault.RedactKnownSecrets("tenso 登入驗證碼 135883，有效期限 10 分鐘");
@@ -42,6 +47,7 @@ public sealed class OtpCorrelatorAndVaultTests
         Assert.True(vault.TryConsume(handle, out var secret, out var meta));
         Assert.Equal("135883", secret);
         Assert.Equal("tenso.com", meta?.SenderDomain);
+        Assert.Null(vault.TryGetActiveHandleForMail("m1"));
 
         // Second consume MUST fail (single-use!)
         Assert.False(vault.TryConsume(handle, out var second, out _));
@@ -62,152 +68,313 @@ public sealed class OtpCorrelatorAndVaultTests
         Assert.False(vault.TryConsume(h2, out _, out _));
     }
 
-    [Fact]
-    public void OtpExtractor_ExtractsValidCodes_AndIgnoresYearsOrNoContext()
+    [Theory]
+    [InlineData("304891", "tenso.com", "support@tenso.com")]
+    [InlineData("9K4MX", "Steam", "noreply@steampowered.com")]
+    [InlineData("G-482910", "Google", "no-reply@accounts.google.com")]
+    [InlineData("482 910", "Service", "auth@example.co.jp")]
+    public void VaultAndRedactTriage_SupportsAnyCodeFormat_WithoutHardcodedRegex(
+        string rawCode, string senderName, string senderEmail)
     {
-        var otpMail = new MailItem(
-            "m1", "tenso 登入確認", "tenso", "noreply@mail.tenso.com",
-            DateTimeOffset.UtcNow, MailImportance.High, "驗證碼為 135883", "您的登入驗證碼：135883，10分鐘內有效", false, "t1");
-        Assert.True(OtpExtractor.TryExtractFromMail(otpMail, out var code));
-        Assert.Equal("135883", code);
+        var vault = new SecretVaultService();
+        var mail = new MailItem(
+            Id: $"m-{rawCode}",
+            Subject: $"[{senderName}] Security verification",
+            SenderName: senderName,
+            SenderEmail: senderEmail,
+            ReceivedAt: DateTimeOffset.UtcNow,
+            Importance: MailImportance.High,
+            Snippet: $"Your code is {rawCode}",
+            Body: $"Hello, enter {rawCode} to continue.",
+            IsRead: false,
+            ThreadId: "th-1");
 
-        var nonOtpMail = new MailItem(
-            "m2", "2026 年度報告", "HR", "hr@company.com",
-            DateTimeOffset.UtcNow, MailImportance.Normal, "預算 $123456", "2026 年報告已上傳，總金額 $123456。", false, "t2");
-        Assert.False(OtpExtractor.TryExtractFromMail(nonOtpMail, out _));
+        // MailTriage LLM extracts the verification code directly regardless of format/language
+        var triage = new TriageResult(
+            Urgent: true,
+            Title: $"{senderName} 驗證碼 {rawCode}",
+            Summary: $"{senderName} 寄來驗證碼 {rawCode}，請儘速使用。",
+            ReRemindMinutes: 10,
+            Actions: new List<NotificationButtonOption>
+            {
+                new("fill_otp", "填入驗證碼", rawCode, IsPrimary: true),
+                new("copy_otp", "複製驗證碼", rawCode, IsPrimary: false),
+                new("view_mail", "查看郵件", null, IsPrimary: false)
+            });
+
+        var (safeTitle, safeSummary, safeActions, primaryHandle) = MailSyncService.VaultAndRedactTriage(vault, mail, triage);
+
+        Assert.NotNull(primaryHandle);
+        Assert.True(SecretVaultService.IsOtpHandle(primaryHandle));
+        Assert.NotNull(safeActions);
+
+        var fillBtn = Assert.Single(safeActions!, a => a.Type == "fill_otp");
+        var copyBtn = Assert.Single(safeActions!, a => a.Type == "copy_otp");
+        Assert.Equal(primaryHandle, fillBtn.Prompt);
+        Assert.Equal(primaryHandle, copyBtn.Prompt);
+
+        // Vault resolves back to the exact raw code (numeric, alphanumeric, prefixed, or spaced)
+        Assert.True(vault.TryResolve(primaryHandle, out var resolved, out var meta));
+        Assert.Equal(rawCode, resolved);
+        Assert.Equal(DomainParser.ExtractRegistrableDomain(senderEmail), meta?.SenderDomain);
+
+        // Neither plaintext code nor internal otp#xxxxxx handle leaks into human-facing Title/Summary
+        Assert.DoesNotContain(rawCode, safeTitle);
+        Assert.DoesNotContain(rawCode, safeSummary);
+        Assert.DoesNotContain("otp#", safeTitle, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("otp#", safeSummary, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void OtpSituationDetector_PageFirst_ThenMail_ReachesL2Confidence()
+    public async Task StateMachine_PageFirst_ThenEvent_ExactDomainMatchesWithZeroLlmCalls()
     {
-        var clock = new DateTimeOffset(2026, 11, 21, 10, 0, 0, TimeSpan.Zero);
-        var vault = new SecretVaultService(() => clock);
-        var detector = new OtpSituationDetector(vault, () => clock);
+        var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
+        using var harness = CreateStateMachineHarness(() => clock);
+        ContextEventMatchDecision? captured = null;
+        harness.Agent.ContextEventMatchHandler = (d, _) => { captured = d; return Task.FromResult(true); };
 
-        // Step 1: User opens OTP page first
-        var first = detector.OnPageSignal(
-            "https://member.pchome.com.tw/login/otp",
-            "PChome 24h 登入驗證",
-            new[] { "輸入驗證碼" },
-            otpFieldPresent: true,
-            otpFieldFocused: true,
-            observedAtUtc: clock);
-        Assert.Null(first);
+        // Step 1: User opens verification page on pchome.com.tw (with 1 visible editable input)
+        await harness.Agent.HandleBrowserPageSignalAsync(
+            "conv-1",
+            new CachedBrowserPageSignal(
+                Url: "https://member.pchome.com.tw/login/otp",
+                Title: "PChome 24h 登入驗證",
+                InputCount: 1,
+                Labels: new[] { "輸入驗證碼" },
+                Headings: new[] { "登入驗證" },
+                Excerpt: "請輸入驗證碼",
+                CapturedAt: clock,
+                HasOneTimeCodeInput: true,
+                HasFocusedInput: true));
+        Assert.Null(captured);
 
-        // Step 2: 25 seconds later, OTP mail arrives from auth.pchome.com.tw
+        // Step 2: 25 seconds later, MailTriage vaults code and emits generic ContextEvent
         clock = clock.AddSeconds(25);
-        var handle = vault.StoreOtp("482910", "pchome.com.tw", "PChome", "m-pc");
-        var decision = detector.OnOtpMailEvent(new OtpMailEvent(
-            "m-pc", "auth.pchome.com.tw", "pchome.com.tw", "PChome", "登入驗證碼", clock, handle));
+        var handle = harness.Vault.StoreOtp("482910", "pchome.com.tw", "PChome", "m-pc");
+        var handled = await harness.Agent.HandleContextEventAsync(new StateMachineContextEvent(
+            EventId: "ev-m-pc",
+            ActionClass: AutonomyPolicyService.ActionFillOtp,
+            SourceId: "m-pc",
+            SourceDomain: "pchome.com.tw",
+            SourceName: "PChome",
+            Title: "PChome 登入驗證碼",
+            Summary: "PChome 寄來登入驗證碼",
+            ResourceHandle: handle,
+            OccurredAtUtc: clock));
 
-        Assert.NotNull(decision);
-        Assert.Equal(OtpDecisionKind.SingleMatch, decision!.Kind);
-        Assert.Single(decision.Candidates);
-        Assert.True(decision.Candidates[0].Confidence >= OtpSituationDetector.AutoFillL2Threshold,
-            $"Expected confidence >= 0.85, got {decision.Candidates[0].Confidence} ({decision.Candidates[0].Reason})");
-        Assert.Equal(handle, decision.Candidates[0].Mail.Handle);
+        Assert.True(handled);
+        Assert.NotNull(captured);
+        Assert.Equal(ContextEventMatchKind.SingleMatch, captured!.Kind);
+        Assert.Single(captured.Matches);
+        Assert.Equal(1.0, captured.Matches[0].Confidence);
+        Assert.Equal(handle, captured.Matches[0].Event.ResourceHandle);
+        // Exact RFC registrable domain match MUST use 0 EventMatch LLM calls!
+        Assert.DoesNotContain(harness.Gateway.RecordedCallers, c => c == "StateMachine.EventMatch");
     }
 
     [Fact]
-    public void OtpSituationDetector_MailFirst_ThenPage_MatchesCorrelatedOtp()
+    public async Task StateMachine_EventFirst_ThenPage_ExactDomainMatchesImmediately()
     {
-        var clock = new DateTimeOffset(2026, 11, 21, 10, 0, 0, TimeSpan.Zero);
-        var vault = new SecretVaultService(() => clock);
-        var detector = new OtpSituationDetector(vault, () => clock);
+        var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
+        using var harness = CreateStateMachineHarness(() => clock);
+        ContextEventMatchDecision? captured = null;
+        harness.Agent.ContextEventMatchHandler = (d, _) => { captured = d; return Task.FromResult(true); };
 
-        // Step 1: Mail arrives first
-        var handle = vault.StoreOtp("771234", "tenso.com", "tenso", "m-tenso");
-        var first = detector.OnOtpMailEvent(new OtpMailEvent(
-            "m-tenso", "mail.tenso.com", "tenso.com", "tenso", "Login verification code", clock, handle));
-        Assert.Null(first);
+        // Step 1: Event arrives before user opens page
+        var handle = harness.Vault.StoreOtp("771234", "tenso.com", "tenso", "m-tenso");
+        var handledInitially = await harness.Agent.HandleContextEventAsync(new StateMachineContextEvent(
+            "ev-tenso", AutonomyPolicyService.ActionFillOtp, "m-tenso", "tenso.com", "tenso",
+            "tenso 驗證碼", "登入驗證碼已送達", handle, clock));
+        Assert.False(handledInitially);
+        Assert.Null(captured);
 
-        // Step 2: 40 seconds later, user switches to tenso OTP page
+        // Step 2: 40 seconds later, user opens tenso page -> immediately correlated!
         clock = clock.AddSeconds(40);
-        var decision = detector.OnPageSignal(
-            "https://login.tenso.com/verify",
-            "tenso - Two-Step Verification",
-            new[] { "Enter verification code" },
-            otpFieldPresent: true,
-            otpFieldFocused: false,
-            observedAtUtc: clock);
+        await harness.Agent.HandleBrowserPageSignalAsync(
+            "conv-1",
+            new CachedBrowserPageSignal(
+                Url: "https://login.tenso.com/verify",
+                Title: "tenso - Two-Step Verification",
+                InputCount: 1,
+                Labels: new[] { "Code" },
+                Headings: new[] { "Enter verification code" },
+                Excerpt: "",
+                CapturedAt: clock));
 
-        Assert.NotNull(decision);
-        Assert.Equal(OtpDecisionKind.SingleMatch, decision!.Kind);
-        Assert.True(decision.Candidates[0].Confidence >= OtpSituationDetector.AutoFillL2Threshold);
+        Assert.NotNull(captured);
+        Assert.Equal(ContextEventMatchKind.SingleMatch, captured!.Kind);
+        Assert.Equal(1.0, captured.Matches[0].Confidence);
+        Assert.Equal(handle, captured.Matches[0].Event.ResourceHandle);
     }
 
     [Fact]
-    public void OtpSituationDetector_UnrelatedDomainAndTitle_DoesNotMatch()
+    public async Task StateMachine_CrossDomainService_UsesSemanticEventMatchLlm_WithoutLeakingSecrets()
     {
-        var clock = new DateTimeOffset(2026, 11, 21, 10, 0, 0, TimeSpan.Zero);
-        var vault = new SecretVaultService(() => clock);
-        var detector = new OtpSituationDetector(vault, () => clock);
+        var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
+        using var harness = CreateStateMachineHarness(
+            () => clock,
+            llmResponder: (caller, _) => caller == "StateMachine.EventMatch"
+                ? """{"matched_event_ids": ["ev-cross"], "confidence": 0.92, "reason": "same tenso service across .com and .jp"}"""
+                : """{"mode": "ignore"}""");
 
-        detector.OnPageSignal(
-            "https://login.bank-a.com/otp",
-            "Bank A Verification",
-            Array.Empty<string>(),
-            otpFieldPresent: true,
-            otpFieldFocused: true,
-            observedAtUtc: clock);
+        ContextEventMatchDecision? captured = null;
+        harness.Agent.ContextEventMatchHandler = (d, _) => { captured = d; return Task.FromResult(true); };
 
-        clock = clock.AddSeconds(10);
-        var handle = vault.StoreOtp("112233", "shop-b.com", "Shop B", "m-other");
-        var decision = detector.OnOtpMailEvent(new OtpMailEvent(
-            "m-other", "noreply.shop-b.com", "shop-b.com", "Shop B", "Verification", clock, handle));
-
-        Assert.Null(decision);
-    }
-
-    [Fact]
-    public void OtpSituationDetector_MultipleMatchingOtps_ReturnsMultipleMatchesNeverSingleAutoFill()
-    {
-        var clock = new DateTimeOffset(2026, 11, 21, 10, 0, 0, TimeSpan.Zero);
-        var vault = new SecretVaultService(() => clock);
-        var detector = new OtpSituationDetector(vault, () => clock);
-
-        var h1 = vault.StoreOtp("111111", "tenso.com", "tenso", "m1");
-        detector.OnOtpMailEvent(new OtpMailEvent("m1", "mail.tenso.com", "tenso.com", "tenso", "OTP 1", clock, h1));
+        // Page is on tenso.jp while email came from support@tenso.com (different registrable domain!)
+        await harness.Agent.HandleBrowserPageSignalAsync(
+            "conv-1",
+            new CachedBrowserPageSignal(
+                Url: "https://www.tenso.jp/login/confirm",
+                Title: "ログイン確認 | tenso転送サービス",
+                InputCount: 1,
+                Labels: new[] { "認証コード" },
+                Headings: new[] { "ログイン確認" },
+                Excerpt: "",
+                CapturedAt: clock));
 
         clock = clock.AddSeconds(15);
-        var h2 = vault.StoreOtp("222222", "tenso.com", "tenso", "m2");
-        detector.OnOtpMailEvent(new OtpMailEvent("m2", "mail.tenso.com", "tenso.com", "tenso", "OTP 2", clock, h2));
+        var handle = harness.Vault.StoreOtp("558899", "tenso.com", "tenso.com", "m-cross");
+        var handled = await harness.Agent.HandleContextEventAsync(new StateMachineContextEvent(
+            "ev-cross", AutonomyPolicyService.ActionFillOtp, "m-cross", "tenso.com", "tenso.com",
+            "tenso 登入驗證碼", "tenso 寄來登入驗證碼", handle, clock));
 
-        clock = clock.AddSeconds(5);
-        var decision = detector.OnPageSignal(
-            "https://login.tenso.com/verify",
-            "tenso Verify",
-            Array.Empty<string>(),
-            otpFieldPresent: true,
-            otpFieldFocused: true,
-            observedAtUtc: clock);
+        Assert.True(handled);
+        Assert.NotNull(captured);
+        Assert.Equal(ContextEventMatchKind.SingleMatch, captured!.Kind);
+        Assert.Equal(0.92, captured.Matches[0].Confidence, 2);
+        Assert.Contains("StateMachine.EventMatch", harness.Gateway.RecordedCallers);
 
-        Assert.NotNull(decision);
-        Assert.Equal(OtpDecisionKind.MultipleMatches, decision!.Kind);
-        Assert.Equal(2, decision.Candidates.Count);
+        // CRITICAL SECURITY CHECK: EventMatch LLM prompt MUST contain NEITHER plaintext OTP NOR vault handle!
+        var matchPrompt = Assert.Single(harness.Gateway.RecordedPrompts, p => p.Caller == "StateMachine.EventMatch").UserText;
+        Assert.DoesNotContain("558899", matchPrompt);
+        Assert.DoesNotContain(handle, matchPrompt);
     }
 
     [Fact]
-    public void OtpSituationDetector_OutsideThreeMinuteWindow_DoesNotMatch()
+    public async Task StateMachine_UnrelatedOrZeroInputPage_DoesNotMatch()
     {
-        var clock = new DateTimeOffset(2026, 11, 21, 10, 0, 0, TimeSpan.Zero);
-        var vault = new SecretVaultService(() => clock);
-        var detector = new OtpSituationDetector(vault, () => clock);
+        var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
+        using var harness = CreateStateMachineHarness(
+            () => clock,
+            llmResponder: (caller, _) => caller == "StateMachine.EventMatch"
+                ? """{"matched_event_ids": [], "confidence": 0.0, "reason": "different services"}"""
+                : """{"mode": "ignore"}""");
 
-        var h1 = vault.StoreOtp("654321", "tenso.com", "tenso", "m-old");
-        detector.OnOtpMailEvent(new OtpMailEvent("m-old", "mail.tenso.com", "tenso.com", "tenso", "OTP", clock, h1));
+        // 1) Zero-input browsing page -> skips EventMatch LLM completely (0 calls)
+        await harness.Agent.HandleBrowserPageSignalAsync(
+            "conv-1",
+            new CachedBrowserPageSignal("https://www.youtube.com/watch?v=123", "YouTube", 0, Array.Empty<string>(), Array.Empty<string>(), "", clock));
 
-        // 4 minutes later -> outside ±3 min window
+        var h0 = harness.Vault.StoreOtp("112233", "tenso.com", "tenso", "m-yt");
+        var handledYt = await harness.Agent.HandleContextEventAsync(new StateMachineContextEvent(
+            "ev-yt", AutonomyPolicyService.ActionFillOtp, "m-yt", "tenso.com", "tenso", "tenso", "驗證碼", h0, clock));
+        Assert.False(handledYt);
+        Assert.DoesNotContain("StateMachine.EventMatch", harness.Gateway.RecordedCallers);
+
+        // 2) Unrelated page with input -> LLM rejects -> no match
+        clock = clock.AddSeconds(5);
+        await harness.Agent.HandleBrowserPageSignalAsync(
+            "conv-1",
+            new CachedBrowserPageSignal("https://login.bank-a.com/otp", "Bank A Verification", 1, new[] { "Code" }, Array.Empty<string>(), "", clock));
+
+        var h1 = harness.Vault.StoreOtp("445566", "shop-b.com", "Shop B", "m-other");
+        var handledOther = await harness.Agent.HandleContextEventAsync(new StateMachineContextEvent(
+            "ev-other", AutonomyPolicyService.ActionFillOtp, "m-other", "shop-b.com", "Shop B", "Shop B", "Verification", h1, clock));
+        Assert.False(handledOther);
+    }
+
+    [Fact]
+    public async Task StateMachine_MultipleMatchingEvents_ReturnsMultipleMatchesNeverSingleAutoFill()
+    {
+        var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
+        using var harness = CreateStateMachineHarness(() => clock);
+        ContextEventMatchDecision? captured = null;
+        harness.Agent.ContextEventMatchHandler = (d, _) => { captured = d; return Task.FromResult(true); };
+
+        var h1 = harness.Vault.StoreOtp("111111", "tenso.com", "tenso", "m1");
+        await harness.Agent.HandleContextEventAsync(new StateMachineContextEvent(
+            "ev-1", AutonomyPolicyService.ActionFillOtp, "m1", "tenso.com", "tenso", "OTP 1", "驗證碼", h1, clock));
+
+        clock = clock.AddSeconds(15);
+        var h2 = harness.Vault.StoreOtp("222222", "tenso.com", "tenso", "m2");
+        await harness.Agent.HandleContextEventAsync(new StateMachineContextEvent(
+            "ev-2", AutonomyPolicyService.ActionFillOtp, "m2", "tenso.com", "tenso", "OTP 2", "驗證碼", h2, clock));
+
+        clock = clock.AddSeconds(5);
+        await harness.Agent.HandleBrowserPageSignalAsync(
+            "conv-1",
+            new CachedBrowserPageSignal("https://login.tenso.com/verify", "tenso Verify", 1, new[] { "Code" }, Array.Empty<string>(), "", clock));
+
+        Assert.NotNull(captured);
+        Assert.Equal(ContextEventMatchKind.MultipleMatches, captured!.Kind);
+        Assert.Equal(2, captured.Matches.Count);
+    }
+
+    [Fact]
+    public async Task StateMachine_OutsideThreeMinuteWindow_DoesNotMatch()
+    {
+        var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
+        using var harness = CreateStateMachineHarness(() => clock);
+        ContextEventMatchDecision? captured = null;
+        harness.Agent.ContextEventMatchHandler = (d, _) => { captured = d; return Task.FromResult(true); };
+
+        var h1 = harness.Vault.StoreOtp("654321", "tenso.com", "tenso", "m-old");
+        await harness.Agent.HandleContextEventAsync(new StateMachineContextEvent(
+            "ev-old", AutonomyPolicyService.ActionFillOtp, "m-old", "tenso.com", "tenso", "OTP", "驗證碼", h1, clock));
+
         clock = clock.AddMinutes(4);
-        var decision = detector.OnPageSignal(
-            "https://login.tenso.com/verify",
-            "tenso Verify",
-            Array.Empty<string>(),
-            otpFieldPresent: true,
-            otpFieldFocused: true,
-            observedAtUtc: clock);
+        await harness.Agent.HandleBrowserPageSignalAsync(
+            "conv-1",
+            new CachedBrowserPageSignal("https://login.tenso.com/verify", "tenso Verify", 1, new[] { "Code" }, Array.Empty<string>(), "", clock));
 
-        Assert.Null(decision);
+        Assert.Null(captured);
+    }
+
+    [Fact]
+    public async Task StateMachine_FirstVisitProbe_SilentPrepare_SavesHotRuleAndExecutesSilentlyWithZeroPopup()
+    {
+        var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
+        using var harness = CreateStateMachineHarness(
+            () => clock,
+            llmResponder: (caller, _) => caller == "StateMachine.FirstProbe"
+                ? """{"mode":"silent_prepare","proposal":"","skill":"manage_mail","args":{"action":"sync","source":"all","boost_seconds":90}}"""
+                : """{"mode":"ignore"}""");
+
+        int proposalCount = 0;
+        harness.Agent.ProposalRequested += _ => proposalCount++;
+
+        var url = "https://www.tenso.com/cht/login/confirm";
+        var key = StateMachineAgent.BuildTriggerKey(url, "msedge", "登入確認 | tenso");
+        var sig = new CachedBrowserPageSignal(url, "登入確認 | tenso", 1, new[] { "驗證碼" }, new[] { "登入確認" }, "請輸入驗證碼", clock);
+        var target = new ExternalWindowTarget(IntPtr.Zero, 1, "msedge", sig.Title, clock);
+
+        await harness.Agent.TryFirstVisitProbeAsync("conv-1", key, target, url, sig, CancellationToken.None, skipDwellForTest: true);
+
+        // Zero popup card raised, manage_mail sync ran silently, and rule is saved as Hot for 0-LLM replay next time!
+        Assert.Equal(0, proposalCount);
+        Assert.Equal(1, harness.FakeMailSkill.Executions);
+        var saved = await harness.Store.GetAutoStateRuleAsync(key);
+        Assert.NotNull(saved);
+        Assert.Equal("Hot", saved!.Status);
+        Assert.True(saved.PredictorCounter >= 2);
+        Assert.Equal("silent_prepare_manage_mail", saved.StateName);
+    }
+
+    [Fact]
+    public async Task StateMachine_MigrateLegacyRules_DeletesStaleBrowserWinAndColdMailSyncRules()
+    {
+        var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
+        using var harness = CreateStateMachineHarness(() => clock);
+
+        await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord("win:msedge|登入確認", "first_visit_manage_mail", "[]", 1, 0, 0, "Cold", clock));
+        await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord("url:www.tenso.com/*/login/confirm", "first_visit_manage_mail", "[]", 1, 0, 0, "Cold", clock));
+        await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord("url:forms.company.com/apply", "first_visit_browser_form", "[]", 2, 3, 0, "Hot", clock));
+
+        await harness.Agent.MigrateLegacyRulesAsync();
+
+        Assert.Null(await harness.Store.GetAutoStateRuleAsync("win:msedge|登入確認"));
+        Assert.Null(await harness.Store.GetAutoStateRuleAsync("url:www.tenso.com/*/login/confirm"));
+        Assert.NotNull(await harness.Store.GetAutoStateRuleAsync("url:forms.company.com/apply"));
     }
 
     [Fact]
@@ -258,10 +425,7 @@ public sealed class OtpCorrelatorAndVaultTests
         }
         finally
         {
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-            try { if (File.Exists(tempDb)) File.Delete(tempDb); } catch { }
-            try { if (File.Exists(tempDb + "-wal")) File.Delete(tempDb + "-wal"); } catch { }
-            try { if (File.Exists(tempDb + "-shm")) File.Delete(tempDb + "-shm"); } catch { }
+            CleanupSqlite(tempDb);
         }
     }
 
@@ -272,14 +436,16 @@ public sealed class OtpCorrelatorAndVaultTests
         var vault = new SecretVaultService(() => clock);
         var handle = vault.StoreOtp("482910", "pchome.com.tw", "PChome", "m-pc");
 
-        var page = new OtpPageSignal(
+        var page = new ActivePageContext(
             Url: "https://member.pchome.com.tw/login/otp",
             Host: "member.pchome.com.tw",
             RegistrableDomain: "pchome.com.tw",
             Title: "PChome 24h 登入驗證",
             Headings: new[] { "輸入驗證碼" },
-            OtpFieldPresent: true,
-            OtpFieldFocused: true,
+            Labels: new[] { "驗證碼" },
+            InputCount: 1,
+            HasOneTimeCodeInput: true,
+            HasFocusedInput: true,
             ObservedAtUtc: clock);
 
         var browserWindow = new ExternalWindowTarget(
@@ -289,7 +455,6 @@ public sealed class OtpCorrelatorAndVaultTests
         string? capturedExpectedDomain = null;
         bool? capturedRequireOtp = null;
 
-        // Simulate extension rejecting due to active tab domain mismatch (e.g. tab switched right before fill)
         var mismatchRes = await SecretaryController.TryExecuteL2AutoFillAsync(
             vault,
             page,
@@ -309,11 +474,9 @@ public sealed class OtpCorrelatorAndVaultTests
         Assert.Equal(SecretaryController.L2OtpFillOutcome.DowngradedToL1, mismatchRes.Outcome);
         Assert.Equal("domain_mismatch", mismatchRes.Reason);
 
-        // Handle MUST still be resolvable & usable after domain mismatch!
         Assert.True(vault.TryResolve(handle, out var stillAliveCode, out _));
         Assert.Equal("482910", stillAliveCode);
 
-        // Once user switches back to matching domain, fill succeeds and THEN consumes the handle.
         var okRes = await SecretaryController.TryExecuteL2AutoFillAsync(
             vault,
             page,
@@ -321,7 +484,7 @@ public sealed class OtpCorrelatorAndVaultTests
             browserWindow,
             (code, expectedDomain, requireOtpField, _) =>
                 Task.FromResult<BrowserOtpFillResult?>(
-                    new BrowserOtpFillResult(Filled: true, Title: page.Title, Url: page.Url, Mode: "single")),
+                    new BrowserOtpFillResult(Filled: true, Title: page.Title, Url: page.Url, Mode: "sole_input")),
             CancellationToken.None);
 
         Assert.Equal(SecretaryController.L2OtpFillOutcome.Filled, okRes.Outcome);
@@ -336,21 +499,22 @@ public sealed class OtpCorrelatorAndVaultTests
         var vault = new SecretVaultService(() => clock);
         var handle = vault.StoreOtp("135883", "tenso.com", "tenso", "m-tenso");
 
-        var page = new OtpPageSignal(
+        var page = new ActivePageContext(
             Url: "https://login.tenso.com/verify",
             Host: "login.tenso.com",
             RegistrableDomain: "tenso.com",
             Title: "tenso Verify",
             Headings: Array.Empty<string>(),
-            OtpFieldPresent: true,
-            OtpFieldFocused: true,
+            Labels: new[] { "Code" },
+            InputCount: 1,
+            HasOneTimeCodeInput: false,
+            HasFocusedInput: true,
             ObservedAtUtc: clock);
 
         var browserWindow = new ExternalWindowTarget(
             Hwnd: (nint)1002, ProcessId: 43, ProcessName: "msedge",
             Title: "tenso Verify - Microsoft Edge", CapturedAt: clock);
 
-        // 1) Extension timeout (returns null) -> handle NOT consumed
         var timeoutRes = await SecretaryController.TryExecuteL2AutoFillAsync(
             vault, page, handle, browserWindow,
             (_, _, _, _) => Task.FromResult<BrowserOtpFillResult?>(null),
@@ -359,17 +523,15 @@ public sealed class OtpCorrelatorAndVaultTests
         Assert.True(vault.TryResolve(handle, out var codeAfterTimeout, out _));
         Assert.Equal("135883", codeAfterTimeout);
 
-        // 2) Extension reports no_otp_field (same domain, navigated away from OTP page) -> handle NOT consumed
-        var noFieldRes = await SecretaryController.TryExecuteL2AutoFillAsync(
+        var ambiguousRes = await SecretaryController.TryExecuteL2AutoFillAsync(
             vault, page, handle, browserWindow,
-            (_, _, _, _) => Task.FromResult<BrowserOtpFillResult?>(new BrowserOtpFillResult(false, Error: "no_otp_field")),
+            (_, _, _, _) => Task.FromResult<BrowserOtpFillResult?>(new BrowserOtpFillResult(false, Error: "ambiguous_fields")),
             CancellationToken.None);
-        Assert.Equal(SecretaryController.L2OtpFillOutcome.DowngradedToL1, noFieldRes.Outcome);
-        Assert.Equal("no_otp_field", noFieldRes.Reason);
-        Assert.True(vault.TryResolve(handle, out var codeAfterNoField, out _));
-        Assert.Equal("135883", codeAfterNoField);
+        Assert.Equal(SecretaryController.L2OtpFillOutcome.DowngradedToL1, ambiguousRes.Outcome);
+        Assert.Equal("ambiguous_fields", ambiguousRes.Reason);
+        Assert.True(vault.TryResolve(handle, out var codeAfterFail, out _));
+        Assert.Equal("135883", codeAfterFail);
 
-        // 3) Explicitly marking consumed after a successful fill/copy invalidates the handle while preserving redaction tombstone
         Assert.True(vault.MarkConsumed(handle));
         Assert.False(vault.MarkConsumed(handle));
         Assert.False(vault.TryResolve(handle, out _, out _));
@@ -384,19 +546,20 @@ public sealed class OtpCorrelatorAndVaultTests
         var vault = new SecretVaultService(() => clock);
         var handle = vault.StoreOtp("654321", "tenso.com", "tenso", "m-tenso-2");
 
-        var page = new OtpPageSignal(
+        var page = new ActivePageContext(
             Url: "https://login.tenso.com/verify",
             Host: "login.tenso.com",
             RegistrableDomain: "tenso.com",
             Title: "tenso - Two-Step Verification",
             Headings: Array.Empty<string>(),
-            OtpFieldPresent: true,
-            OtpFieldFocused: true,
+            Labels: new[] { "Code" },
+            InputCount: 1,
+            HasOneTimeCodeInput: false,
+            HasFocusedInput: true,
             ObservedAtUtc: clock);
 
         int extensionCalls = 0;
 
-        // Case 1: User switched to LINE before OTP email arrived -> C# pre-check downgrades to L1 immediately (0 extension calls, 0 UIA calls)
         var lineWin = new ExternalWindowTarget((nint)2001, 101, "LINE", "LINE - 小明", clock);
         var lineRes = await SecretaryController.TryExecuteL2AutoFillAsync(
             vault, page, handle, lineWin,
@@ -407,7 +570,6 @@ public sealed class OtpCorrelatorAndVaultTests
         Assert.Equal(0, extensionCalls);
         Assert.True(vault.TryResolve(handle, out _, out _));
 
-        // Case 2: User switched to Notepad -> downgraded to L1, 0 extension calls
         var notepadWin = new ExternalWindowTarget((nint)2002, 102, "notepad", "未命名 - 記事本", clock);
         var notepadRes = await SecretaryController.TryExecuteL2AutoFillAsync(
             vault, page, handle, notepadWin,
@@ -416,52 +578,19 @@ public sealed class OtpCorrelatorAndVaultTests
         Assert.Equal(SecretaryController.L2OtpFillOutcome.DowngradedToL1, notepadRes.Outcome);
         Assert.Equal(0, extensionCalls);
 
-        // Case 3: User switched to chrome://settings or Incognito tab -> browser title no longer matches -> downgraded to L1
         var settingsWin = new ExternalWindowTarget((nint)2003, 103, "chrome", "Settings - Google Chrome", clock);
         var incognitoWin = new ExternalWindowTarget((nint)2004, 104, "chrome", "New Incognito Tab - Google Chrome", clock);
-        Assert.False(SecretaryController.IsExternalWindowMatchingOtpPage(settingsWin, page));
-        Assert.False(SecretaryController.IsExternalWindowMatchingOtpPage(incognitoWin, page));
+        Assert.False(SecretaryController.IsExternalWindowMatchingPage(settingsWin, page));
+        Assert.False(SecretaryController.IsExternalWindowMatchingPage(incognitoWin, page));
 
-        // Case 4: Even when L1/manual UIA target selector runs, LINE/Notepad/Discord are NEVER blindly picked!
         var onlyChatApps = new[] { lineWin, notepadWin };
         Assert.Null(ActivityMonitorService.SelectOtpUiaTarget(onlyChatApps, serviceHint: "驗證碼已就緒（tenso）", expectedDomain: "tenso.com", senderName: "tenso"));
 
-        // If a non-browser foreground app is active AND Chrome is in the background on an unrelated tab, do NOT blindly hijack the unrelated Chrome tab
         var unrelatedChrome = new ExternalWindowTarget((nint)2005, 105, "chrome", "YouTube - Google Chrome", clock.AddSeconds(-30));
         Assert.Null(ActivityMonitorService.SelectOtpUiaTarget(new[] { lineWin, unrelatedChrome }, serviceHint: "tenso", expectedDomain: "tenso.com", senderName: "tenso"));
 
-        // Matching native app or matching browser IS allowed on L1 UIA fallback
         var matchingBrowser = new ExternalWindowTarget((nint)2006, 106, "firefox", "tenso - Two-Step Verification - Mozilla Firefox", clock);
         Assert.Equal(matchingBrowser, ActivityMonitorService.SelectOtpUiaTarget(new[] { lineWin, matchingBrowser }, serviceHint: null, expectedDomain: "tenso.com", senderName: "tenso"));
-    }
-
-    [Fact]
-    public void MailRedactionBeforeTriage_ReplacesVaultedOtpWithHandleInSubjectSnippetAndBody()
-    {
-        var clock = new DateTimeOffset(2026, 11, 21, 10, 0, 0, TimeSpan.Zero);
-        var vault = new SecretVaultService(() => clock);
-        var rawMail = new MailItem(
-            Id: "m-redact",
-            Subject: "您的登入驗證碼 839201",
-            SenderName: "tenso",
-            SenderEmail: "noreply@mail.tenso.com",
-            ReceivedAt: clock,
-            Importance: MailImportance.High,
-            Snippet: "驗證碼為 839201，請於 10 分鐘內輸入",
-            Body: "您好，您的登入驗證碼是 839201。",
-            IsRead: false,
-            ThreadId: "t-1");
-
-        Assert.True(OtpExtractor.TryExtractFromMail(rawMail, out var extracted));
-        var handle = vault.StoreOtp(extracted, "tenso.com", rawMail.SenderName, rawMail.Id);
-
-        var safeMail = MailSyncService.RedactMailForTriage(vault, rawMail);
-        Assert.DoesNotContain("839201", safeMail.Subject);
-        Assert.DoesNotContain("839201", safeMail.Snippet);
-        Assert.DoesNotContain("839201", safeMail.Body);
-        Assert.Contains(handle, safeMail.Subject);
-        Assert.Contains(handle, safeMail.Snippet);
-        Assert.Contains(handle, safeMail.Body);
     }
 
     [Fact]
@@ -478,26 +607,12 @@ public sealed class OtpCorrelatorAndVaultTests
             Assert.True(vault.TryMatchHandleOrBareSuffix(h[4..], out var m2));
             Assert.Equal(h, m2);
         }
-        // Real 6-digit numeric OTP must NOT be confused with a handle suffix
         Assert.False(vault.TryMatchHandleOrBareSuffix("777665", out _));
     }
 
-    [Theory]
-    [InlineData("sync_mail", "sync")]
-    [InlineData("get_mail_detail", "detail")]
-    [InlineData("get_gmail_detail", "detail")]
-    [InlineData("read_gmail", "list")]
-    [InlineData("manage_mail", "list")]
-    public void ManageMailSkill_InfersLegacyAliasDefaultAction(string requestedAlias, string expectedAction)
-    {
-        Assert.Equal(expectedAction, Skills.ManageMailSkill.InferDefaultAction(requestedAlias));
-    }
-
     [Fact]
-    public void DoubleVaultProtection_TriageStrippingOtpPrefixNeverReplacesRealDigitsOrLeaksHandleInSummary()
+    public void DoubleVaultProtection_StoreOtpAndVaultAndRedactTriage_NeverReplacesRealDigitsOrLeaksHandle()
     {
-        // Exact repro of tenso.com incident: real OTP = 304891 -> vaulted as otp#xxxxxx ->
-        // misbehaving MailTriage strips "otp#" and outputs bare 6-hex suffix as Prompt & raw handle in Summary.
         var vault = new SecretVaultService();
         var rawMail = new MailItem(
             Id: "gmail:tenso-repro",
@@ -511,21 +626,17 @@ public sealed class OtpCorrelatorAndVaultTests
             IsRead: false,
             ThreadId: "th-tenso");
 
-        Assert.True(OtpExtractor.TryExtractFromMail(rawMail, out var extracted));
-        Assert.Equal("304891", extracted);
-        var realHandle = vault.StoreOtp(extracted, "tenso.com", rawMail.SenderName, rawMail.Id);
-        var bareSuffix = realHandle[4..]; // e.g. "4a550d"
+        var realHandle = vault.StoreOtp("304891", "tenso.com", rawMail.SenderName, rawMail.Id);
+        var bareSuffix = realHandle[4..];
 
-        // 1) StoreOtp MUST NOT double-vault bare suffix or handle as a new secret!
+        // StoreOtp MUST NOT double-vault bare suffix or handle as a new secret!
         Assert.Equal(realHandle, vault.StoreOtp(bareSuffix, "tenso.com", rawMail.SenderName, rawMail.Id));
         Assert.Equal(realHandle, vault.StoreOtp(realHandle, "tenso.com", rawMail.SenderName, rawMail.Id));
 
-        // 2) VaultAndRedactTriage MUST bind fill_otp/copy_otp to realHandle and resolve back to "304891"
-        var safeMail = MailSyncService.RedactMailForTriage(vault, rawMail);
-        var badTriage = new Agent.TriageResult(
+        var badTriage = new TriageResult(
             Urgent: true,
             Title: "tenso 登入驗證碼",
-            Summary: $"tenso 寄來登入驗證碼 {realHandle}，有效期限 10 分鐘，目前仍可使用。",
+            Summary: $"tenso 寄來登入驗證碼 {realHandle}，有效期限 10 分鐘。",
             ReRemindMinutes: 10,
             Actions: new List<NotificationButtonOption>
             {
@@ -534,16 +645,15 @@ public sealed class OtpCorrelatorAndVaultTests
                 new("view_mail", "查看郵件", null, IsPrimary: false)
             });
 
-        var (_, safeSummary, safeActions) = MailSyncService.VaultAndRedactTriage(vault, null, safeMail, badTriage, realHandle);
+        var (_, safeSummary, safeActions, primaryHandle) = MailSyncService.VaultAndRedactTriage(vault, rawMail, badTriage);
 
-        Assert.NotNull(safeActions);
+        Assert.Equal(realHandle, primaryHandle);
         var fillBtn = Assert.Single(safeActions!, a => a.Type == "fill_otp");
         Assert.Equal(realHandle, fillBtn.Prompt);
         Assert.True(vault.TryResolve(fillBtn.Prompt, out var resolvedDigits, out _));
         Assert.Equal("304891", resolvedDigits);
         Assert.NotEqual(bareSuffix, resolvedDigits);
 
-        // 3) Human-facing summary contains NEITHER plaintext OTP NOR ugly internal handle / hex suffix!
         Assert.DoesNotContain("304891", safeSummary);
         Assert.DoesNotContain("otp#", safeSummary, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(bareSuffix, safeSummary, StringComparison.OrdinalIgnoreCase);
@@ -551,10 +661,10 @@ public sealed class OtpCorrelatorAndVaultTests
     }
 
     [Fact]
-    public async Task OtpPageSuppressesDuplicateStateMachineAndBrowserUiaWindowFocus()
+    public async Task BrowserPageSignal_FiresSingleUnifiedChannel_AndUniformlySuppressesBrowserUiaWindowFocus()
     {
         var now = DateTimeOffset.UtcNow;
-        var otpSignal = new CachedBrowserPageSignal(
+        var pageSignal = new CachedBrowserPageSignal(
             Url: "https://www.tenso.com/cht/login/confirm",
             Title: "登入確認 | tenso轉送服務",
             InputCount: 1,
@@ -562,28 +672,34 @@ public sealed class OtpCorrelatorAndVaultTests
             Headings: new[] { "登入確認" },
             Excerpt: "請輸入驗證碼",
             CapturedAt: now.AddSeconds(-2),
-            OtpFieldPresent: true,
-            OtpFieldFocused: true);
+            HasOneTimeCodeInput: false,
+            HasFocusedInput: true);
 
-        // 1) Browser UIA WindowFocused MUST be suppressed when extension already reported fresh OTP / matching browser signal
+        // 1) Browser UIA WindowFocused MUST be suppressed uniformly for ALL pages with a fresh extension signal
         Assert.True(ActivityMonitorService.ShouldSuppressBrowserUiaWindowFocus(
-            otpSignal,
+            pageSignal,
             "登入確認 | tenso轉送服務 和其他 3 個頁面 - 個人 - Microsoft Edge",
+            now));
+
+        // Same title within 15s is also suppressed
+        Assert.True(ActivityMonitorService.ShouldSuppressBrowserUiaWindowFocus(
+            pageSignal with { CapturedAt = now.AddSeconds(-10) },
+            "登入確認 | tenso轉送服務 - Microsoft Edge",
             now));
 
         // Stale signal (>15s) does NOT suppress
         Assert.False(ActivityMonitorService.ShouldSuppressBrowserUiaWindowFocus(
-            otpSignal with { CapturedAt = now.AddSeconds(-30) },
+            pageSignal with { CapturedAt = now.AddSeconds(-30) },
             "其他頁面 - Microsoft Edge",
             now));
 
-        // 2) HandleBrowserPageSignalAsync with OtpFieldPresent=true emits BrowserPageSignalReceived, NOT WindowFocused
-        var cfg = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+        // 2) HandleBrowserPageSignalAsync fires ONLY BrowserPageSignalReceived, NEVER duplicate WindowFocused
+        var cfg = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?> { ["Database:ConnectionString"] = "Data Source=:memory:" })
             .Build();
         var settings = new AppSettingsService(cfg);
-        var localizer = new UiLocalizer(settings, new Data.SqliteStore(cfg), new DummyGateway(), Microsoft.Extensions.Logging.Abstractions.NullLogger<UiLocalizer>.Instance);
-        using var monitor = new ActivityMonitorService(localizer, Microsoft.Extensions.Logging.Abstractions.NullLogger<ActivityMonitorService>.Instance);
+        var localizer = new UiLocalizer(settings, new SqliteStore(cfg), new FakeGateway(), NullLogger<UiLocalizer>.Instance);
+        using var monitor = new ActivityMonitorService(localizer, NullLogger<ActivityMonitorService>.Instance);
 
         int pageSignalCount = 0;
         int windowFocusCount = 0;
@@ -596,17 +712,138 @@ public sealed class OtpCorrelatorAndVaultTests
             InputCount: 1,
             Labels: new[] { "驗證碼" },
             Headings: new[] { "登入確認" },
-            Excerpt: "驗證碼",
-            OtpFieldPresent: true,
-            OtpFieldFocused: true));
+            Excerpt: "驗證碼"));
 
         Assert.Equal(1, pageSignalCount);
         Assert.Equal(0, windowFocusCount);
     }
 
-    private sealed class DummyGateway : Agent.IModelGateway
+    [Theory]
+    [InlineData("sync_mail", "sync")]
+    [InlineData("get_mail_detail", "detail")]
+    [InlineData("get_gmail_detail", "detail")]
+    [InlineData("read_gmail", "list")]
+    [InlineData("manage_mail", "list")]
+    public void ManageMailSkill_InfersLegacyAliasDefaultAction(string requestedAlias, string expectedAction)
     {
-        public Task<Agent.ModelResponse> CompleteAsync(IReadOnlyList<Agent.ModelMessage> messages, Agent.LlmCallOptions options, CancellationToken ct = default)
-            => Task.FromResult(new Agent.ModelResponse("", 0));
+        Assert.Equal(expectedAction, ManageMailSkill.InferDefaultAction(requestedAlias));
+    }
+
+    private static StateMachineHarness CreateStateMachineHarness(
+        Func<DateTimeOffset> utcNow,
+        Func<string, string, string>? llmResponder = null)
+    {
+        var tempDb = Path.Combine(Path.GetTempPath(), $"aisec_sm_test_{Guid.NewGuid():N}.db");
+        var cfg = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Database:ConnectionString"] = $"Data Source={tempDb}"
+            })
+            .Build();
+
+        var store = new SqliteStore(cfg);
+        var settings = new AppSettingsService(cfg);
+        var gateway = new FakeGateway(llmResponder);
+        var localizer = new UiLocalizer(settings, store, gateway, NullLogger<UiLocalizer>.Instance);
+        var fakeMailSkill = new FakeManageMailSkill();
+        var registry = new SkillRegistry(new IBasicSkill[] { fakeMailSkill }, store, localizer, NullLogger<SkillRegistry>.Instance);
+        var guard = new GuardService(cfg, new GuardAuditStore(), new InteractionGateway(), settings, localizer, NullLogger<GuardService>.Instance);
+        guard.BindSkillCatalog(registry);
+        var customSkills = new CustomSkillService(store, new SandboxService(cfg), guard, settings, localizer, new EmptyServiceProvider(), NullLogger<CustomSkillService>.Instance);
+        var worker = new WorkerAgent(customSkills, guard, registry, localizer, NullLogger<WorkerAgent>.Instance);
+        var presence = new UserPresenceService(settings, NullLogger<UserPresenceService>.Instance, utcNow, () => TimeSpan.Zero, () => false);
+        var vault = new SecretVaultService(utcNow);
+        var blackboard = new AgentBlackboard();
+        var bridge = new BrowserFormBridgeService();
+
+        var agent = new StateMachineAgent(
+            store, worker, guard, gateway, bridge, blackboard, presence, vault,
+            NullLogger<StateMachineAgent>.Instance, utcNow);
+
+        return new StateMachineHarness(tempDb, store, vault, gateway, presence, fakeMailSkill, agent);
+    }
+
+    private sealed class StateMachineHarness : IDisposable
+    {
+        public string TempDb { get; }
+        public SqliteStore Store { get; }
+        public SecretVaultService Vault { get; }
+        public FakeGateway Gateway { get; }
+        public UserPresenceService Presence { get; }
+        public FakeManageMailSkill FakeMailSkill { get; }
+        public StateMachineAgent Agent { get; }
+
+        public StateMachineHarness(
+            string tempDb,
+            SqliteStore store,
+            SecretVaultService vault,
+            FakeGateway gateway,
+            UserPresenceService presence,
+            FakeManageMailSkill fakeMailSkill,
+            StateMachineAgent agent)
+        {
+            TempDb = tempDb;
+            Store = store;
+            Vault = vault;
+            Gateway = gateway;
+            Presence = presence;
+            FakeMailSkill = fakeMailSkill;
+            Agent = agent;
+        }
+
+        public void Dispose()
+        {
+            Agent.Dispose();
+            Presence.Dispose();
+            CleanupSqlite(TempDb);
+        }
+    }
+
+    private static void CleanupSqlite(string dbPath)
+    {
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        try { if (File.Exists(dbPath)) File.Delete(dbPath); } catch { }
+        try { if (File.Exists(dbPath + "-wal")) File.Delete(dbPath + "-wal"); } catch { }
+        try { if (File.Exists(dbPath + "-shm")) File.Delete(dbPath + "-shm"); } catch { }
+    }
+
+    private sealed class FakeManageMailSkill : IBasicSkill
+    {
+        public int Executions { get; private set; }
+        public string Name => "manage_mail";
+        public string DisplayDescription => "Fake Mail Sync";
+        public string MainAgentSpec => "";
+        public string PlannerSpec => "";
+
+        public Task ExecuteAsync(SkillExecutionContext ctx)
+        {
+            Executions++;
+            ctx.Observations.Add("Synced 0 emails.");
+            ctx.CompletedSteps.Add("manage_mail:sync:all");
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FakeGateway : IModelGateway
+    {
+        private readonly Func<string, string, string>? _responder;
+        public List<string> RecordedCallers { get; } = new();
+        public List<(string Caller, string UserText)> RecordedPrompts { get; } = new();
+
+        public FakeGateway(Func<string, string, string>? responder = null) => _responder = responder;
+
+        public Task<ModelResponse> CompleteAsync(IReadOnlyList<ModelMessage> messages, LlmCallOptions options, CancellationToken ct = default)
+        {
+            var userText = messages.LastOrDefault(m => m.Role == "user")?.Content ?? "";
+            RecordedCallers.Add(options.Agent);
+            RecordedPrompts.Add((options.Agent, userText));
+            var content = _responder?.Invoke(options.Agent, userText) ?? """{"mode":"ignore"}""";
+            return Task.FromResult(new ModelResponse(content, 100));
+        }
+    }
+
+    private sealed class EmptyServiceProvider : IServiceProvider
+    {
+        public object? GetService(Type serviceType) => null;
     }
 }

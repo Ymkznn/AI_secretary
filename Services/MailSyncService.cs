@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using AiSecretary.Desktop.Agent;
 using AiSecretary.Desktop.Data;
 using AiSecretary.Desktop.Models;
@@ -9,6 +8,8 @@ namespace AiSecretary.Desktop.Services;
 /// <summary>
 /// Passive mail synchronization service (EWS + Gmail) with cursor tracking, deduplication, and AI triage.
 /// Driven solely by scheduled tasks or explicit skill calls—never runs its own background polling loop.
+/// Contains ZERO hardcoded OTP/language regexes: MailTriage LLM extracts any verification code format/language
+/// and SecretVault locks it immediately at the triage exit before notifying StateMachineAgent or UI.
 /// </summary>
 public sealed class MailSyncService
 {
@@ -20,7 +21,7 @@ public sealed class MailSyncService
     private readonly PlannerAgent _planner;
     private readonly AgentBlackboard _blackboard;
     private readonly SecretVaultService _vault;
-    private readonly OtpSituationDetector _otpDetector;
+    private readonly StateMachineAgent _stateMachine;
     private readonly ILogger<MailSyncService> _logger;
     private readonly SemaphoreSlim _triageGate = new(2, 2);
 
@@ -33,7 +34,7 @@ public sealed class MailSyncService
         PlannerAgent planner,
         AgentBlackboard blackboard,
         SecretVaultService vault,
-        OtpSituationDetector otpDetector,
+        StateMachineAgent stateMachine,
         ILogger<MailSyncService> logger)
     {
         _store = store;
@@ -44,7 +45,7 @@ public sealed class MailSyncService
         _planner = planner;
         _blackboard = blackboard;
         _vault = vault;
-        _otpDetector = otpDetector;
+        _stateMachine = stateMachine;
         _logger = logger;
     }
 
@@ -102,10 +103,12 @@ public sealed class MailSyncService
                 summary += " (" + string.Join("; ", notes) + ")";
             if (newMails.Count > 0)
             {
+                // Omit raw Snippet before background MailTriage finishes so unredacted OTPs never enter Blackboard.
+                // Triage writes its redacted summary into its own mail_triage:{id} Blackboard entry once done.
                 var lines = newMails
                     .OrderByDescending(m => m.ReceivedAt)
                     .Take(10)
-                    .Select(m => $"- id={m.Id} | from={m.SenderName} | subject=\"{m.Subject}\" | at={m.ReceivedAt.ToLocalTime():MM-dd HH:mm} | snippet={_vault.RedactKnownSecrets(m.Snippet)}");
+                    .Select(m => $"- id={m.Id} | from={m.SenderName} | subject=\"{_vault.RedactKnownSecrets(m.Subject)}\" | at={m.ReceivedAt.ToLocalTime():MM-dd HH:mm}");
                 summary += "\nNew emails:\n" + string.Join("\n", lines);
             }
 
@@ -152,44 +155,8 @@ public sealed class MailSyncService
             if (!seenInBatch.Add($"{mail.SenderEmail}|{mail.Subject}")) continue;
 
             processed.Add(mail);
-            var deterministicHandle = TryEmitDeterministicOtpEvent(mail);
-
             if (decision == MailRuleDecision.NeedsAiTriage)
-            {
-                var safeMail = RedactMailForTriage(mail);
-                var triageTaskId = $"mail_triage:{mail.Id}";
-                var triageGoal = $"Analyze new email: {safeMail.Subject}";
-                _blackboard.StartTask(triageTaskId, "mail_sync", triageGoal);
-                _ = Task.Run(async () =>
-                {
-                    bool triageDone = false;
-                    await _triageGate.WaitAsync(ct);
-                    try
-                    {
-                        var triage = await _planner.TriageMailEventAsync(safeMail, conversationId, ct);
-                        var (safeTitle, safeSummary, safeActions) = VaultAndRedactTriage(safeMail, triage, deterministicHandle);
-                        var bbSummary = triage.Urgent
-                            ? $"Urgent email [{safeTitle}]: {safeSummary}"
-                            : $"Non-urgent email from {safeMail.SenderName} ({safeMail.Subject})";
-                        _blackboard.CompleteTask(triageTaskId, "mail_sync", triageGoal, bbSummary, succeeded: true, recordInRecent: triage.Urgent);
-                        triageDone = true;
-                        if (triage.Urgent)
-                        {
-                            await onNotifyAsync(eventId, safeMail, safeTitle, safeSummary, triage.ReRemindMinutes, safeActions);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogDebug(ex, "Background EWS triage error");
-                    }
-                    finally
-                    {
-                        if (!triageDone)
-                            _blackboard.EnsureClosed(triageTaskId);
-                        _triageGate.Release();
-                    }
-                }, ct);
-            }
+                EnqueueBackgroundTriage(conversationId, eventId, mail, onNotifyAsync, "EWS", ct);
         }
 
         if (newest > (cursor ?? DateTimeOffset.MinValue))
@@ -239,44 +206,8 @@ public sealed class MailSyncService
             if (!isNew) continue;
 
             processed.Add(mail);
-            var deterministicHandle = TryEmitDeterministicOtpEvent(mail);
-
             if (decision == MailRuleDecision.NeedsAiTriage)
-            {
-                var safeMail = RedactMailForTriage(mail);
-                var triageTaskId = $"mail_triage:{mail.Id}";
-                var triageGoal = $"Analyze new email: {safeMail.Subject}";
-                _blackboard.StartTask(triageTaskId, "mail_sync", triageGoal);
-                _ = Task.Run(async () =>
-                {
-                    bool triageDone = false;
-                    await _triageGate.WaitAsync(ct);
-                    try
-                    {
-                        var triage = await _planner.TriageMailEventAsync(safeMail, conversationId, ct);
-                        var (safeTitle, safeSummary, safeActions) = VaultAndRedactTriage(safeMail, triage, deterministicHandle);
-                        var bbSummary = triage.Urgent
-                            ? $"Urgent email [{safeTitle}]: {safeSummary}"
-                            : $"Non-urgent email from {safeMail.SenderName} ({safeMail.Subject})";
-                        _blackboard.CompleteTask(triageTaskId, "mail_sync", triageGoal, bbSummary, succeeded: true, recordInRecent: triage.Urgent);
-                        triageDone = true;
-                        if (triage.Urgent)
-                        {
-                            await onNotifyAsync(eventId, safeMail, safeTitle, safeSummary, triage.ReRemindMinutes, safeActions);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogDebug(ex, "Background Gmail triage error");
-                    }
-                    finally
-                    {
-                        if (!triageDone)
-                            _blackboard.EnsureClosed(triageTaskId);
-                        _triageGate.Release();
-                    }
-                }, ct);
-            }
+                EnqueueBackgroundTriage(conversationId, eventId, mail, onNotifyAsync, "Gmail", ct);
         }
 
         if (newest > cursor.Value)
@@ -285,10 +216,73 @@ public sealed class MailSyncService
         return processed;
     }
 
-    internal MailItem RedactMailForTriage(MailItem mail)
-        => RedactMailForTriage(_vault, mail);
+    private void EnqueueBackgroundTriage(
+        string conversationId,
+        string eventId,
+        MailItem mail,
+        Func<string, MailItem, string, string, int, List<NotificationButtonOption>?, Task> onNotifyAsync,
+        string providerLabel,
+        CancellationToken ct)
+    {
+        var triageTaskId = $"mail_triage:{mail.Id}";
+        var triageGoal = $"Analyze new email from {mail.SenderName}";
+        _blackboard.StartTask(triageTaskId, "mail_sync", triageGoal);
+        _ = Task.Run(async () =>
+        {
+            bool triageDone = false;
+            await _triageGate.WaitAsync(ct);
+            try
+            {
+                var triage = await _planner.TriageMailEventAsync(mail, conversationId, ct);
+                var (safeTitle, safeSummary, safeActions, primaryOtpHandle) = VaultAndRedactTriage(_vault, mail, triage);
+                var safeMail = RedactMailMetadata(_vault, mail);
 
-    internal static MailItem RedactMailForTriage(SecretVaultService vault, MailItem mail)
+                var bbSummary = triage.Urgent
+                    ? $"Urgent email [{safeTitle}]: {safeSummary}"
+                    : $"Non-urgent email from {safeMail.SenderName} ({safeMail.Subject})";
+                _blackboard.CompleteTask(triageTaskId, "mail_sync", triageGoal, bbSummary, succeeded: true, recordInRecent: triage.Urgent);
+                triageDone = true;
+
+                // Emit generic ContextEvent into StateMachineAgent if triage produced an actionable vaulted handle.
+                // Await synchronously BEFORE pushing any notification card so there is zero race condition or duplicate popup.
+                bool handledByStateMachine = false;
+                if (!string.IsNullOrWhiteSpace(primaryOtpHandle))
+                {
+                    var senderDomain = DomainParser.ExtractSenderDomain(mail.SenderEmail);
+                    var regDomain = DomainParser.ExtractRegistrableDomain(senderDomain);
+                    var ctxEvent = new StateMachineContextEvent(
+                        EventId: eventId,
+                        ActionClass: AutonomyPolicyService.ActionFillOtp,
+                        SourceId: mail.Id,
+                        SourceDomain: regDomain,
+                        SourceName: mail.SenderName,
+                        Title: safeTitle,
+                        Summary: safeSummary,
+                        ResourceHandle: primaryOtpHandle,
+                        OccurredAtUtc: mail.ReceivedAt.ToUniversalTime());
+
+                    handledByStateMachine = await _stateMachine.HandleContextEventAsync(ctxEvent, ct);
+                }
+
+                if (triage.Urgent && !handledByStateMachine)
+                {
+                    await onNotifyAsync(eventId, safeMail, safeTitle, safeSummary, triage.ReRemindMinutes, safeActions);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Background {Provider} triage error", providerLabel);
+            }
+            finally
+            {
+                if (!triageDone)
+                    _blackboard.EnsureClosed(triageTaskId);
+                _triageGate.Release();
+            }
+        }, ct);
+    }
+
+    internal static MailItem RedactMailMetadata(SecretVaultService vault, MailItem mail)
         => mail with
         {
             Subject = vault.RedactKnownSecrets(mail.Subject),
@@ -296,42 +290,19 @@ public sealed class MailSyncService
             Body = vault.RedactKnownSecrets(mail.Body)
         };
 
-    private string? TryEmitDeterministicOtpEvent(MailItem mail)
-    {
-        if (!OtpExtractor.TryExtractFromMail(mail, out var rawCode))
-            return null;
-
-        var senderDomain = OtpExtractor.ExtractSenderDomain(mail.SenderEmail);
-        var regDomain = OtpExtractor.ExtractRegistrableDomain(senderDomain);
-        var handle = _vault.StoreOtp(rawCode, regDomain, mail.SenderName, mail.Id);
-
-        _otpDetector.OnOtpMailEvent(new OtpMailEvent(
-            MailId: mail.Id,
-            SenderDomain: senderDomain,
-            SenderRegistrableDomain: regDomain,
-            SenderName: mail.SenderName,
-            Subject: mail.Subject,
-            ReceivedAtUtc: mail.ReceivedAt.ToUniversalTime(),
-            Handle: handle));
-        return handle;
-    }
-
-    private (string Title, string Summary, List<NotificationButtonOption>? Actions) VaultAndRedactTriage(
-        MailItem mail,
-        TriageResult triage,
-        string? existingHandle)
-        => VaultAndRedactTriage(_vault, _otpDetector, mail, triage, existingHandle);
-
-    internal static (string Title, string Summary, List<NotificationButtonOption>? Actions) VaultAndRedactTriage(
+    /// <summary>
+    /// Vaults any verification code extracted by <see cref="PlannerAgent.TriageMailEventAsync"/> (in ANY language or format)
+    /// at the triage exit, binds <c>fill_otp</c>/<c>copy_otp</c> buttons to the opaque <c>otp#xxxxxx</c> handle,
+    /// and scrubs both plaintext codes and internal handles from human-facing notification Title/Summary.
+    /// </summary>
+    internal static (string Title, string Summary, List<NotificationButtonOption>? Actions, string? PrimaryOtpHandle) VaultAndRedactTriage(
         SecretVaultService vault,
-        OtpSituationDetector? otpDetector,
         MailItem mail,
-        TriageResult triage,
-        string? existingHandle)
+        TriageResult triage)
     {
-        var senderDomain = OtpExtractor.ExtractSenderDomain(mail.SenderEmail);
-        var regDomain = OtpExtractor.ExtractRegistrableDomain(senderDomain);
-        string? handle = existingHandle;
+        var senderDomain = DomainParser.ExtractSenderDomain(mail.SenderEmail);
+        var regDomain = DomainParser.ExtractRegistrableDomain(senderDomain);
+        string? primaryHandle = null;
         List<NotificationButtonOption>? safeActions = null;
 
         if (triage.Actions is { Count: > 0 })
@@ -341,35 +312,16 @@ public sealed class MailSyncService
             {
                 if (btn.Type is "fill_otp" or "copy_otp")
                 {
-                    string? btnHandle = null;
-                    // 1) If deterministic extraction already vaulted the real OTP BEFORE triage redacted the mail,
-                    //    MailTriage NEVER saw the real digits — ALWAYS bind buttons to existingHandle!
-                    if (!string.IsNullOrWhiteSpace(existingHandle))
-                    {
-                        btnHandle = existingHandle;
-                    }
-                    else if (!string.IsNullOrWhiteSpace(btn.Prompt))
-                    {
-                        btnHandle = vault.TryMatchHandleOrBareSuffix(btn.Prompt, out var matched)
-                            ? matched
-                            : vault.StoreOtp(btn.Prompt, regDomain, mail.SenderName, mail.Id);
-                    }
-
-                    if (string.IsNullOrWhiteSpace(btnHandle))
+                    if (string.IsNullOrWhiteSpace(btn.Prompt))
                         continue;
 
-                    if (handle is null)
-                    {
-                        handle = btnHandle;
-                        otpDetector?.OnOtpMailEvent(new OtpMailEvent(
-                            MailId: mail.Id,
-                            SenderDomain: senderDomain,
-                            SenderRegistrableDomain: regDomain,
-                            SenderName: mail.SenderName,
-                            Subject: mail.Subject,
-                            ReceivedAtUtc: mail.ReceivedAt.ToUniversalTime(),
-                            Handle: handle));
-                    }
+                    string btnHandle;
+                    if (vault.TryMatchHandleOrBareSuffix(btn.Prompt, out var matched))
+                        btnHandle = matched;
+                    else
+                        btnHandle = vault.StoreOtp(btn.Prompt, regDomain, mail.SenderName, mail.Id);
+
+                    primaryHandle ??= btnHandle;
                     safeActions.Add(btn with { Prompt = btnHandle });
                 }
                 else
@@ -380,10 +332,10 @@ public sealed class MailSyncService
         }
 
         // Redact any plaintext OTP first, then strip raw opaque vault handles (and any leaked bare 6-hex suffix)
-        // from human-facing notification Title/Summary so users & TTS never see "otp#4a550d" or "4a550d".
-        var safeTitle = CleanHumanFacingOtpText(vault.RedactKnownSecrets(triage.Title), handle);
-        var safeSummary = CleanHumanFacingOtpText(vault.RedactKnownSecrets(triage.Summary), handle);
-        return (safeTitle, safeSummary, safeActions);
+        // from human-facing notification Title/Summary so users & TTS never see raw codes or "otp#xxxxxx".
+        var safeTitle = CleanHumanFacingOtpText(vault.RedactKnownSecrets(triage.Title), primaryHandle);
+        var safeSummary = CleanHumanFacingOtpText(vault.RedactKnownSecrets(triage.Summary), primaryHandle);
+        return (safeTitle, safeSummary, safeActions, primaryHandle);
     }
 
     internal static string CleanHumanFacingOtpText(string? text, string? knownHandle = null)

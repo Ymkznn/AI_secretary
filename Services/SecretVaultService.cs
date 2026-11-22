@@ -165,6 +165,19 @@ public sealed class SecretVaultService
         }
     }
 
+    public string? TryGetActiveHandleForMail(string? mailId)
+    {
+        if (string.IsNullOrWhiteSpace(mailId)) return null;
+        var now = _utcNow();
+        lock (_lock)
+        {
+            PruneExpiredLocked(now);
+            return _mailIdToHandle.TryGetValue(mailId, out var handle) && _entries.ContainsKey(handle)
+                ? handle
+                : null;
+        }
+    }
+
     public bool TryPeekMetadata(string? handle, out SecretMetadata? metadata)
     {
         metadata = null;

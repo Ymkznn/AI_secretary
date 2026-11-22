@@ -77,73 +77,78 @@ async function reportPageSignal(tab, forceResend = false) {
       target: { tabId: tab.id, allFrames: true },
       func: () => {
         const isTop = window === window.top;
+        const isSearchRole = (el) => {
+          const t = (el.type || el.tagName).toLowerCase();
+          const role = (el.getAttribute('role') || '').toLowerCase().trim();
+          return t === 'search' || role === 'searchbox' || role === 'combobox';
+        };
         const allInputs = Array.from(document.querySelectorAll('input, textarea, select'))
           .filter(el => {
             const t = (el.type || el.tagName).toLowerCase();
-            return t !== 'hidden' && t !== 'submit' && t !== 'button' && !el.disabled && !el.readOnly && el.offsetParent !== null;
+            return t !== 'hidden' && t !== 'submit' && t !== 'button' && t !== 'image' && t !== 'reset'
+              && !el.disabled && !el.readOnly && el.offsetParent !== null;
           });
-        const els = allInputs.filter(el => (el.type || el.tagName).toLowerCase() !== 'password');
+        // Pure structural form inputs: exclude password fields and W3C/ARIA search boxes (zero language keywords).
+        const els = allInputs.filter(el => {
+          const t = (el.type || el.tagName).toLowerCase();
+          return t !== 'password' && !isSearchRole(el);
+        });
+        const getLabelFor = (el) => {
+          try {
+            const aria = el.getAttribute('aria-label');
+            if (aria && aria.trim()) return aria.trim().slice(0, 60);
+            const labelledBy = el.getAttribute('aria-labelledby');
+            if (labelledBy) {
+              const txt = labelledBy.split(/\s+/).map(id => document.getElementById(id)?.innerText?.trim()).filter(Boolean).join(' ');
+              if (txt) return txt.slice(0, 60);
+            }
+            if (el.id) {
+              const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+              if (lbl?.innerText) return lbl.innerText.replace(/\s+/g, ' ').trim().slice(0, 60);
+            }
+            const parentLbl = el.closest('label');
+            if (parentLbl?.innerText) return parentLbl.innerText.replace(/\s+/g, ' ').trim().slice(0, 60);
+            const tr = el.closest('tr');
+            if (tr) {
+              const ownTd = el.closest('td, th');
+              const th = tr.querySelector('th, td:first-child');
+              if (th && th !== ownTd && th.innerText) {
+                const t = th.innerText.replace(/\s+/g, ' ').trim();
+                if (t) return t.slice(0, 60);
+              }
+            }
+          } catch {}
+          return (el.placeholder || el.name || el.id || '').trim().slice(0, 60);
+        };
         const labels = els
-          .map(el => (el.getAttribute('aria-label') || el.placeholder || el.name || el.id || '').trim())
+          .map(getLabelFor)
           .filter(Boolean)
           .slice(0, 12);
 
-        // Deterministic OTP field detection (structure only — NEVER reads .value or password values).
-        const otpHintRe = /otp|code|verify|verification|one[-_ ]?time|passcode|auth[-_ ]?code|confirm[-_ ]?code|2fa|mfa|驗證碼|認證碼|確認碼|動態密碼|認証|確認コード|ワンタイム/i;
-        const getLabelFor = (el) => {
-          try {
-            if (el.id) {
-              const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-              if (lbl?.innerText) return lbl.innerText.trim();
-            }
-            const parentLbl = el.closest('label');
-            if (parentLbl?.innerText) return parentLbl.innerText.trim();
-          } catch {}
-          return '';
-        };
-        const isOtpInput = (el) => {
-          if ((el.tagName || '').toLowerCase() !== 'input') return false;
-          const ac = (el.getAttribute('autocomplete') || '').toLowerCase().trim();
-          if (ac === 'one-time-code') return true;
-          const type = (el.type || 'text').toLowerCase();
-          const maxLen = Number(el.maxLength || 0);
-          const inputMode = (el.getAttribute('inputmode') || el.inputMode || '').toLowerCase().trim();
-          const meta = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${getLabelFor(el)}`;
-          if (!otpHintRe.test(meta)) return false;
-          return (maxLen >= 4 && maxLen <= 8) || inputMode === 'numeric' || type === 'tel' || type === 'number';
-        };
-
-        const visibleTextInputs = allInputs.filter(el => (el.tagName || '').toLowerCase() === 'input');
+        // Pure W3C / DOM structural descriptors (NEVER reads .value, NEVER uses hardcoded language regexes).
+        const visibleTextInputs = els.filter(el => (el.tagName || '').toLowerCase() === 'input');
         const singleCharBoxes = visibleTextInputs.filter(el => Number(el.maxLength) === 1);
-        const multiBoxOtp = singleCharBoxes.length >= 4 && singleCharBoxes.length <= 8
-          && (singleCharBoxes.some(el => (el.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code'
-              || (el.getAttribute('inputmode') || '').toLowerCase() === 'numeric')
-              || otpHintRe.test(document.title || ''));
-        const otpInputs = visibleTextInputs.filter(isOtpInput);
-        const otpFieldPresent = otpInputs.length > 0 || multiBoxOtp;
+        const hasOneTimeCodeInput =
+          visibleTextInputs.some(el => (el.getAttribute('autocomplete') || '').toLowerCase().trim() === 'one-time-code')
+          || (singleCharBoxes.length >= 4 && singleCharBoxes.length <= 8);
 
         let activeEl = document.activeElement;
         while (activeEl && activeEl.shadowRoot && activeEl.shadowRoot.activeElement) {
           activeEl = activeEl.shadowRoot.activeElement;
         }
-        const otpFieldFocused = otpFieldPresent && Boolean(
-          activeEl && (otpInputs.includes(activeEl) || (multiBoxOtp && singleCharBoxes.includes(activeEl)))
-        );
+        const hasFocusedInput = Boolean(activeEl && els.includes(activeEl));
 
-        // Install a lightweight one-time focus listener on OTP pages so focusing an OTP box pushes a fresh signal immediately.
-        if (otpFieldPresent && !window.__aiSecOtpFocusHooked) {
-          window.__aiSecOtpFocusHooked = true;
+        // Lightweight one-time focus listener on compact input pages so focusing a box refreshes context immediately.
+        if (els.length > 0 && els.length <= 6 && !window.__aiSecInputFocusHooked) {
+          window.__aiSecInputFocusHooked = true;
           document.addEventListener('focusin', (ev) => {
             const target = ev.target;
-            if (!target || (target.tagName || '').toLowerCase() !== 'input') return;
-            const ac = (target.getAttribute('autocomplete') || '').toLowerCase().trim();
-            const tp = (target.type || 'text').toLowerCase();
-            const ml = Number(target.maxLength || 0);
-            const im = (target.getAttribute('inputmode') || '').toLowerCase().trim();
-            const meta = `${target.name || ''} ${target.id || ''} ${target.placeholder || ''} ${target.getAttribute('aria-label') || ''}`;
-            if (ac === 'one-time-code' || ml === 1 || (otpHintRe.test(meta) && ((ml >= 4 && ml <= 8) || im === 'numeric' || tp === 'tel' || tp === 'number'))) {
-              try { chrome.runtime.sendMessage({ type: 'OTP_FIELD_FOCUSED' }); } catch {}
-            }
+            if (!target) return;
+            const tag = (target.tagName || '').toLowerCase();
+            if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') return;
+            const tp = (target.type || tag).toLowerCase();
+            if (tp === 'password' || tp === 'hidden' || tp === 'submit' || tp === 'button' || isSearchRole(target)) return;
+            try { chrome.runtime.sendMessage({ type: 'INPUT_FIELD_FOCUSED' }); } catch {}
           }, true);
         }
 
@@ -183,7 +188,7 @@ async function reportPageSignal(tab, forceResend = false) {
             excerpt = chunks.join(' ').slice(0, 650);
           }
         }
-        return { isTop, inputCount: els.length, labels, headings, excerpt, otpFieldPresent, otpFieldFocused };
+        return { isTop, inputCount: els.length, labels, headings, excerpt, hasOneTimeCodeInput, hasFocusedInput };
       }
     });
 
@@ -191,13 +196,13 @@ async function reportPageSignal(tab, forceResend = false) {
     const allLabels = [];
     let topHeadings = [];
     let topExcerpt = '';
-    let otpFieldPresent = false;
-    let otpFieldFocused = false;
+    let hasOneTimeCodeInput = false;
+    let hasFocusedInput = false;
     for (const r of frameResults || []) {
       if (!r?.result) continue;
       totalInputs += r.result.inputCount || 0;
-      if (r.result.otpFieldPresent) otpFieldPresent = true;
-      if (r.result.otpFieldFocused) otpFieldFocused = true;
+      if (r.result.hasOneTimeCodeInput) hasOneTimeCodeInput = true;
+      if (r.result.hasFocusedInput) hasFocusedInput = true;
       for (const lbl of r.result.labels || []) {
         if (lbl && !allLabels.includes(lbl) && allLabels.length < 15) {
           allLabels.push(lbl);
@@ -219,8 +224,8 @@ async function reportPageSignal(tab, forceResend = false) {
         labels: allLabels,
         headings: topHeadings,
         excerpt: topExcerpt,
-        otpFieldPresent,
-        otpFieldFocused
+        hasOneTimeCodeInput,
+        hasFocusedInput
       })
     });
   } catch {}
@@ -731,7 +736,7 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   } catch {}
 });
 chrome.runtime.onMessage.addListener((msg, sender) => {
-  if (msg?.type === 'OTP_FIELD_FOCUSED' && sender?.tab && sender.tab.active) {
+  if ((msg?.type === 'INPUT_FIELD_FOCUSED' || msg?.type === 'OTP_FIELD_FOCUSED') && sender?.tab && sender.tab.active) {
     reportPageSignal(sender.tab, true);
   }
 });
