@@ -125,4 +125,63 @@ public sealed class CachePolicyAndDomCompressionTests
         Assert.DoesNotContain("<p>", stripped);
         Assert.Contains("[HTML omitted in final reply synthesis]", stripped);
     }
+
+    [Fact]
+    public void WebFetchSkill_ExtractsPdfBytesViaPdfPig_SupportsPageRange_AndRejectsNonPdfBinary()
+    {
+        var pdfBytes = BuildMinimalTwoPagePdf("PostgreSQL exploit page one", "Second page follow up");
+
+        // 1) Auto-detects PDF via %PDF- magic header even if Content-Type is octet-stream
+        var (okAll, textAll) = WebFetchSkill.ExtractTextFromPayload(pdfBytes, "application/octet-stream");
+        Assert.True(okAll);
+        Assert.Contains("PDF extracted (2 page(s)", textAll);
+        Assert.Contains("--- Page 1 ---", textAll);
+        Assert.Contains("PostgreSQL exploit page one", textAll);
+        Assert.Contains("--- Page 2 ---", textAll);
+        Assert.Contains("Second page follow up", textAll);
+
+        // 2) Respects start_page / end_page pagination
+        var (okP2, textP2) = WebFetchSkill.ExtractTextFromPayload(pdfBytes, "application/pdf", startPage: 2, endPage: 2);
+        Assert.True(okP2);
+        Assert.DoesNotContain("PostgreSQL exploit page one", textP2);
+        Assert.Contains("Second page follow up", textP2);
+
+        // 3) Rejects non-PDF binary payloads cleanly instead of emitting UTF-8 gibberish
+        var pngHeader = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D };
+        var (okBin, binMsg) = WebFetchSkill.ExtractTextFromPayload(pngHeader, "image/png");
+        Assert.False(okBin);
+        Assert.Contains("binary content", binMsg);
+    }
+
+    private static byte[] BuildMinimalTwoPagePdf(string page1Text, string page2Text)
+    {
+        var sb = new System.Text.StringBuilder();
+        var offsets = new List<int>();
+        void AddObj(int id, string body)
+        {
+            offsets.Add(sb.Length);
+            sb.Append($"{id} 0 obj\n{body}\nendobj\n");
+        }
+
+        sb.Append("%PDF-1.4\n");
+        AddObj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        AddObj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>");
+        AddObj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 7 0 R >> >> >>");
+        AddObj(4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 7 0 R >> >> >>");
+
+        var s1 = $"BT /F1 12 Tf 72 720 Td ({page1Text}) Tj ET";
+        var s2 = $"BT /F1 12 Tf 72 720 Td ({page2Text}) Tj ET";
+        AddObj(5, $"<< /Length {s1.Length} >>\nstream\n{s1}\nendstream");
+        AddObj(6, $"<< /Length {s2.Length} >>\nstream\n{s2}\nendstream");
+        AddObj(7, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+
+        int xrefOffset = sb.Length;
+        sb.Append($"xref\n0 {offsets.Count + 1}\n");
+        sb.Append("0000000000 65535 f \n");
+        foreach (var off in offsets)
+            sb.Append($"{off:D10} 00000 n \n");
+
+        sb.Append($"trailer\n<< /Size {offsets.Count + 1} /Root 1 0 R >>\nstartxref\n{xrefOffset}\n%%EOF\n");
+        return System.Text.Encoding.ASCII.GetBytes(sb.ToString());
+    }
 }
