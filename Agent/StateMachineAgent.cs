@@ -167,12 +167,15 @@ public sealed class StateMachineAgent : IDisposable
     }
 
     /// <summary>
-    /// One-time cleanup of legacy browser-UIA (<c>win:msedge|...</c>) rules and pre-v2 Cold <c>first_visit_manage_mail</c> rules
-    /// so pages with the browser extension use clean URL-scoped rules and silent background preparation.
+    /// One-time cleanup and upgrade of legacy rules:
+    /// - Removes legacy browser-UIA (<c>win:msedge|...</c>) rules.
+    /// - Removes any Cold <c>manage_mail</c> rules (e.g., bogus same-host transfers onto password login pages).
+    /// - Upgrades legacy Hot <c>manage_mail</c> rules to <c>silent_prepare_manage_mail</c> with <c>boost_seconds=90</c>.
+    /// - Prunes old un-normalized opaque-ID <c>Ignored</c> entries (e.g., per-video YouTube Shorts rows).
     /// </summary>
     public async Task MigrateLegacyRulesAsync(CancellationToken ct = default)
     {
-        var done = await _store.GetSyncValueAsync("state_machine_v2_migrated", ct);
+        var done = await _store.GetSyncValueAsync("state_machine_v3_migrated", ct);
         if (done == "1") return;
 
         var rules = await _store.GetAllAutoStateRulesAsync(ct);
@@ -180,14 +183,65 @@ public sealed class StateMachineAgent : IDisposable
         {
             bool isLegacyBrowserWinRule = BrowserProcesses.Any(b =>
                 r.TriggerKey.StartsWith($"win:{b}|", StringComparison.OrdinalIgnoreCase));
-            bool isLegacyColdMailSync = string.Equals(r.Status, "Cold", StringComparison.OrdinalIgnoreCase) &&
+
+            var steps = ParseSteps(r.StepsJson);
+            bool isMailSyncRule = steps.Any(IsSafeSilentPrepareStep) ||
                 string.Equals(r.StateName, "first_visit_manage_mail", StringComparison.OrdinalIgnoreCase);
 
-            if (isLegacyBrowserWinRule || isLegacyColdMailSync)
+            if (isLegacyBrowserWinRule)
+            {
                 await _store.DeleteAutoStateRuleAsync(r.TriggerKey, ct);
+                continue;
+            }
+
+            if (isMailSyncRule)
+            {
+                if (string.Equals(r.Status, "Hot", StringComparison.OrdinalIgnoreCase) && r.PredictorCounter >= 2)
+                {
+                    var upgradedSteps = new[] { EnsureSilentPrepareBoostArgs(steps.FirstOrDefault()) };
+                    await _store.UpsertAutoStateRuleAsync(r with
+                    {
+                        StateName = "silent_prepare_manage_mail",
+                        StepsJson = JsonSerializer.Serialize(upgradedSteps),
+                        ProposalText = null
+                    }, ct);
+                }
+                else
+                {
+                    await _store.DeleteAutoStateRuleAsync(r.TriggerKey, ct);
+                }
+                continue;
+            }
+
+            // Re-normalize legacy Ignored URL keys that contained opaque video/item IDs
+            if (string.Equals(r.Status, "Ignored", StringComparison.OrdinalIgnoreCase) &&
+                r.TriggerKey.StartsWith("url:", StringComparison.OrdinalIgnoreCase) &&
+                !r.TriggerKey.EndsWith("/*", StringComparison.Ordinal))
+            {
+                var syntheticUrl = "https://" + r.TriggerKey["url:".Length..];
+                var normalized = BuildTriggerKey(syntheticUrl, "browser", "");
+                if (!string.Equals(normalized, r.TriggerKey, StringComparison.OrdinalIgnoreCase))
+                    await _store.DeleteAutoStateRuleAsync(r.TriggerKey, ct);
+            }
         }
 
-        await _store.SetSyncValueAsync("state_machine_v2_migrated", "1", ct);
+        await _store.SetSyncValueAsync("state_machine_v3_migrated", "1", ct);
+    }
+
+    internal static bool IsOpaqueUrlSegment(string seg)
+    {
+        if (string.IsNullOrEmpty(seg)) return false;
+        if (seg.StartsWith('@')) return true;
+        if (Regex.IsMatch(seg, @"^(?:cht|chs|[a-z]{2}(?:-[a-z]{2,4})?|\d+)$", RegexOptions.IgnoreCase))
+            return true;
+        if (Regex.IsMatch(seg, @"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$", RegexOptions.IgnoreCase))
+            return true;
+        if (seg.Length >= 16 && Regex.IsMatch(seg, @"^[A-Za-z0-9_\-]+$") && seg.Any(char.IsDigit))
+            return true;
+        if (seg.Length >= 8 && Regex.IsMatch(seg, @"^[A-Za-z0-9_\-]+$") &&
+            seg.Any(char.IsDigit) && seg.Any(char.IsUpper) && seg.Any(char.IsLower))
+            return true;
+        return false;
     }
 
     public static string BuildTriggerKey(string? url, string processName, string title)
@@ -195,9 +249,7 @@ public sealed class StateMachineAgent : IDisposable
         if (!string.IsNullOrWhiteSpace(url) && Uri.TryCreate(url, UriKind.Absolute, out var uri))
         {
             var segs = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries)
-                .Select(s => Regex.IsMatch(s, @"^(?:cht|chs|[a-z]{2}(?:-[a-z]{2,4})?|\d+)$", RegexOptions.IgnoreCase)
-                    ? "*"
-                    : s)
+                .Select(s => IsOpaqueUrlSegment(s) ? "*" : s)
                 .Take(4);
             return $"url:{uri.Host.ToLowerInvariant()}/{string.Join("/", segs)}";
         }
@@ -212,6 +264,12 @@ public sealed class StateMachineAgent : IDisposable
         if (!string.IsNullOrWhiteSpace(url) && Uri.TryCreate(url, UriKind.Absolute, out var uri) && !string.IsNullOrWhiteSpace(uri.Host))
             return $"url:{uri.Host.ToLowerInvariant()}/";
         return null;
+    }
+
+    internal static string? BuildHostIgnoreKey(string? url)
+    {
+        var coarse = BuildCoarseTriggerKey(url);
+        return coarse is null ? null : coarse + "*";
     }
 
     /// <summary>
@@ -542,18 +600,35 @@ public sealed class StateMachineAgent : IDisposable
                 }
             }
 
-            // No exact rule: check same-domain coarse transfer (0 LLM tokens)
+            // Adaptive host-level cooling (zero hardcoded site blacklists): if this host already accumulated >=3 Ignored paths
+            // with zero useful rules, skip probing new subpaths until cooldown expires or user manually uses a skill on this host.
+            var hostIgnoreKey = BuildHostIgnoreKey(url);
+            if (!string.IsNullOrWhiteSpace(hostIgnoreKey))
+            {
+                var hostIgnored = await _store.GetAutoStateRuleAsync(hostIgnoreKey, ct);
+                if (hostIgnored is not null &&
+                    string.Equals(hostIgnored.Status, "Ignored", StringComparison.OrdinalIgnoreCase) &&
+                    (!hostIgnored.CooldownUntil.HasValue || hostIgnored.CooldownUntil.Value > now))
+                {
+                    return;
+                }
+            }
+
+            // No exact rule: check same-domain coarse transfer for interactive form/doc rules ONLY (0 LLM tokens).
+            // NEVER coarse-transfer passive background rules (such as manage_mail sync) onto unrelated pages like /login or /mypage.
             var coarsePrefix = BuildCoarseTriggerKey(url);
             if (!string.IsNullOrWhiteSpace(coarsePrefix))
             {
                 var allRules = await _store.GetAllAutoStateRulesAsync(ct);
                 var donor = allRules.FirstOrDefault(r =>
-                    !string.Equals(r.TriggerKey, triggerKey, StringComparison.OrdinalIgnoreCase) &&
-                    r.TriggerKey.StartsWith(coarsePrefix, StringComparison.OrdinalIgnoreCase) &&
-                    r.Status is "Hot" or "Cold" &&
-                    r.PredictorCounter >= 1 &&
-                    !r.StateName.StartsWith("silent_prepare_", StringComparison.OrdinalIgnoreCase) &&
-                    ParseSteps(r.StepsJson).Count > 0);
+                {
+                    if (string.Equals(r.TriggerKey, triggerKey, StringComparison.OrdinalIgnoreCase)) return false;
+                    if (!r.TriggerKey.StartsWith(coarsePrefix, StringComparison.OrdinalIgnoreCase)) return false;
+                    if (r.Status is not ("Hot" or "Cold") || r.PredictorCounter < 1) return false;
+                    if (r.StateName.StartsWith("silent_prepare_", StringComparison.OrdinalIgnoreCase)) return false;
+                    var donorSteps = ParseSteps(r.StepsJson);
+                    return donorSteps.Count > 0 && !donorSteps.Any(IsSafeSilentPrepareStep);
+                });
 
                 if (donor is not null)
                 {
@@ -705,6 +780,7 @@ public sealed class StateMachineAgent : IDisposable
         var (mode, proposal, step) = ParseFirstVisitDecision(resp.Content);
         if (mode == "ignore" || step is null || FilterSafeSteps(new List<CachedWorkflowStep> { step }).Count == 0)
         {
+            var nowUtc = _utcNow();
             // Remember "nothing to offer" for 7 days so revisiting costs 0 tokens.
             await _store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord(
                 TriggerKey: triggerKey,
@@ -714,19 +790,50 @@ public sealed class StateMachineAgent : IDisposable
                 HitCount: 0,
                 MissCount: 0,
                 Status: "Ignored",
-                LastSeenAt: _utcNow(),
-                CooldownUntil: _utcNow().AddDays(7)), ct);
+                LastSeenAt: nowUtc,
+                CooldownUntil: nowUtc.AddDays(7)), ct);
+
+            // Adaptive host-level cooling (zero hardcoded site blacklists): if >=3 paths on the same host
+            // are Ignored and 0 are Hot/Cold, record a 7-day host-level Ignored rule so browsing subpaths costs 0 tokens.
+            var coarse = BuildCoarseTriggerKey(url);
+            var hostIgnore = BuildHostIgnoreKey(url);
+            if (!string.IsNullOrWhiteSpace(coarse) && !string.IsNullOrWhiteSpace(hostIgnore))
+            {
+                var allRules = await _store.GetAllAutoStateRulesAsync(ct);
+                var hostRules = allRules
+                    .Where(r => r.TriggerKey.StartsWith(coarse, StringComparison.OrdinalIgnoreCase) &&
+                                !string.Equals(r.TriggerKey, hostIgnore, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                bool hasUseful = hostRules.Any(r => r.Status is "Hot" or "Cold");
+                int ignoredCount = hostRules.Count(r =>
+                    string.Equals(r.Status, "Ignored", StringComparison.OrdinalIgnoreCase) &&
+                    (!r.CooldownUntil.HasValue || r.CooldownUntil.Value > nowUtc));
+                if (!hasUseful && ignoredCount >= 3)
+                {
+                    await _store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord(
+                        TriggerKey: hostIgnore,
+                        StateName: "ignored_host_adaptive",
+                        StepsJson: "[]",
+                        PredictorCounter: 0,
+                        HitCount: 0,
+                        MissCount: 0,
+                        Status: "Ignored",
+                        LastSeenAt: nowUtc,
+                        CooldownUntil: nowUtc.AddDays(7)), ct);
+                }
+            }
             return;
         }
 
-        // Strictly read-only background preparation (e.g., manage_mail sync boost while waiting on a verification email):
-        // Save directly as Hot and execute silently with ZERO popup card!
-        if (mode == "silent_prepare" && IsSafeSilentPrepareStep(step))
+        // Strictly read-only background preparation (manage_mail sync):
+        // ALWAYS save directly as Hot and execute silently with ZERO popup card (even if LLM wrote mode=propose).
+        if (IsSafeSilentPrepareStep(step))
         {
-            var silentSteps = new List<CachedWorkflowStep> { step };
+            var silentStep = EnsureSilentPrepareBoostArgs(step);
+            var silentSteps = new List<CachedWorkflowStep> { silentStep };
             var silentRule = new AutoStateRuleRecord(
                 TriggerKey: triggerKey,
-                StateName: $"silent_prepare_{step.Skill.ToLowerInvariant()}",
+                StateName: $"silent_prepare_{silentStep.Skill.ToLowerInvariant()}",
                 StepsJson: JsonSerializer.Serialize(silentSteps),
                 PredictorCounter: 2,
                 HitCount: 0,
@@ -772,6 +879,14 @@ public sealed class StateMachineAgent : IDisposable
         if (!step.Args.TryGetProperty("action", out var act))
             return false;
         return string.Equals(act.GetString()?.Trim(), "sync", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static CachedWorkflowStep EnsureSilentPrepareBoostArgs(CachedWorkflowStep? step)
+    {
+        if (step is not null && step.Args.ValueKind == JsonValueKind.Object && step.Args.TryGetProperty("boost_seconds", out _))
+            return step;
+        using var doc = JsonDocument.Parse("""{"action":"sync","source":"all","boost_seconds":90}""");
+        return new CachedWorkflowStep("manage_mail", doc.RootElement.Clone());
     }
 
     private void RaiseProposal(string triggerKey, string? title, string message, IReadOnlyList<string> choices)
@@ -941,6 +1056,16 @@ public sealed class StateMachineAgent : IDisposable
             ProposalText: existing?.ProposalText);
 
         await _store.UpsertAutoStateRuleAsync(updated, ct);
+        // If this host had an adaptive host-level Ignored rule, clear it since the user explicitly acted on this host.
+        if (triggerKey.StartsWith("url:", StringComparison.OrdinalIgnoreCase))
+        {
+            var slash = triggerKey.IndexOf('/', 4);
+            if (slash > 4)
+            {
+                var hostIgnore = triggerKey[..(slash + 1)] + "*";
+                await _store.DeleteAutoStateRuleAsync(hostIgnore, ct);
+            }
+        }
         var evtType = existing is not null && existing.Status is "Muted" or "Disabled" or "Ignored"
             ? "revived"
             : (existing?.Status != "Hot" && nextStatus == "Hot" ? "promoted" : "observed");

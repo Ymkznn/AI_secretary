@@ -3030,8 +3030,10 @@ public sealed class SecretaryController : IDisposable
             if (level <= 0)
                 return false;
 
-            // If this was a mail-first -> page-second flow, dismiss any earlier MailTriage pinned card for the same email.
+            // If this was a mail-first -> page-second flow, dismiss any earlier MailTriage pinned card for the same email,
+            // and clear any stale StateMachine confirmation pills for this domain so completed OTP flows never leave old cards behind.
             await DismissEarlierMailPinnedCardsAsync(ev.SourceId);
+            DismissStaleStateProposalsForDomain(domain);
 
             bool downgradedFromL2 = false;
             if (level >= 2)
@@ -3129,6 +3131,32 @@ public sealed class SecretaryController : IDisposable
         }
         foreach (var id in staleIds)
             await DismissPinnedReminderAsync(id);
+    }
+
+    private void DismissStaleStateProposalsForDomain(string? registrableDomain)
+    {
+        if (string.IsNullOrWhiteSpace(registrableDomain) ||
+            string.Equals(registrableDomain, "unknown", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        List<string> staleProposalIds;
+        lock (_pinnedLock)
+        {
+            staleProposalIds = _pinnedReminders
+                .Where(p => p.Kind == PinnedItemKind.Confirmation &&
+                            p.Id.StartsWith("state-propose:url:", StringComparison.OrdinalIgnoreCase))
+                .Where(p =>
+                {
+                    var key = p.Id["state-propose:url:".Length..];
+                    var slash = key.IndexOf('/');
+                    var host = slash > 0 ? key[..slash] : key;
+                    return string.Equals(DomainParser.ExtractRegistrableDomain(host), registrableDomain, StringComparison.OrdinalIgnoreCase);
+                })
+                .Select(p => p.Id)
+                .ToList();
+        }
+        foreach (var id in staleProposalIds)
+            RemovePinnedConfirmation(id);
     }
 
     private async Task<(bool Ok, string Message)> FillOtpForL1OrManualAsync(

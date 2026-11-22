@@ -361,20 +361,104 @@ public sealed class OtpCorrelatorAndVaultTests
     }
 
     [Fact]
-    public async Task StateMachine_MigrateLegacyRules_DeletesStaleBrowserWinAndColdMailSyncRules()
+    public async Task StateMachine_MigrateLegacyRules_DeletesStaleBrowserWinColdMailSyncAndUpgradesHotMailSync()
     {
         var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
         using var harness = CreateStateMachineHarness(() => clock);
 
         await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord("win:msedge|登入確認", "first_visit_manage_mail", "[]", 1, 0, 0, "Cold", clock));
-        await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord("url:www.tenso.com/*/login/confirm", "first_visit_manage_mail", "[]", 1, 0, 0, "Cold", clock));
-        await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord("url:forms.company.com/apply", "first_visit_browser_form", "[]", 2, 3, 0, "Hot", clock));
+        await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord("url:www.tenso.com/*/login", "first_visit_manage_mail", """[{"Skill":"manage_mail","Args":{"action":"sync"}}]""", 1, 0, 0, "Cold", clock));
+        await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord("url:www.tenso.com/*/login/verify", "first_visit_manage_mail", """[{"Skill":"manage_mail","Args":{"action":"sync"}}]""", 3, 2, 0, "Hot", clock));
+        await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord("url:www.youtube.com/shorts/DOYYn8AEDcQ", "ignored_first_visit", "[]", 0, 0, 0, "Ignored", clock));
+        await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord("url:forms.company.com/apply", "first_visit_browser_form", """[{"Skill":"browser_form","Args":{"action":"read"}}]""", 2, 3, 0, "Hot", clock));
 
         await harness.Agent.MigrateLegacyRulesAsync();
 
         Assert.Null(await harness.Store.GetAutoStateRuleAsync("win:msedge|登入確認"));
-        Assert.Null(await harness.Store.GetAutoStateRuleAsync("url:www.tenso.com/*/login/confirm"));
+        Assert.Null(await harness.Store.GetAutoStateRuleAsync("url:www.tenso.com/*/login"));
+        Assert.Null(await harness.Store.GetAutoStateRuleAsync("url:www.youtube.com/shorts/DOYYn8AEDcQ"));
+
+        var upgradedHot = await harness.Store.GetAutoStateRuleAsync("url:www.tenso.com/*/login/verify");
+        Assert.NotNull(upgradedHot);
+        Assert.Equal("silent_prepare_manage_mail", upgradedHot!.StateName);
+        Assert.Contains("boost_seconds", upgradedHot.StepsJson);
+
         Assert.NotNull(await harness.Store.GetAutoStateRuleAsync("url:forms.company.com/apply"));
+    }
+
+    [Theory]
+    [InlineData("https://www.youtube.com/shorts/DOYYn8AEDcQ", "url:www.youtube.com/shorts/*")]
+    [InlineData("https://www.youtube.com/post/Ugkx7ezdIgmFDWs2zBw5BxnoPmbwm95kMaBx", "url:www.youtube.com/post/*")]
+    [InlineData("https://www.youtube.com/@imas-official/videos", "url:www.youtube.com/*/videos")]
+    [InlineData("https://www.tenso.com/cht/login", "url:www.tenso.com/*/login")]
+    [InlineData("https://www.tenso.com/cht/login/verify", "url:www.tenso.com/*/login/verify")]
+    [InlineData("https://trackings.post.japanpost.jp/services/srv/search", "url:trackings.post.japanpost.jp/services/srv/search")]
+    public void StateMachine_BuildTriggerKey_NormalizesOpaqueUrlIdsWhilePreservingSemanticPaths(string url, string expectedKey)
+    {
+        Assert.Equal(expectedKey, StateMachineAgent.BuildTriggerKey(url, "msedge", ""));
+    }
+
+    [Fact]
+    public async Task StateMachine_CoarseTransfer_NeverTransfersPassiveMailSyncOntoOtherPagesOfSameSite()
+    {
+        var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
+        using var harness = CreateStateMachineHarness(
+            () => clock,
+            llmResponder: (_, _) => """{"mode":"ignore"}""");
+
+        // Pre-existing Hot mail-sync rule on /login/verify (even with legacy StateName!)
+        await harness.Store.UpsertAutoStateRuleAsync(new AutoStateRuleRecord(
+            "url:www.tenso.com/*/login/verify",
+            "first_visit_manage_mail",
+            """[{"Skill":"manage_mail","Args":{"action":"sync"}}]""",
+            PredictorCounter: 3, HitCount: 2, MissCount: 0, Status: "Hot", LastSeenAt: clock));
+
+        int proposalCount = 0;
+        harness.Agent.ProposalRequested += _ => proposalCount++;
+
+        // User visits password login page /cht/login (NOT /login/verify) -> MUST NOT coarse-transfer manage_mail popup!
+        var loginUrl = "https://www.tenso.com/cht/login";
+        await harness.Agent.HandleBrowserPageSignalAsync(
+            "conv-1",
+            new CachedBrowserPageSignal(loginUrl, "登入 | tenso", 1, new[] { "Email" }, Array.Empty<string>(), "", clock));
+
+        Assert.Equal(0, proposalCount);
+        var loginRule = await harness.Store.GetAutoStateRuleAsync("url:www.tenso.com/*/login");
+        Assert.True(loginRule is null || loginRule.Status == "Ignored");
+    }
+
+    [Fact]
+    public async Task StateMachine_AdaptiveHostCooling_StopsProbingHostAfterThreeIgnoredPaths()
+    {
+        var clock = new DateTimeOffset(2026, 11, 22, 10, 0, 0, TimeSpan.Zero);
+        using var harness = CreateStateMachineHarness(
+            () => clock,
+            llmResponder: (_, _) => """{"mode":"ignore"}""");
+
+        var urls = new[]
+        {
+            "https://example-media.test/watch",
+            "https://example-media.test/shorts/Ab12Cd34Ef",
+            "https://example-media.test/feed/subscriptions"
+        };
+        foreach (var u in urls)
+        {
+            var k = StateMachineAgent.BuildTriggerKey(u, "msedge", "Media");
+            var sig = new CachedBrowserPageSignal(u, "Media", 1, new[] { "Comment" }, Array.Empty<string>(), "", clock);
+            await harness.Agent.TryFirstVisitProbeAsync("conv-1", k, new ExternalWindowTarget(IntPtr.Zero, 1, "msedge", "Media", clock), u, sig, CancellationToken.None, skipDwellForTest: true);
+        }
+
+        // After 3 ignored paths with 0 useful rules, adaptive host rule url:example-media.test/* is created automatically!
+        var hostRule = await harness.Store.GetAutoStateRuleAsync("url:example-media.test/*");
+        Assert.NotNull(hostRule);
+        Assert.Equal("Ignored", hostRule!.Status);
+
+        int callsBefore = harness.Gateway.RecordedCallers.Count;
+        // 4th new subpath on the same host is skipped via host-level Ignored rule with 0 LLM calls!
+        await harness.Agent.HandleBrowserPageSignalAsync(
+            "conv-1",
+            new CachedBrowserPageSignal("https://example-media.test/playlist/new", "Playlist", 1, new[] { "Filter" }, Array.Empty<string>(), "", clock));
+        Assert.Equal(callsBefore, harness.Gateway.RecordedCallers.Count);
     }
 
     [Fact]

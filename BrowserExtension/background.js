@@ -77,10 +77,13 @@ async function reportPageSignal(tab, forceResend = false) {
       target: { tabId: tab.id, allFrames: true },
       func: () => {
         const isTop = window === window.top;
-        const isSearchRole = (el) => {
+        const isChromeLandmarkOrSearch = (el) => {
+          const ac = (el.getAttribute('autocomplete') || '').toLowerCase().trim();
+          if (ac === 'one-time-code') return false;
           const t = (el.type || el.tagName).toLowerCase();
           const role = (el.getAttribute('role') || '').toLowerCase().trim();
-          return t === 'search' || role === 'searchbox' || role === 'combobox';
+          if (t === 'search' || role === 'searchbox' || role === 'combobox') return true;
+          return Boolean(el.closest('header, nav, [role="banner"], [role="search"], [role="navigation"]'));
         };
         const allInputs = Array.from(document.querySelectorAll('input, textarea, select'))
           .filter(el => {
@@ -88,10 +91,10 @@ async function reportPageSignal(tab, forceResend = false) {
             return t !== 'hidden' && t !== 'submit' && t !== 'button' && t !== 'image' && t !== 'reset'
               && !el.disabled && !el.readOnly && el.offsetParent !== null;
           });
-        // Pure structural form inputs: exclude password fields and W3C/ARIA search boxes (zero language keywords).
+        // Pure structural form inputs: exclude password fields and W3C/ARIA search/navigation chrome (zero language keywords).
         const els = allInputs.filter(el => {
           const t = (el.type || el.tagName).toLowerCase();
-          return t !== 'password' && !isSearchRole(el);
+          return t !== 'password' && !isChromeLandmarkOrSearch(el);
         });
         const getLabelFor = (el) => {
           try {
@@ -147,7 +150,7 @@ async function reportPageSignal(tab, forceResend = false) {
             const tag = (target.tagName || '').toLowerCase();
             if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') return;
             const tp = (target.type || tag).toLowerCase();
-            if (tp === 'password' || tp === 'hidden' || tp === 'submit' || tp === 'button' || isSearchRole(target)) return;
+            if (tp === 'password' || tp === 'hidden' || tp === 'submit' || tp === 'button' || isChromeLandmarkOrSearch(target)) return;
             try { chrome.runtime.sendMessage({ type: 'INPUT_FIELD_FOCUSED' }); } catch {}
           }, true);
         }
