@@ -12,8 +12,13 @@ public enum CachePolicy
     None,
     /// <summary>Cache only the static system prompt prefix.</summary>
     SystemOnly,
-    /// <summary>Cache the system prompt plus conversation history prefix breakpoints.</summary>
-    Conversation
+    /// <summary>Cache the system prompt plus conversation history prefix breakpoints (including trailing message).</summary>
+    Conversation,
+    /// <summary>
+    /// Reuse existing system + preceding conversation prefix cache (breakpoint at <c>n - 3</c>) WITHOUT caching
+    /// the trailing assistant/user pair (avoids 1.25x cache write surcharge on one-off final-reply observations).
+    /// </summary>
+    PrefixReadOnly
 }
 
 public enum LlmPriority

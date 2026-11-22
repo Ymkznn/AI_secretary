@@ -25,12 +25,13 @@ public sealed class BrowserFormSkill : IBasicSkill
     public string StatusText => "Interacting with browser form...";
     public string MainAgentSpec => """
             browser_form
-               - Purpose: Read form fields, inspect up to the full page DOM (on-demand), or prefill fields in the active Chrome/Edge tab via Browser Extension (never auto-submits).
-               - Args: {"action": "read|read_dom|fill", "selector": "optional CSS selector for read_dom", "max_chars": 20000, "fills": [{"field_id": "aisec_top_0", "value": "...", "label": "optional field label"}]}
+               - Purpose: Read form fields, read webpage text/DOM (on-demand), or prefill fields in the active Chrome/Edge tab via Extension (never auto-submits).
+               - Args: {"action": "read|read_dom|fill", "selector": "optional CSS selector for read_dom", "max_chars": 8000, "include_html": false, "fills": [{"field_id": "aisec_top_0", "value": "...", "label": "optional field label"}]}
+               - read_dom returns clean page TEXT only by default (saves tokens); pass "include_html": true ONLY when inspecting HTML/CSS selectors (prefer scoping with "selector").
                - fill reports exactly which fields were applied/missed (with read-back values); only claim success for fields listed as applied.
             
         """;
-    public string PlannerSpec => """browser_form: Read form fields, full page DOM (read_dom), or prefill active browser tab via Extension (never submits). args: {"action":"read|read_dom|fill","selector":"optional","max_chars":20000,"fills":[{"field_id":"...","value":"...","label":"optional"}]}; fill returns applied/missed fields - never claim unlisted fields were filled.""";
+    public string PlannerSpec => """browser_form: Read form fields, webpage text/DOM (read_dom; text-only by default, pass include_html=true only when CSS selectors are needed), or prefill active browser tab via Extension (never submits). args: {"action":"read|read_dom|fill","selector":"optional","max_chars":8000,"include_html":false,"fills":[{"field_id":"...","value":"...","label":"optional"}]}; fill returns applied/missed fields - never claim unlisted fields were filled.""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
@@ -74,9 +75,11 @@ public sealed class BrowserFormSkill : IBasicSkill
         if (action == "read_dom")
         {
             var selector = ctx.GetArg("selector");
-            // Default lowered from 80k: every read_dom result is re-sent on each subsequent LLM call of the turn.
-            var maxChars = int.TryParse(ctx.GetArg("max_chars"), out var mc) ? Math.Clamp(mc, 1000, 120000) : 20000;
-            var dom = await _bridge.RequestActiveTabDomAsync(selector, maxChars, TimeSpan.FromSeconds(8), ctx.Ct);
+            var includeHtml = string.Equals(ctx.GetArg("include_html"), "true", StringComparison.OrdinalIgnoreCase);
+            var maxChars = int.TryParse(ctx.GetArg("max_chars"), out var mc) ? Math.Clamp(mc, 1000, 30000) : 8000;
+            // Fetch slightly more raw HTML before compaction when include_html is requested so stripping attributes preserves structure.
+            var fetchChars = includeHtml ? Math.Min(60000, maxChars * 2) : Math.Min(30000, maxChars + 2000);
+            var dom = await _bridge.RequestActiveTabDomAsync(selector, fetchChars, TimeSpan.FromSeconds(8), ctx.Ct);
             if (dom is null)
             {
                 ctx.MarkFailed();
@@ -90,15 +93,7 @@ public sealed class BrowserFormSkill : IBasicSkill
                 return;
             }
 
-            var html = CompactHtmlForContext(dom.Html ?? "");
-            var text = dom.Text ?? "";
-            var truncated = dom.Truncated;
-            if (text.Length > maxChars) { text = text[..maxChars]; truncated = true; }
-            // Text is usually what the model needs; HTML gets whatever budget is left (at least a quarter).
-            var htmlBudget = Math.Max(maxChars / 4, maxChars - text.Length);
-            if (html.Length > htmlBudget) { html = html[..htmlBudget]; truncated = true; }
-            var note = truncated ? " [truncated]" : "";
-            ctx.Observations.Add($"browser_form: DOM snapshot of \"{dom.Title}\" ({dom.Url}){note}\n--- TEXT ---\n{text}\n--- HTML (compacted) ---\n{html}");
+            ctx.Observations.Add(FormatDomObservation(dom, maxChars, includeHtml));
             ctx.CompletedSteps.Add("browser_form:read_dom");
             return;
         }
@@ -204,26 +199,100 @@ public sealed class BrowserFormSkill : IBasicSkill
             ctx.CompletedSteps.Add("browser_form:fill");
     }
 
+    internal const string HtmlSectionMarker = "\n--- HTML (compacted) ---\n";
+
+    private static readonly Regex HeadBlockRegex = new(
+        @"<head\b[^>]*>.*?</head>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex StripNoiseElementsRegex = new(
+        @"<(script|style|noscript|svg|template|canvas)\b[^>]*>.*?</\1>|<(meta|link)\b[^>]*\/?>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex DataUriAttrRegex = new(
+        @"\s(?:src|href|poster|srcset)=(?:""data:[^""]*""|'data:[^']*')",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex NoiseAttrRegex = new(
-        @"\s(?:style|class|data-(?!aisec-id)[\w-]+|on\w+|jsaction|jscontroller|jsname|jsmodel|aria-describedby|aria-labelledby|tabindex|role)=(?:""[^""]*""|'[^']*'|[^\s>]+)",
+        @"\s(?:style|class|data-(?!aisec-id)[\w-]+|on\w+|jsaction|jscontroller|jsname|jsmodel|aria-describedby|aria-labelledby|tabindex|role|width|height|loading|decoding|fetchpriority|referrerpolicy|crossorigin)=(?:""[^""]*""|'[^']*'|[^\s>]+)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex CommentRegex = new(@"<!--(?!\s*\[Frame:).*?-->", RegexOptions.Singleline | RegexOptions.Compiled);
     private static readonly Regex WhitespaceRegex = new(@"\s{2,}", RegexOptions.Compiled);
-    private static readonly Regex EmptyTagRegex = new(@"<(div|span)>\s*</\1>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex BlankLinesRegex = new(@"\n{3,}", RegexOptions.Compiled);
+    private static readonly Regex EmptyTagRegex = new(@"<(div|span|p|section)>\s*</\1>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    /// <summary>Strips styling/framework noise from raw page HTML so a DOM snapshot costs far fewer tokens.</summary>
+    internal static string CompactTextForContext(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "";
+        var normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        var lines = normalized.Split('\n').Select(l => Regex.Replace(l, @"[ \t]{2,}", " ").Trim());
+        var joined = string.Join("\n", lines);
+        return BlankLinesRegex.Replace(joined, "\n\n").Trim();
+    }
+
+    /// <summary>Strips head/styling/data-URI/framework noise from raw page HTML so a DOM snapshot costs far fewer tokens.</summary>
     internal static string CompactHtmlForContext(string html)
     {
         if (string.IsNullOrEmpty(html)) return html;
-        var s = CommentRegex.Replace(html, "");
+        var s = HeadBlockRegex.Replace(html, "");
+        s = StripNoiseElementsRegex.Replace(s, "");
+        s = CommentRegex.Replace(s, "");
+        s = DataUriAttrRegex.Replace(s, "");
         s = NoiseAttrRegex.Replace(s, "");
         s = WhitespaceRegex.Replace(s, " ");
-        for (var i = 0; i < 3; i++)
+        for (var i = 0; i < 4; i++)
         {
             var next = EmptyTagRegex.Replace(s, "");
             if (next.Length == s.Length) break;
             s = next;
         }
         return s.Trim();
+    }
+
+    /// <summary>
+    /// Formats a DOM snapshot within a strict <paramref name="maxChars"/> total budget.
+    /// Text-only by default; when <paramref name="includeHtml"/> is true, splits the budget strictly so total text + HTML never exceeds <paramref name="maxChars"/>.
+    /// </summary>
+    internal static string FormatDomObservation(BrowserDomSnapshot dom, int maxChars, bool includeHtml)
+    {
+        var text = CompactTextForContext(dom.Text);
+        var truncated = dom.Truncated;
+
+        if (!includeHtml)
+        {
+            if (text.Length > maxChars)
+            {
+                text = text[..maxChars];
+                truncated = true;
+            }
+            var note = truncated ? " [truncated]" : "";
+            return $"browser_form: DOM snapshot of \"{dom.Title}\" ({dom.Url}){note}\n--- TEXT ---\n{text}";
+        }
+
+        // Strict total cap: split budget cleanly between text (up to 40%) and compacted HTML (remaining 60%+).
+        var textBudget = Math.Max(800, maxChars * 2 / 5);
+        if (text.Length > textBudget)
+        {
+            text = text[..textBudget];
+            truncated = true;
+        }
+        var htmlBudget = Math.Max(400, maxChars - text.Length);
+        var html = CompactHtmlForContext(dom.Html ?? "");
+        if (html.Length > htmlBudget)
+        {
+            html = html[..htmlBudget];
+            truncated = true;
+        }
+        var htmlNote = truncated ? " [truncated]" : "";
+        return $"browser_form: DOM snapshot of \"{dom.Title}\" ({dom.Url}){htmlNote}\n--- TEXT ---\n{text}{HtmlSectionMarker}{html}";
+    }
+
+    /// <summary>
+    /// Removes the raw HTML appendix from <c>browser_form read_dom</c> observations before FinalReply / MemoryReflection
+    /// so user-facing reply synthesis never re-ingests thousands of tokens of raw markup.
+    /// </summary>
+    internal static string StripHtmlSectionForFinalReply(string observation)
+    {
+        if (string.IsNullOrEmpty(observation)) return observation;
+        var idx = observation.IndexOf(HtmlSectionMarker, StringComparison.Ordinal);
+        if (idx < 0) return observation;
+        return observation[..idx].TrimEnd() + "\n[HTML omitted in final reply synthesis]";
     }
 }

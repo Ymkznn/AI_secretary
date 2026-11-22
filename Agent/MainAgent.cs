@@ -711,10 +711,16 @@ public sealed class MainAgent
             }
         }
 
+        // Strip raw HTML sections from read_dom observations before FinalReply & MemoryReflection
+        // so human-facing reply synthesis never re-ingests 10k-20k tokens of raw HTML.
+        var finalObservations = observations
+            .Select(BrowserFormSkill.StripHtmlSectionForFinalReply)
+            .ToList();
+
         var synthesisPrompt = PlannerPrompts.BuildMainAgentReportSynthesisPrompt(
             sourceLabel,
             completedSteps,
-            observations,
+            finalObservations,
             includeTaskStatus,
             _tts.IsEnabled,
             _tts.ChatMode,
@@ -731,7 +737,7 @@ public sealed class MainAgent
 
         var finalResp = await _model.CompleteAsync(
             finalMessages,
-            new LlmCallOptions("MainAgent.FinalReply", tier, CachePolicy.Conversation, LlmPriority.Interactive),
+            new LlmCallOptions("MainAgent.FinalReply", tier, CachePolicy.PrefixReadOnly, LlmPriority.Interactive),
             ct);
         WorkerAgent.CleanupTempScreenshots(observations);
         await _sessions.RecordTokensAsync(mainSession, finalResp.EstimatedTokens, ct: ct);
@@ -750,7 +756,7 @@ public sealed class MainAgent
         onTaskCompleted?.Invoke(isTaskDone);
 
         if (completedSteps.Count > 0 && !usedFallback)
-            _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, completedSteps, observations, cleanFinal);
+            _memoryReflection.EnqueueDecisionReflection(conversationId, userPrompt, completedSteps, finalObservations, cleanFinal);
     }
 
     internal static bool IsRefusalStopReason(string? stopReason)
@@ -825,7 +831,7 @@ public sealed class MainAgent
 
         var resp = await _model.CompleteAsync(
             msgs,
-            new LlmCallOptions("MainAgent.FreshnessRegen", ModelTier.Simple, CachePolicy.Conversation, LlmPriority.Interactive),
+            new LlmCallOptions("MainAgent.FreshnessRegen", ModelTier.Simple, CachePolicy.PrefixReadOnly, LlmPriority.Interactive),
             ct);
         await _sessions.RecordTokensAsync(mainSession, resp.EstimatedTokens, ct: ct);
 

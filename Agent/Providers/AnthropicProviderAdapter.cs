@@ -51,18 +51,32 @@ public sealed class AnthropicProviderAdapter : ILlmProviderAdapter
                 normalized.Add((role, m.Content));
         }
 
-        // Only attach conversation breakpoints when CachePolicy == Conversation (avoids 1.25x cache write waste on one-off calls).
-        int lastIdx = cachePolicy == CachePolicy.Conversation ? normalized.Count - 1 : -1;
-        int prevIdx = cachePolicy == CachePolicy.Conversation && normalized.Count >= 2 ? normalized.Count - 2 : -1;
+        // Attach conversation breakpoints according to policy:
+        // - Conversation: last + second-to-last (reused by immediate follow-ups like FinalReply or next Planner round).
+        // - PrefixReadOnly: align with preceding Route's cached tail (n - 3) without paying 1.25x CacheWrite on trailing one-off observations.
+        int bp1 = -1;
+        int bp2 = -1;
+        if (cachePolicy == CachePolicy.Conversation)
+        {
+            bp1 = normalized.Count - 1;
+            bp2 = normalized.Count >= 2 ? normalized.Count - 2 : -1;
+        }
+        else if (cachePolicy == CachePolicy.PrefixReadOnly)
+        {
+            bp1 = normalized.Count >= 3
+                ? normalized.Count - 3
+                : (normalized.Count >= 2 ? normalized.Count - 2 : -1);
+        }
+
         var chatMsgs = normalized
             .Select((m, idx) => new
             {
                 role = m.Role,
-                content = BuildContent(m.Content, withCacheControl: idx == lastIdx || idx == prevIdx)
+                content = BuildContent(m.Content, withCacheControl: idx == bp1 || idx == bp2)
             })
             .ToArray();
 
-        bool cacheSystem = cachePolicy is CachePolicy.SystemOnly or CachePolicy.Conversation;
+        bool cacheSystem = cachePolicy is CachePolicy.SystemOnly or CachePolicy.Conversation or CachePolicy.PrefixReadOnly;
         object[] systemBlocks = string.IsNullOrWhiteSpace(systemPrompt)
             ? Array.Empty<object>()
             : (cacheSystem

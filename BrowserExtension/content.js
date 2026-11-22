@@ -459,20 +459,24 @@
       pw.removeAttribute('value');
       pw.value = '';
     }
-    for (const noise of clone.querySelectorAll('script, style, noscript, svg')) {
+    for (const noise of clone.querySelectorAll('head, script, style, noscript, svg, template, canvas, link, meta, [hidden], [aria-hidden="true"]')) {
       noise.remove();
+    }
+    for (const el of clone.querySelectorAll('[src^="data:"], [href^="data:"]')) {
+      if ((el.getAttribute('src') || '').startsWith('data:')) el.removeAttribute('src');
+      if ((el.getAttribute('href') || '').startsWith('data:')) el.removeAttribute('href');
     }
     return clone.outerHTML || '';
   }
 
   function extractDom(selector, maxChars) {
-    const limit = Math.max(1000, Math.min(Number(maxChars) || 80000, 250000));
+    const limit = Math.max(1000, Math.min(Number(maxChars) || 30000, 120000));
     let root = null;
     if (selector) {
       const matches = queryAllDeep(document, selector);
       root = matches[0] || null;
     } else {
-      root = document.documentElement;
+      root = document.body || document.documentElement;
     }
 
     if (!root) {
@@ -487,9 +491,10 @@
       for (const frame of frames) {
         try {
           const fdoc = frame.contentDocument;
-          if (fdoc && fdoc.documentElement) {
-            const fText = (fdoc.body?.innerText || fdoc.documentElement.innerText || '').trim();
-            const fHtml = sanitizeCloneDom(fdoc.documentElement);
+          if (fdoc && (fdoc.body || fdoc.documentElement)) {
+            const fRoot = fdoc.body || fdoc.documentElement;
+            const fText = (fRoot.innerText || '').trim();
+            const fHtml = sanitizeCloneDom(fRoot);
             const fLabel = frame.name || frame.id || frame.getAttribute('src') || 'iframe';
             if (fText) textParts.push(`\n--- [Frame: ${fLabel}] ---\n${fText}`);
             if (fHtml) htmlParts.push(`\n<!-- [Frame: ${fLabel}] -->\n${fHtml}`);
@@ -499,7 +504,7 @@
     }
 
     const rawHtml = htmlParts.filter(Boolean).join('\n');
-    const rawText = textParts.filter(Boolean).join('\n');
+    const rawText = textParts.filter(Boolean).join('\n').replace(/\n{3,}/g, '\n\n');
     const truncated = rawHtml.length > limit || rawText.length > limit;
     return {
       url: location.href,
