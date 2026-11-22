@@ -92,6 +92,11 @@ public sealed class SecretVaultService
         if (string.IsNullOrWhiteSpace(clean))
             throw new ArgumentException("OTP code cannot be empty.", nameof(rawCode));
 
+        // Guard: NEVER double-vault an existing otp#xxxxxx handle or its stripped 6-hex suffix
+        // (e.g. if an LLM stripped "otp#" from "otp#4a550d" and passed "4a550d" back as the code).
+        if (TryMatchHandleOrBareSuffix(clean, out var existingMatchedHandle))
+            return existingMatchedHandle;
+
         var effectiveTtl = ttl ?? DefaultTtl;
         if (effectiveTtl < TimeSpan.FromSeconds(1)) effectiveTtl = TimeSpan.FromSeconds(1);
         if (effectiveTtl > TimeSpan.FromMinutes(10)) effectiveTtl = TimeSpan.FromMinutes(10);
@@ -222,6 +227,18 @@ public sealed class SecretVaultService
 
             CleanupAndTombstoneLocked(key, entry);
             return true;
+        }
+    }
+
+    public bool IsRecentlyConsumed(string? handle)
+    {
+        if (string.IsNullOrWhiteSpace(handle)) return false;
+        var key = handle.Trim();
+        var now = _utcNow();
+        lock (_lock)
+        {
+            PruneExpiredLocked(now);
+            return _recentlyConsumed.Any(c => string.Equals(c.Handle, key, StringComparison.OrdinalIgnoreCase));
         }
     }
 

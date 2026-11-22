@@ -492,4 +492,121 @@ public sealed class OtpCorrelatorAndVaultTests
     {
         Assert.Equal(expectedAction, Skills.ManageMailSkill.InferDefaultAction(requestedAlias));
     }
+
+    [Fact]
+    public void DoubleVaultProtection_TriageStrippingOtpPrefixNeverReplacesRealDigitsOrLeaksHandleInSummary()
+    {
+        // Exact repro of tenso.com incident: real OTP = 304891 -> vaulted as otp#xxxxxx ->
+        // misbehaving MailTriage strips "otp#" and outputs bare 6-hex suffix as Prompt & raw handle in Summary.
+        var vault = new SecretVaultService();
+        var rawMail = new MailItem(
+            Id: "gmail:tenso-repro",
+            Subject: "[tenso轉送] 登入驗證碼通知",
+            SenderName: "tenso.com",
+            SenderEmail: "support@tenso.com",
+            ReceivedAt: DateTimeOffset.UtcNow,
+            Importance: MailImportance.High,
+            Snippet: "驗證碼 304891 ※驗證碼有效期限為10分鐘。",
+            Body: "驗證碼\n\n304891\n\n※驗證碼有效期限為10分鐘。",
+            IsRead: false,
+            ThreadId: "th-tenso");
+
+        Assert.True(OtpExtractor.TryExtractFromMail(rawMail, out var extracted));
+        Assert.Equal("304891", extracted);
+        var realHandle = vault.StoreOtp(extracted, "tenso.com", rawMail.SenderName, rawMail.Id);
+        var bareSuffix = realHandle[4..]; // e.g. "4a550d"
+
+        // 1) StoreOtp MUST NOT double-vault bare suffix or handle as a new secret!
+        Assert.Equal(realHandle, vault.StoreOtp(bareSuffix, "tenso.com", rawMail.SenderName, rawMail.Id));
+        Assert.Equal(realHandle, vault.StoreOtp(realHandle, "tenso.com", rawMail.SenderName, rawMail.Id));
+
+        // 2) VaultAndRedactTriage MUST bind fill_otp/copy_otp to realHandle and resolve back to "304891"
+        var safeMail = MailSyncService.RedactMailForTriage(vault, rawMail);
+        var badTriage = new Agent.TriageResult(
+            Urgent: true,
+            Title: "tenso 登入驗證碼",
+            Summary: $"tenso 寄來登入驗證碼 {realHandle}，有效期限 10 分鐘，目前仍可使用。",
+            ReRemindMinutes: 10,
+            Actions: new List<NotificationButtonOption>
+            {
+                new("fill_otp", "代填驗證碼", bareSuffix, IsPrimary: true),
+                new("copy_otp", "複製驗證碼", bareSuffix, IsPrimary: false),
+                new("view_mail", "查看郵件", null, IsPrimary: false)
+            });
+
+        var (_, safeSummary, safeActions) = MailSyncService.VaultAndRedactTriage(vault, null, safeMail, badTriage, realHandle);
+
+        Assert.NotNull(safeActions);
+        var fillBtn = Assert.Single(safeActions!, a => a.Type == "fill_otp");
+        Assert.Equal(realHandle, fillBtn.Prompt);
+        Assert.True(vault.TryResolve(fillBtn.Prompt, out var resolvedDigits, out _));
+        Assert.Equal("304891", resolvedDigits);
+        Assert.NotEqual(bareSuffix, resolvedDigits);
+
+        // 3) Human-facing summary contains NEITHER plaintext OTP NOR ugly internal handle / hex suffix!
+        Assert.DoesNotContain("304891", safeSummary);
+        Assert.DoesNotContain("otp#", safeSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(bareSuffix, safeSummary, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("登入驗證碼", safeSummary);
+    }
+
+    [Fact]
+    public async Task OtpPageSuppressesDuplicateStateMachineAndBrowserUiaWindowFocus()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var otpSignal = new CachedBrowserPageSignal(
+            Url: "https://www.tenso.com/cht/login/confirm",
+            Title: "登入確認 | tenso轉送服務",
+            InputCount: 1,
+            Labels: new[] { "驗證碼" },
+            Headings: new[] { "登入確認" },
+            Excerpt: "請輸入驗證碼",
+            CapturedAt: now.AddSeconds(-2),
+            OtpFieldPresent: true,
+            OtpFieldFocused: true);
+
+        // 1) Browser UIA WindowFocused MUST be suppressed when extension already reported fresh OTP / matching browser signal
+        Assert.True(ActivityMonitorService.ShouldSuppressBrowserUiaWindowFocus(
+            otpSignal,
+            "登入確認 | tenso轉送服務 和其他 3 個頁面 - 個人 - Microsoft Edge",
+            now));
+
+        // Stale signal (>15s) does NOT suppress
+        Assert.False(ActivityMonitorService.ShouldSuppressBrowserUiaWindowFocus(
+            otpSignal with { CapturedAt = now.AddSeconds(-30) },
+            "其他頁面 - Microsoft Edge",
+            now));
+
+        // 2) HandleBrowserPageSignalAsync with OtpFieldPresent=true emits BrowserPageSignalReceived, NOT WindowFocused
+        var cfg = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?> { ["Database:ConnectionString"] = "Data Source=:memory:" })
+            .Build();
+        var settings = new AppSettingsService(cfg);
+        var localizer = new UiLocalizer(settings, new Data.SqliteStore(cfg), new DummyGateway(), Microsoft.Extensions.Logging.Abstractions.NullLogger<UiLocalizer>.Instance);
+        using var monitor = new ActivityMonitorService(localizer, Microsoft.Extensions.Logging.Abstractions.NullLogger<ActivityMonitorService>.Instance);
+
+        int pageSignalCount = 0;
+        int windowFocusCount = 0;
+        monitor.BrowserPageSignalReceived += _ => pageSignalCount++;
+        monitor.WindowFocused += (_, _) => windowFocusCount++;
+
+        await monitor.HandleBrowserPageSignalAsync(new BrowserPageSignal(
+            Url: "https://www.tenso.com/cht/login/confirm",
+            Title: "登入確認 | tenso轉送服務",
+            InputCount: 1,
+            Labels: new[] { "驗證碼" },
+            Headings: new[] { "登入確認" },
+            Excerpt: "驗證碼",
+            OtpFieldPresent: true,
+            OtpFieldFocused: true));
+
+        Assert.Equal(1, pageSignalCount);
+        Assert.Equal(0, windowFocusCount);
+    }
+
+    private sealed class DummyGateway : Agent.IModelGateway
+    {
+        public Task<Agent.ModelResponse> CompleteAsync(IReadOnlyList<Agent.ModelMessage> messages, Agent.LlmCallOptions options, CancellationToken ct = default)
+            => Task.FromResult(new Agent.ModelResponse("", 0));
+    }
 }

@@ -320,6 +320,14 @@ public sealed class MailSyncService
         MailItem mail,
         TriageResult triage,
         string? existingHandle)
+        => VaultAndRedactTriage(_vault, _otpDetector, mail, triage, existingHandle);
+
+    internal static (string Title, string Summary, List<NotificationButtonOption>? Actions) VaultAndRedactTriage(
+        SecretVaultService vault,
+        OtpSituationDetector? otpDetector,
+        MailItem mail,
+        TriageResult triage,
+        string? existingHandle)
     {
         var senderDomain = OtpExtractor.ExtractSenderDomain(mail.SenderEmail);
         var regDomain = OtpExtractor.ExtractRegistrableDomain(senderDomain);
@@ -331,15 +339,29 @@ public sealed class MailSyncService
             safeActions = new List<NotificationButtonOption>(triage.Actions.Count);
             foreach (var btn in triage.Actions)
             {
-                if (btn.Type is "fill_otp" or "copy_otp" && !string.IsNullOrWhiteSpace(btn.Prompt))
+                if (btn.Type is "fill_otp" or "copy_otp")
                 {
-                    var btnHandle = SecretVaultService.IsOtpHandle(btn.Prompt)
-                        ? btn.Prompt.Trim().ToLowerInvariant()
-                        : _vault.StoreOtp(btn.Prompt, regDomain, mail.SenderName, mail.Id);
+                    string? btnHandle = null;
+                    // 1) If deterministic extraction already vaulted the real OTP BEFORE triage redacted the mail,
+                    //    MailTriage NEVER saw the real digits — ALWAYS bind buttons to existingHandle!
+                    if (!string.IsNullOrWhiteSpace(existingHandle))
+                    {
+                        btnHandle = existingHandle;
+                    }
+                    else if (!string.IsNullOrWhiteSpace(btn.Prompt))
+                    {
+                        btnHandle = vault.TryMatchHandleOrBareSuffix(btn.Prompt, out var matched)
+                            ? matched
+                            : vault.StoreOtp(btn.Prompt, regDomain, mail.SenderName, mail.Id);
+                    }
+
+                    if (string.IsNullOrWhiteSpace(btnHandle))
+                        continue;
+
                     if (handle is null)
                     {
                         handle = btnHandle;
-                        _otpDetector.OnOtpMailEvent(new OtpMailEvent(
+                        otpDetector?.OnOtpMailEvent(new OtpMailEvent(
                             MailId: mail.Id,
                             SenderDomain: senderDomain,
                             SenderRegistrableDomain: regDomain,
@@ -357,9 +379,35 @@ public sealed class MailSyncService
             }
         }
 
-        // Redact any plaintext OTP from title/summary before persisting to DB or Blackboard.
-        var safeTitle = _vault.RedactKnownSecrets(triage.Title);
-        var safeSummary = _vault.RedactKnownSecrets(triage.Summary);
+        // Redact any plaintext OTP first, then strip raw opaque vault handles (and any leaked bare 6-hex suffix)
+        // from human-facing notification Title/Summary so users & TTS never see "otp#4a550d" or "4a550d".
+        var safeTitle = CleanHumanFacingOtpText(vault.RedactKnownSecrets(triage.Title), handle);
+        var safeSummary = CleanHumanFacingOtpText(vault.RedactKnownSecrets(triage.Summary), handle);
         return (safeTitle, safeSummary, safeActions);
+    }
+
+    internal static string CleanHumanFacingOtpText(string? text, string? knownHandle = null)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return text ?? "";
+        var s = System.Text.RegularExpressions.Regex.Replace(
+            text,
+            @"\s*\botp#[0-9a-f]{6}\b\s*",
+            " ",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        if (!string.IsNullOrWhiteSpace(knownHandle) && SecretVaultService.IsOtpHandle(knownHandle))
+        {
+            var suffix = knownHandle.Trim()[4..];
+            s = System.Text.RegularExpressions.Regex.Replace(
+                s,
+                $@"\s*\b{System.Text.RegularExpressions.Regex.Escape(suffix)}\b\s*",
+                " ",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        }
+
+        // Clean stray spaces left before CJK/ASCII punctuation after stripping handle tokens
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"\s+([，。、！？,.;:：）\)])", "$1");
+        s = System.Text.RegularExpressions.Regex.Replace(s, @"[ \t]{2,}", " ");
+        return s.Trim();
     }
 }

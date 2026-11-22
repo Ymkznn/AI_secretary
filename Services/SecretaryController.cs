@@ -1915,15 +1915,17 @@ public sealed class SecretaryController : IDisposable
         var regDomain = OtpExtractor.ExtractRegistrableDomain(senderDomain);
         var finalActions = new List<NotificationButtonOption>();
 
+        string? primaryOtpHandle = null;
         if (actions is not null)
         {
             foreach (var btn in actions)
             {
                 if (btn.Type is "fill_otp" or "copy_otp" && !string.IsNullOrWhiteSpace(btn.Prompt))
                 {
-                    var handle = SecretVaultService.IsOtpHandle(btn.Prompt)
-                        ? btn.Prompt.Trim().ToLowerInvariant()
+                    var handle = _vault.TryMatchHandleOrBareSuffix(btn.Prompt, out var matched)
+                        ? matched
                         : _vault.StoreOtp(btn.Prompt, regDomain, mail.SenderName, mail.Id);
+                    primaryOtpHandle ??= handle;
                     _skills.LastObservedOtpHandle = handle;
                     _skills.LastObservedOtpHint = title;
                     _boostedPollUntilUtc = DateTimeOffset.MinValue;
@@ -1936,9 +1938,27 @@ public sealed class SecretaryController : IDisposable
             }
         }
 
-        // Defense-in-depth: redact any vaulted OTP plaintext from title/summary before DB persistence.
-        var safeTitle = _vault.RedactKnownSecrets(title);
-        var safeSummary = _vault.RedactKnownSecrets(summary);
+        // If the dedicated zero-LLM OTP correlator (L1/L2) ALREADY surfaced or auto-filled this exact OTP handle,
+        // skip pushing a duplicate MailTriage notification card so one OTP never spams multiple popups.
+        if (!string.IsNullOrWhiteSpace(primaryOtpHandle))
+        {
+            bool alreadyHandledByOtpDetector = _vault.IsRecentlyConsumed(primaryOtpHandle);
+            if (!alreadyHandledByOtpDetector)
+            {
+                lock (_pinnedLock)
+                {
+                    alreadyHandledByOtpDetector = _pinnedReminders.Any(p =>
+                        string.Equals(p.Id, $"otp-l1:{primaryOtpHandle}", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(p.Id, $"otp-undo:{primaryOtpHandle}", StringComparison.OrdinalIgnoreCase));
+                }
+            }
+            if (alreadyHandledByOtpDetector)
+                return;
+        }
+
+        // Defense-in-depth: redact any vaulted OTP plaintext and strip raw opaque handles from human-facing text.
+        var safeTitle = MailSyncService.CleanHumanFacingOtpText(_vault.RedactKnownSecrets(title), primaryOtpHandle);
+        var safeSummary = MailSyncService.CleanHumanFacingOtpText(_vault.RedactKnownSecrets(summary), primaryOtpHandle);
         await PersistNotificationAsync(convId, eventId, mail, safeTitle, safeSummary, reRemindMinutes, finalActions, ct);
     }
 
@@ -3061,7 +3081,7 @@ public sealed class SecretaryController : IDisposable
                         _boostedPollUntilUtc = DateTimeOffset.MinValue;
                         var undoId = $"otp-undo:{cand.Mail.Handle}";
                         var title = $"已自動填入驗證碼（{domain}）";
-                        var summary = $"已將 {cand.Mail.Handle} 填入「{page.Title}」（未自動送出）。10 秒內可點「復原」清空欄位。";
+                        var summary = $"已將驗證碼填入「{page.Title}」（未自動送出）。10 秒內可點「復原」清空欄位。";
                         var actions = new List<NotificationButtonOption>
                         {
                             new("undo_otp", "復原（清空欄位）", $"{domain}|{cand.Mail.Handle}", IsPrimary: true)
@@ -3099,8 +3119,8 @@ public sealed class SecretaryController : IDisposable
                 var l1Id = $"otp-l1:{cand.Mail.Handle}";
                 var l1Title = $"驗證碼已就緒（{cand.Mail.SenderName}）";
                 var l1Summary = downgradedFromL2
-                    ? $"收到來自 {cand.Mail.SenderName} 的驗證碼 {cand.Mail.Handle}，但目前焦點不在「{page.Title}」，未自動填入。切回該頁面後可點擊填入或複製。"
-                    : $"偵測到「{page.Title}」有驗證碼欄位，要幫你填入 {cand.Mail.Handle} 嗎？（絕不自動送出）";
+                    ? $"收到來自 {cand.Mail.SenderName} 的驗證碼，但目前焦點不在「{page.Title}」，未自動填入。切回該頁面後可點擊填入或複製。"
+                    : $"偵測到「{page.Title}」有驗證碼欄位，要幫你填入驗證碼嗎？（絕不自動送出）";
                 var fillPrompt = downgradedFromL2
                     ? $"{cand.Mail.Handle}|{domain}|downgraded"
                     : $"{cand.Mail.Handle}|{domain}";

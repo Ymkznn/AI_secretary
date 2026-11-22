@@ -53,10 +53,11 @@ Check <user_mail_preferences>:
 3. Newsletters/ads -> `urgent=false`.
 4. If `urgent=true`, set `re_remind_minutes` (urgent=5, normal=15, low=30, none=0).
 5. Choose 1-4 tailored `actions` buttons (labels written strictly in '{{replyLang}}'):
-   - `type`: `"view_mail"`, `"draft_reply"`, `"ask_ai"` (must include `prompt`), `"snooze"`, `"fill_otp"` (if a 4-8 digit OTP/verification code is present; `prompt` = the code), `"copy_otp"` (if an OTP/verification code is present; `prompt` = the code).
+   - `type`: `"view_mail"`, `"draft_reply"`, `"ask_ai"` (must include `prompt`), `"snooze"`, `"fill_otp"` (if an OTP/verification code or `otp#xxxxxx` handle is present; `prompt` = the EXACT `"otp#xxxxxx"` handle verbatim if redacted, NEVER strip `otp#`, else the code), `"copy_otp"` (same `prompt` rule).
+   - If the email contains an opaque Vault handle like `otp#xxxxxx`, NEVER treat its 6 hex characters as the literal verification digits and NEVER display `otp#xxxxxx` in the human-facing `summary` (simply say a verification code arrived and can be filled or copied via the buttons below).
    - ONLY include `"draft_reply"` for real human emails that require replying; NEVER include it for system/no-reply/billing/logistics/approval notifications or newsletters.
    - At most one `"is_primary": true`.
-Output pure JSON only (write `title`, `summary`, and button `label`s strictly in '{{replyLang}}'): {"urgent": true/false, "title": "short title", "summary": "one-sentence summary", "re_remind_minutes": 15, "actions": [{"type": "fill_otp", "label": "...", "prompt": "123456", "is_primary": true}, {"type": "view_mail", "label": "...", "is_primary": false}]}.
+Output pure JSON only (write `title`, `summary`, and button `label`s strictly in '{{replyLang}}'): {"urgent": true/false, "title": "short title", "summary": "one-sentence summary", "re_remind_minutes": 15, "actions": [{"type": "fill_otp", "label": "...", "prompt": "otp#a1b2c3", "is_primary": true}, {"type": "view_mail", "label": "...", "is_primary": false}]}.
 """;
 
     /// <summary>組裝 Planner 規劃階段的 User Prompt。</summary>

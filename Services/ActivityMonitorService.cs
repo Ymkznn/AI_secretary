@@ -420,8 +420,42 @@ public sealed class ActivityMonitorService : IDisposable
             FormFieldLabels: labels,
             VisibleInputCount: signal.InputCount);
 
-        WindowFocused?.Invoke(target, signal.Url);
+        // On OTP pages, the dedicated zero-LLM OTP correlator + fast mail sync handles everything automatically.
+        // Do NOT also fire WindowFocused -> StateMachine.FirstProbe, or the user gets a redundant "要不要幫你同步信箱" card!
+        if (!signal.OtpFieldPresent)
+            WindowFocused?.Invoke(target, signal.Url);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Suppresses redundant UIA <c>WindowFocused(enriched, null)</c> events for browsers whenever the browser extension
+    /// already reported a fresh page signal (preventing duplicate <c>win:msedge|...</c> + <c>url:...</c> cards,
+    /// and ensuring OTP pages never spawn redundant StateMachine proposals).
+    /// </summary>
+    internal static bool ShouldSuppressBrowserUiaWindowFocus(
+        CachedBrowserPageSignal? lastSignal,
+        string uiaTitle,
+        DateTimeOffset nowUtc)
+    {
+        if (lastSignal is null)
+            return false;
+
+        var age = nowUtc - lastSignal.CapturedAt;
+        if (age > TimeSpan.FromSeconds(15))
+            return false;
+
+        if (lastSignal.OtpFieldPresent)
+            return true;
+
+        if (age <= TimeSpan.FromSeconds(5))
+            return true;
+
+        if (!string.IsNullOrWhiteSpace(lastSignal.Title) &&
+            !string.IsNullOrWhiteSpace(uiaTitle) &&
+            uiaTitle.Contains(lastSignal.Title, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
     }
 
     private static bool SharesKeyword(string windowTitle, string hint)
@@ -534,6 +568,8 @@ public sealed class ActivityMonitorService : IDisposable
                                 return;
 
                             var enriched = await RefreshExternalTargetUiaAsync(hwnd, ct) ?? newTarget;
+                            if (ShouldSuppressBrowserUiaWindowFocus(GetLastBrowserPageSignal(), enriched.Title, DateTimeOffset.UtcNow))
+                                return;
                             if ((enriched.FormFieldLabels is { Count: > 0 }) || enriched.VisibleInputCount > 0)
                                 WindowFocused?.Invoke(enriched, null);
                         }, ct);
