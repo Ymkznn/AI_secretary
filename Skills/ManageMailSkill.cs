@@ -22,6 +22,7 @@ public sealed class ManageMailSkill : IBasicSkill
     public string DisplayDescription => "Read, search, and sync Outlook & Gmail";
     public string StatusText => "Accessing mail...";
     public string? Capability => "mail";
+    public IReadOnlyList<string> Aliases => new[] { "sync_mail", "read_inbox", "read_gmail", "get_mail_detail", "get_gmail_detail" };
     public bool IsSilentPoller => true;
     private string AvailableSourcesHint
     {

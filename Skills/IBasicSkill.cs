@@ -99,6 +99,7 @@ public interface IBasicSkill
     string PlannerSpec { get; }
     string StatusText => $"Running {DisplayDescription}...";
     string? Capability => null;
+    IReadOnlyList<string> Aliases => Array.Empty<string>();
     bool IsSilentPoller => false;
     bool IsDangerousByDefault => false;
     Task ExecuteAsync(SkillExecutionContext ctx);

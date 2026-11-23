@@ -1088,7 +1088,35 @@ public sealed class SqliteStore
                     UpdatedAt = now
                 }, ct);
             }
-            // Existing basic skill rows are left untouched so SQLite remains the single source of truth.
+            else
+            {
+                // Preserve user-toggled IsEnabled and custom aliases while syncing updated built-in specs/aliases/poller flag.
+                var mergedAliases = (match.Aliases ?? new List<string>())
+                    .Concat(def.Aliases ?? new List<string>())
+                    .Where(a => !string.IsNullOrWhiteSpace(a))
+                    .Select(a => a.Trim())
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                bool changed = !string.Equals(match.MainAgentSpec, def.MainAgentSpec, StringComparison.Ordinal)
+                    || !string.Equals(match.PlannerSpec, def.PlannerSpec, StringComparison.Ordinal)
+                    || !string.Equals(match.Capability, def.Capability, StringComparison.Ordinal)
+                    || match.IsSilentPoller != def.IsSilentPoller
+                    || mergedAliases.Count != (match.Aliases?.Count ?? 0);
+
+                if (changed)
+                {
+                    await InsertSkillRowAsync(conn, tx, match with
+                    {
+                        MainAgentSpec = def.MainAgentSpec,
+                        PlannerSpec = def.PlannerSpec,
+                        Capability = def.Capability,
+                        IsSilentPoller = def.IsSilentPoller,
+                        Aliases = mergedAliases,
+                        UpdatedAt = now
+                    }, ct);
+                }
+            }
         }
 
         await tx.CommitAsync(ct);

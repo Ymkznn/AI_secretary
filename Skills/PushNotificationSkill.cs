@@ -24,11 +24,11 @@ public sealed class PushNotificationSkill : IBasicSkill
     public string StatusText => "Publishing notification...";
     public string MainAgentSpec => """
             push_notification
-               - Purpose: Publish a desktop notification card and pinned reminder.
-               - Args: {"title": "notification title", "summary": "notification body", "re_remind_minutes": 15}
+               - Purpose: Publish a desktop notification card and pinned reminder (use whenever user asks to pin a note/reminder/notification).
+               - Args: {"title": "notification title", "summary": "notification body", "re_remind_minutes": 0} (default 0 = pin quietly without repeating; set >0 only if user explicitly asks to repeat every N minutes)
             
         """;
-    public string PlannerSpec => """push_notification: Publish desktop notification card & pinned reminder. args: {"title":"...","summary":"...","re_remind_minutes":15}""";
+    public string PlannerSpec => """push_notification: Publish desktop notification card & pinned reminder. args: {"title":"...","summary":"...","re_remind_minutes":0} (0 = pin quietly without repeating)""";
 
     public async Task ExecuteAsync(SkillExecutionContext ctx)
     {
@@ -54,7 +54,7 @@ public sealed class PushNotificationSkill : IBasicSkill
 
         var reRemind = int.TryParse(ctx.GetArg("re_remind_minutes"), out var mins)
             ? Math.Clamp(mins, 0, 1440)
-            : (ev?.ReRemindMinutes ?? 15);
+            : (ev?.ReRemindMinutes ?? 0);
 
         var actions = ev?.Actions is not null
             ? new List<NotificationButtonOption>(ev.Actions)

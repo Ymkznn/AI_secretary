@@ -59,7 +59,7 @@ public sealed class SkillRegistry : ISkillCatalogLookup
             MainAgentSpec: s.MainAgentSpec,
             PlannerSpec: s.PlannerSpec,
             Command: null,
-            Aliases: new List<string>(),
+            Aliases: s.Aliases.ToList(),
             Capability: s.Capability,
             IsSilentPoller: s.IsSilentPoller,
             IsEnabled: true,
