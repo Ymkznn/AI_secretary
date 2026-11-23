@@ -79,7 +79,7 @@ public sealed class SqliteStore
             CREATE TABLE IF NOT EXISTS Notifications (
                 NotificationId TEXT PRIMARY KEY,
                 EventId TEXT NOT NULL,
-                MailId TEXT NOT NULL UNIQUE,
+                MailId TEXT NOT NULL,
                 ConversationId TEXT NOT NULL,
                 Title TEXT NOT NULL,
                 Summary TEXT NOT NULL,
@@ -360,6 +360,49 @@ public sealed class SqliteStore
         {
             idxCmd.CommandText = "CREATE INDEX IF NOT EXISTS IX_ChatMessages_Conv_Revealed ON ChatMessages(ConversationId, RevealedAt, CreatedAt);";
             await idxCmd.ExecuteNonQueryAsync(ct);
+        }
+
+        // Migrate legacy Notifications table that had `MailId TEXT NOT NULL UNIQUE`, which silently
+        // blocked every non-mail notification (MailId = '') after the first one.
+        string? notifDdl = null;
+        await using (var ddlCmd = conn.CreateCommand())
+        {
+            ddlCmd.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'Notifications';";
+            notifDdl = await ddlCmd.ExecuteScalarAsync(ct) as string;
+        }
+        if (!string.IsNullOrWhiteSpace(notifDdl) &&
+            notifDdl.Contains("UNIQUE", StringComparison.OrdinalIgnoreCase))
+        {
+            await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+            await using (var migCmd = conn.CreateCommand())
+            {
+                migCmd.Transaction = tx;
+                migCmd.CommandText = """
+                    CREATE TABLE Notifications_v2 (
+                        NotificationId TEXT PRIMARY KEY,
+                        EventId TEXT NOT NULL,
+                        MailId TEXT NOT NULL,
+                        ConversationId TEXT NOT NULL,
+                        Title TEXT NOT NULL,
+                        Summary TEXT NOT NULL,
+                        Status TEXT NOT NULL,
+                        SnoozeUntil TEXT NULL,
+                        CreatedAt TEXT NOT NULL
+                    );
+                    INSERT INTO Notifications_v2 (NotificationId, EventId, MailId, ConversationId, Title, Summary, Status, SnoozeUntil, CreatedAt)
+                    SELECT NotificationId, EventId, MailId, ConversationId, Title, Summary, Status, SnoozeUntil, CreatedAt FROM Notifications;
+                    DROP TABLE Notifications;
+                    ALTER TABLE Notifications_v2 RENAME TO Notifications;
+                    """;
+                await migCmd.ExecuteNonQueryAsync(ct);
+            }
+            await tx.CommitAsync(ct);
+        }
+
+        await using (var notifIdxCmd = conn.CreateCommand())
+        {
+            notifIdxCmd.CommandText = "CREATE UNIQUE INDEX IF NOT EXISTS IX_Notifications_MailId_Unique ON Notifications(MailId) WHERE MailId <> '';";
+            await notifIdxCmd.ExecuteNonQueryAsync(ct);
         }
     }
 
